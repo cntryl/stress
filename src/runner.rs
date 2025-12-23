@@ -1,7 +1,7 @@
 //! The main benchmark runner.
 
 use crate::config::BenchRunnerConfig;
-use crate::context::BenchContext;
+use crate::context::StressContext;
 use crate::report::{ConsoleReporter, JsonReporter, Reporter};
 use crate::result::{BenchResult, SuiteResult};
 use std::collections::HashMap;
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 /// # Example
 ///
 /// ```rust,no_run
-/// use cntryl_stress::{BenchRunner, BenchContext};
+/// use cntryl_stress::{BenchRunner, StressContext};
 ///
 /// let mut runner = BenchRunner::new("my_suite");
 ///
@@ -99,7 +99,7 @@ impl BenchRunner {
     /// The closure must call `ctx.measure()` exactly once.
     pub fn run<F>(&mut self, name: &str, f: F)
     where
-        F: Fn(&mut BenchContext),
+        F: Fn(&mut StressContext),
     {
         if !self.should_run(name) {
             return;
@@ -114,7 +114,7 @@ impl BenchRunner {
 
         // Warmup runs
         for _ in 0..self.config.warmup_runs {
-            let mut ctx = BenchContext::new();
+            let mut ctx = StressContext::new();
             f(&mut ctx);
         }
 
@@ -125,7 +125,7 @@ impl BenchRunner {
         let mut tags = HashMap::new();
 
         for _ in 0..self.config.runs {
-            let mut ctx = BenchContext::new();
+            let mut ctx = StressContext::new();
             f(&mut ctx);
 
             if let Some(d) = ctx.duration {
@@ -246,7 +246,7 @@ impl<'a> BenchGroup<'a> {
     /// Run a benchmark within this group.
     pub fn run<F>(&mut self, name: &str, f: F)
     where
-        F: Fn(&mut BenchContext),
+        F: Fn(&mut StressContext),
     {
         let full_name = format!("{}/{}", self.prefix, name);
         self.runner.run(&full_name, f);

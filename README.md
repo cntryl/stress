@@ -32,13 +32,13 @@ cntryl-stress = "0.1"
 
 ### 2. Create a stress test file
 
-Create `benches/stress.rs` (or any binary):
+Create a binary or example with stress tests:
 
 ```rust
-use cntryl_stress::{stress_test, BenchContext};
+use cntryl_stress::{stress_test, StressContext};
 
 #[stress_test]
-fn write_1mb_file(ctx: &mut BenchContext) {
+fn write_1mb_file(ctx: &mut StressContext) {
     let data = vec![0u8; 1024 * 1024];
     ctx.set_bytes(data.len() as u64);
     
@@ -49,20 +49,9 @@ fn write_1mb_file(ctx: &mut BenchContext) {
     std::fs::remove_file("/tmp/stress_test").ok();
 }
 
-#[stress_test]
-fn hash_computation(ctx: &mut BenchContext) {
-    let data = vec![0u8; 10 * 1024 * 1024];
-    ctx.set_bytes(data.len() as u64);
-    
-    ctx.measure(|| {
-        // Simulate expensive computation
-        std::hint::black_box(data.iter().fold(0u64, |acc, &x| acc.wrapping_add(x as u64)));
-    });
-}
-
+// Ignored by default; opt-in with --include-ignored
 #[stress_test(ignore)]
-fn slow_network_test(ctx: &mut BenchContext) {
-    // Ignored by default, run with --include-ignored
+fn slow_network_test(ctx: &mut StressContext) {
     ctx.measure(|| {
         std::thread::sleep(std::time::Duration::from_secs(5));
     });
@@ -70,6 +59,16 @@ fn slow_network_test(ctx: &mut BenchContext) {
 
 // Generate the main function
 cntryl_stress::stress_main!();
+```
+
+Try the included demo:
+
+```bash
+# Run the demo workspace member (has library + stress tests)
+cargo run -p stress-demo
+
+# Or run the simple example
+cargo run --example stress_demo
 ```
 
 ### 3. Run your benchmarks
@@ -122,15 +121,15 @@ Options:
 ```rust
 // Basic benchmark
 #[stress_test]
-fn my_bench(ctx: &mut BenchContext) { ... }
+fn my_bench(ctx: &mut StressContext) { ... }
 
 // Ignored by default (opt-in with --include-ignored)
 #[stress_test(ignore)]
-fn slow_bench(ctx: &mut BenchContext) { ... }
+fn slow_bench(ctx: &mut StressContext) { ... }
 
 // Custom name (instead of function name)
 #[stress_test(name = "custom_name")]
-fn internal_name(ctx: &mut BenchContext) { ... }
+fn internal_name(ctx: &mut StressContext) { ... }
 ```
 
 ---
@@ -140,7 +139,7 @@ fn internal_name(ctx: &mut BenchContext) { ... }
 For more control over execution, use `BenchRunner` directly:
 
 ```rust
-use cntryl_stress::{BenchRunner, BenchContext};
+use cntryl_stress::{BenchRunner, StressContext};
 
 let mut runner = BenchRunner::new("my_suite");
 
@@ -195,7 +194,7 @@ let mut runner = BenchRunner::with_config("my_suite", config);
 
 ```rust
 #[stress_test]
-fn write_data(ctx: &mut BenchContext) {
+fn write_data(ctx: &mut StressContext) {
     let data = vec![0u8; 1024 * 1024];
     ctx.set_bytes(data.len() as u64);  // Enable bytes/sec reporting
 
@@ -222,6 +221,22 @@ cargo stress --runs 5 --baseline baseline.json --threshold 0.05
 ```
 
 ---
+
+## Project Structure
+
+This repository demonstrates the recommended structure:
+
+```
+your-project/
+├── src/           # Your library code
+├── stress/        # Stress test binaries (*.rs files)
+│   └── my_stress.rs
+└── Cargo.toml
+```
+
+The `stress-demo/` workspace member shows a complete example:
+- `stress-demo/src/lib.rs` - Library with data structures to test
+- `stress-demo/stress/stress_test.rs` - Stress tests for the library
 
 ## Installation
 

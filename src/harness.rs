@@ -2,8 +2,21 @@
 //!
 //! This module provides the infrastructure for discovering and running
 //! benchmarks marked with `#[stress_test]`.
+//!
+//! ## Architecture
+//!
+//! When you use `#[stress_test]` and `stress_main!()`, this is what happens:
+//!
+//! 1. `#[stress_test]` registers each function in a distributed slice via linkme
+//! 2. `stress_main!()` generates a main() that calls `stress_binary_main()`
+//! 3. `stress_binary_main()` parses CLI args and calls `run_with_options()`
+//! 4. `run_with_options()` iterates the slice and runs matching benchmarks
+//!
+//! This means each stress binary is self-contained and handles its own argument
+//! parsing - `cargo-stress` just orchestrates which binaries to build and run.
 
-use crate::{BenchContext, BenchRunner, BenchRunnerConfig};
+use crate::{BenchRunner, BenchRunnerConfig, StressContext};
+use std::path::PathBuf;
 
 /// A registered benchmark entry.
 #[doc(hidden)]
@@ -11,7 +24,7 @@ pub struct BenchmarkEntry {
     /// Benchmark name (function name or custom)
     pub name: &'static str,
     /// The benchmark function
-    pub func: fn(&mut BenchContext),
+    pub func: fn(&mut StressContext),
     /// Whether this benchmark is ignored by default
     pub ignored: bool,
     /// Module path where the benchmark is defined
@@ -26,6 +39,215 @@ pub use linkme;
 #[doc(hidden)]
 #[linkme::distributed_slice]
 pub static STRESS_BENCHMARKS: [BenchmarkEntry];
+
+// ============================================================================
+// CLI Arguments for Stress Binaries
+// ============================================================================
+
+/// Command-line arguments for stress test binaries.
+///
+/// These arguments are parsed by the generated main() function from stress_main!().
+/// They match the flags that cargo-stress passes through.
+#[derive(Debug, Clone)]
+struct StressBinaryArgs {
+    /// Filter benchmarks by glob pattern
+    workload: Option<String>,
+    /// Number of measurement runs
+    runs: usize,
+    /// Number of warmup runs
+    warmup: usize,
+    /// Verbose output
+    verbose: bool,
+    /// Quiet mode
+    quiet: bool,
+    /// Include ignored benchmarks
+    include_ignored: bool,
+    /// List benchmarks without running
+    list: bool,
+    /// Output directory for JSON results
+    output_dir: Option<PathBuf>,
+    /// Baseline JSON for regression comparison
+    baseline: Option<PathBuf>,
+    /// Regression threshold
+    threshold: f64,
+}
+
+impl Default for StressBinaryArgs {
+    fn default() -> Self {
+        Self {
+            workload: None,
+            runs: 1,
+            warmup: 0,
+            verbose: false,
+            quiet: false,
+            include_ignored: false,
+            list: false,
+            output_dir: None,
+            baseline: None,
+            threshold: 0.05,
+        }
+    }
+}
+
+impl StressBinaryArgs {
+    /// Parse command-line arguments.
+    ///
+    /// We use a simple hand-rolled parser to avoid adding clap as a dependency
+    /// for every stress binary. The argument format matches what cargo-stress passes.
+    fn parse() -> Self {
+        let args: Vec<String> = std::env::args().collect();
+        let mut result = Self::default();
+        let mut i = 1;
+
+        while i < args.len() {
+            match args[i].as_str() {
+                "--workload" => {
+                    i += 1;
+                    if i < args.len() {
+                        result.workload = Some(args[i].clone());
+                    }
+                }
+                "--runs" => {
+                    i += 1;
+                    if i < args.len() {
+                        result.runs = args[i].parse().unwrap_or(1);
+                    }
+                }
+                "--warmup" => {
+                    i += 1;
+                    if i < args.len() {
+                        result.warmup = args[i].parse().unwrap_or(0);
+                    }
+                }
+                "--verbose" | "-v" => {
+                    result.verbose = true;
+                }
+                "--quiet" | "-q" => {
+                    result.quiet = true;
+                }
+                "--include-ignored" => {
+                    result.include_ignored = true;
+                }
+                "--list" => {
+                    result.list = true;
+                }
+                "--output-dir" => {
+                    i += 1;
+                    if i < args.len() {
+                        result.output_dir = Some(PathBuf::from(&args[i]));
+                    }
+                }
+                "--baseline" => {
+                    i += 1;
+                    if i < args.len() {
+                        result.baseline = Some(PathBuf::from(&args[i]));
+                    }
+                }
+                "--threshold" => {
+                    i += 1;
+                    if i < args.len() {
+                        result.threshold = args[i].parse().unwrap_or(0.05);
+                    }
+                }
+                "--help" | "-h" => {
+                    print_help();
+                    std::process::exit(0);
+                }
+                _ => {
+                    // Ignore unknown args
+                }
+            }
+            i += 1;
+        }
+
+        result
+    }
+}
+
+fn print_help() {
+    eprintln!("Stress test binary");
+    eprintln!();
+    eprintln!("USAGE:");
+    eprintln!("    <binary> [OPTIONS]");
+    eprintln!();
+    eprintln!("OPTIONS:");
+    eprintln!("    --workload <PATTERN>   Filter benchmarks by glob pattern");
+    eprintln!("    --runs <N>             Number of measurement runs (default: 1)");
+    eprintln!("    --warmup <N>           Number of warmup runs (default: 0)");
+    eprintln!("    -v, --verbose          Verbose output");
+    eprintln!("    -q, --quiet            Quiet mode");
+    eprintln!("    --include-ignored      Include ignored benchmarks");
+    eprintln!("    --list                 List benchmarks without running");
+    eprintln!("    --output-dir <PATH>    Output directory for JSON results");
+    eprintln!("    --baseline <PATH>      Baseline JSON for regression comparison");
+    eprintln!("    --threshold <FLOAT>    Regression threshold (default: 0.05)");
+    eprintln!("    -h, --help             Show this help message");
+}
+
+// ============================================================================
+// Main Entry Point for Stress Binaries
+// ============================================================================
+
+/// Main entry point for stress test binaries generated by `stress_main!()`.
+///
+/// This function:
+/// 1. Parses command-line arguments
+/// 2. Handles --list mode
+/// 3. Runs benchmarks with the specified options
+/// 4. Exits with non-zero status on failure
+///
+/// # Panics
+///
+/// This function does not panic. It exits with appropriate exit codes:
+/// - 0: All benchmarks passed
+/// - 1: One or more benchmarks failed or regressed
+pub fn stress_binary_main() {
+    let args = StressBinaryArgs::parse();
+
+    // Handle --list mode
+    if args.list {
+        let benchmarks = list_benchmarks();
+        if benchmarks.is_empty() {
+            println!("No benchmarks registered.");
+            println!("Add #[stress_test] to your benchmark functions.");
+        } else {
+            println!("Registered benchmarks ({}):", benchmarks.len());
+            for name in benchmarks {
+                println!("  {}", name);
+            }
+        }
+        return;
+    }
+
+    // Build options
+    let verbose = if args.quiet {
+        false
+    } else {
+        args.verbose || !args.quiet
+    };
+
+    let mut opts = StressRunnerOptions::new()
+        .runs(args.runs)
+        .warmup(args.warmup)
+        .verbose(verbose)
+        .include_ignored(args.include_ignored)
+        .threshold(args.threshold);
+
+    if let Some(pattern) = args.workload {
+        opts = opts.workload(pattern);
+    }
+
+    if let Some(baseline) = args.baseline {
+        opts = opts.baseline(baseline);
+    }
+
+    // Run benchmarks
+    run_with_options(opts);
+}
+
+// ============================================================================
+// Options
+// ============================================================================
 
 /// Options for running discovered benchmarks.
 #[derive(Debug, Clone, Default)]
@@ -147,6 +369,7 @@ pub fn run_with_options(opts: StressRunnerOptions) {
         let (_results, regressions) = runner.finish_with_baseline(baseline_path, opts.threshold);
         if !regressions.is_empty() {
             eprintln!("\n❌ {} regression(s) detected!", regressions.len());
+
             for (result, ratio) in &regressions {
                 let pct = (ratio - 1.0) * 100.0;
                 eprintln!("  {} is {:.1}% slower", result.name, pct);

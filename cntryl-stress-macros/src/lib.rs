@@ -15,10 +15,10 @@ use syn::{parse_macro_input, ItemFn};
 /// # Example
 ///
 /// ```rust,ignore
-/// use cntryl_stress::{stress_test, BenchContext};
+/// use cntryl_stress::{stress_test, StressContext};
 ///
 /// #[stress_test]
-/// fn my_benchmark(ctx: &mut BenchContext) {
+/// fn my_benchmark(ctx: &mut StressContext) {
 ///     let data = vec![0u8; 1024 * 1024];
 ///     ctx.set_bytes(data.len() as u64);
 ///     ctx.measure(|| {
@@ -88,23 +88,44 @@ fn parse_custom_name(attr: &str) -> Option<String> {
 /// Place this at the end of your benchmark file to create an executable
 /// that discovers and runs all `#[stress_test]` benchmarks.
 ///
+/// The generated main function:
+/// - Parses command-line arguments (--workload, --runs, --list, etc.)
+/// - Runs benchmarks matching the filter criteria
+/// - Exits with non-zero status on failure
+///
 /// # Example
 ///
 /// ```rust,ignore
-/// use cntryl_stress::{stress_test, stress_main, BenchContext};
+/// use cntryl_stress::{stress_test, stress_main, StressContext};
 ///
 /// #[stress_test]
-/// fn benchmark_one(ctx: &mut BenchContext) {
+/// fn benchmark_one(ctx: &mut StressContext) {
 ///     ctx.measure(|| { /* ... */ });
 /// }
 ///
 /// stress_main!();
 /// ```
+///
+/// # Command-line arguments
+///
+/// The generated binary accepts these arguments:
+///
+/// - `--workload <PATTERN>`: Filter benchmarks by glob pattern
+/// - `--runs <N>`: Number of measurement runs (default: 1)
+/// - `--warmup <N>`: Number of warmup runs (default: 0)
+/// - `--verbose` / `-v`: Verbose output
+/// - `--quiet` / `-q`: Quiet mode
+/// - `--include-ignored`: Include ignored benchmarks
+/// - `--list`: List benchmarks without running
+/// - `--output-dir <PATH>`: Output directory for JSON results
+/// - `--baseline <PATH>`: Baseline JSON for regression comparison
+/// - `--threshold <FLOAT>`: Regression threshold (default: 0.05)
 #[proc_macro]
 pub fn stress_main(_input: TokenStream) -> TokenStream {
     let expanded = quote! {
         fn main() {
-            ::cntryl_stress::run_registered_benchmarks();
+            // Use the CLI-parsing entry point that handles all flags
+            ::cntryl_stress::stress_binary_main();
         }
     };
     TokenStream::from(expanded)

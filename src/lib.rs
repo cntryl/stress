@@ -11,10 +11,10 @@
 //! The easiest way to write stress tests is with the `#[stress_test]` attribute:
 //!
 //! ```rust,ignore
-//! use cntryl_stress::{stress_test, BenchContext};
+//! use cntryl_stress::{stress_test, StressContext};
 //!
 //! #[stress_test]
-//! fn write_1mb_file(ctx: &mut BenchContext) {
+//! fn write_1mb_file(ctx: &mut StressContext) {
 //!     let data = vec![0u8; 1024 * 1024];
 //!     ctx.set_bytes(data.len() as u64);
 //!     
@@ -26,7 +26,7 @@
 //! }
 //!
 //! #[stress_test]
-//! fn database_insert(ctx: &mut BenchContext) {
+//! fn database_insert(ctx: &mut StressContext) {
 //!     let db = setup_database();
 //!     ctx.measure(|| {
 //!         db.insert("key", "value");
@@ -53,7 +53,7 @@
 //! For more control, use the `BenchRunner` directly:
 //!
 //! ```rust,no_run
-//! use cntryl_stress::{BenchRunner, BenchContext};
+//! use cntryl_stress::{BenchRunner, StressContext};
 //!
 //! let mut runner = BenchRunner::new("my_suite");
 //!
@@ -85,7 +85,11 @@ mod result;
 mod runner;
 
 pub use config::BenchRunnerConfig;
-pub use context::BenchContext;
+pub use context::StressContext;
+/// Backwards compatibility alias
+#[doc(hidden)]
+#[deprecated(since = "0.2.0", note = "Use StressContext instead")]
+pub type BenchContext = StressContext;
 pub use report::{ConsoleReporter, JsonReporter, MultiReporter, Reporter};
 pub use result::{BenchResult, SuiteResult};
 pub use runner::BenchRunner;
@@ -93,6 +97,9 @@ pub use runner::BenchRunner;
 // Harness exports for auto-discovery
 pub use harness::{benchmark_count, list_benchmarks};
 pub use harness::{run_registered_benchmarks, run_with_options, StressRunnerOptions};
+
+// Entry point for stress binaries (called by stress_main! macro)
+pub use harness::stress_binary_main;
 
 // Re-export the proc macro
 pub use cntryl_stress_macros::{stress_main, stress_test};
@@ -110,7 +117,7 @@ pub mod __private {
 /// ```
 pub mod prelude {
     pub use crate::{
-        stress_main, stress_test, BenchContext, BenchResult, BenchRunner, BenchRunnerConfig,
+        stress_main, stress_test, BenchResult, BenchRunner, BenchRunnerConfig, StressContext,
         StressRunnerOptions,
     };
 }

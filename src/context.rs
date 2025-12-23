@@ -5,14 +5,14 @@ use std::time::{Duration, Instant};
 /// Context passed to benchmark closures for timing control.
 ///
 /// The closure must call exactly one of the `measure` methods to record timing.
-pub struct BenchContext {
+pub struct StressContext {
     pub(crate) duration: Option<Duration>,
     pub(crate) bytes: Option<u64>,
     pub(crate) elements: Option<u64>,
     pub(crate) tags: Vec<(String, String)>,
 }
 
-impl BenchContext {
+impl StressContext {
     pub(crate) fn new() -> Self {
         Self {
             duration: None,
@@ -51,8 +51,8 @@ impl BenchContext {
     /// # Example
     ///
     /// ```rust,no_run
-    /// # use cntryl_stress::BenchContext;
-    /// # fn example(ctx: &mut BenchContext) {
+    /// # use cntryl_stress::StressContext;
+    /// # fn example(ctx: &mut StressContext) {
     /// let data = prepare_expensive_data();  // Not timed
     ///
     /// let result = ctx.measure(|| {
@@ -113,7 +113,7 @@ mod tests {
 
     #[test]
     fn should_measure_duration_when_called() {
-        let mut ctx = BenchContext::new();
+        let mut ctx = StressContext::new();
         ctx.measure(|| std::thread::sleep(Duration::from_millis(10)));
 
         let d = ctx.duration.unwrap();
@@ -123,21 +123,21 @@ mod tests {
 
     #[test]
     fn should_track_bytes_when_set() {
-        let mut ctx = BenchContext::new();
+        let mut ctx = StressContext::new();
         ctx.set_bytes(1024);
         assert_eq!(ctx.bytes, Some(1024));
     }
 
     #[test]
     fn should_track_elements_when_set() {
-        let mut ctx = BenchContext::new();
+        let mut ctx = StressContext::new();
         ctx.set_elements(100);
         assert_eq!(ctx.elements, Some(100));
     }
 
     #[test]
     fn should_collect_tags_when_added() {
-        let mut ctx = BenchContext::new();
+        let mut ctx = StressContext::new();
         ctx.tag("env", "prod");
         ctx.tag("version", "1.0");
         assert_eq!(ctx.tags.len(), 2);
