@@ -5,6 +5,8 @@ edition = "2021"
 description = "Proc macros for cntryl-stress benchmark framework"
 license = "Apache-2.0"
 repository = "https://github.com/cntryl/stress"
+keywords = ["benchmark", "stress", "testing", "performance"]
+categories = ["development-tools::profiling", "development-tools::testing"]
 
 [lib]
 proc-macro = true
