@@ -213,7 +213,7 @@ fn create_temp_workspace(files: &[StressFile], project_root: &Path) -> Result<(P
     // Create directories
     fs::create_dir_all(&src_bin_dir).context("Failed to create temp workspace src/bin")?;
 
-    // Read original Cargo.toml to get package name
+    // Read original Cargo.toml to get package name and check if cntryl-stress is already a dep
     let root_manifest = project_root.join("Cargo.toml");
     let manifest_text = fs::read_to_string(&root_manifest).context("Failed to read root Cargo.toml")?;
     let pkg_name = manifest_text
@@ -228,21 +228,39 @@ fn create_temp_workspace(files: &[StressFile], project_root: &Path) -> Result<(P
             }
             None
         })
-        .unwrap_or_else(|| "cntryl-stress".to_string());
+        .unwrap_or_else(|| "unknown".to_string());
 
     // Convert path to use forward slashes for TOML compatibility
     let project_root_str = project_root.display().to_string().replace('\\', "/");
 
+    // Check if this IS the cntryl-stress repo itself
+    let is_stress_repo = pkg_name == "cntryl-stress";
+
     // Write Cargo.toml for temp package
-    let manifest_contents = format!(r#"[package]
+    let manifest_contents = if is_stress_repo {
+        // Building stress tests for cntryl-stress itself
+        format!(r#"[package]
 name = "cargo-stress-temp-{ts}"
 version = "0.0.0"
 edition = "2021"
 publish = false
 
 [dependencies]
+cntryl-stress = {{ path = "{project_root_str}" }}
+"#)
+    } else {
+        // Building stress tests for a user project — need both cntryl-stress AND their crate
+        format!(r#"[package]
+name = "cargo-stress-temp-{ts}"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+cntryl-stress = "0.1"
 {pkg_name} = {{ path = "{project_root_str}" }}
-"#);
+"#)
+    };
 
     fs::write(&manifest_path, manifest_contents).context("Failed to write temp Cargo.toml")?;
 
