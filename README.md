@@ -6,8 +6,6 @@ A lightweight single-shot benchmark runner for system-level stress tests.
 
 Unlike Criterion (which uses statistical sampling), this crate is designed for expensive operations where each iteration matters: disk I/O, network calls, database transactions, compaction, recovery, etc.
 
----
-
 ## Features
 
 - **`cargo stress` command** — run benchmarks like `cargo test`
@@ -18,8 +16,6 @@ Unlike Criterion (which uses statistical sampling), this crate is designed for e
 - **Pluggable reporters** — Console, JSON
 - **Baseline comparison** — detect regressions against previous runs
 - **Throughput tracking** — report bytes/sec or ops/sec
-
----
 
 ## Quick Start
 
@@ -41,11 +37,11 @@ use cntryl_stress::{stress_test, StressContext};
 fn write_1mb_file(ctx: &mut StressContext) {
     let data = vec![0u8; 1024 * 1024];
     ctx.set_bytes(data.len() as u64);
-    
+
     ctx.measure(|| {
         std::fs::write("/tmp/stress_test", &data).unwrap();
     });
-    
+
     std::fs::remove_file("/tmp/stress_test").ok();
 }
 
@@ -94,8 +90,6 @@ cargo stress --list
 cargo stress --baseline target/stress/baseline.json --threshold 0.10
 ```
 
----
-
 ## Command Line Reference
 
 ```
@@ -114,8 +108,6 @@ Options:
     -h, --help              Print help
 ```
 
----
-
 ## Attribute Options
 
 ```rust
@@ -131,8 +123,6 @@ fn slow_bench(ctx: &mut StressContext) { ... }
 #[stress_test(name = "custom_name")]
 fn internal_name(ctx: &mut StressContext) { ... }
 ```
-
----
 
 ## Manual Runner Style
 
@@ -159,20 +149,18 @@ runner.run("expensive_operation", |ctx| {
 let results = runner.finish();
 ```
 
----
-
 ## Configuration
 
 Configure via environment variables or the builder API:
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `BENCH_RUNS` | `1` | Number of measurement runs (reports median) |
-| `BENCH_WARMUP` | `0` | Warmup runs (discarded) |
-| `BENCH_VERBOSE` | `true` | Print results to stderr |
-| `BENCH_OUTPUT_DIR` | `target/stress` | Directory for JSON results |
-| `BENCH_FILTER` | - | Filter benchmarks by name substring |
-| `BENCH_GIT_SHA` | auto-detected | Git commit hash to include in results |
+| Variable           | Default         | Description                                 |
+| ------------------ | --------------- | ------------------------------------------- |
+| `BENCH_RUNS`       | `1`             | Number of measurement runs (reports median) |
+| `BENCH_WARMUP`     | `0`             | Warmup runs (discarded)                     |
+| `BENCH_VERBOSE`    | `true`          | Print results to stderr                     |
+| `BENCH_OUTPUT_DIR` | `target/stress` | Directory for JSON results                  |
+| `BENCH_FILTER`     | -               | Filter benchmarks by name substring         |
+| `BENCH_GIT_SHA`    | auto-detected   | Git commit hash to include in results       |
 
 Builder API:
 
@@ -187,8 +175,6 @@ let config = BenchRunnerConfig::new()
 
 let mut runner = BenchRunner::with_config("my_suite", config);
 ```
-
----
 
 ## Throughput Reporting
 
@@ -205,8 +191,6 @@ fn write_data(ctx: &mut StressContext) {
 // Output: write_data ... 15.32ms (65.28 MB/s)
 ```
 
----
-
 ## Baseline Comparison
 
 Detect performance regressions in CI:
@@ -220,8 +204,6 @@ cp target/stress/results.json baseline.json
 cargo stress --runs 5 --baseline baseline.json --threshold 0.05
 ```
 
----
-
 ## Project Structure
 
 This repository demonstrates the recommended structure:
@@ -233,10 +215,6 @@ your-project/
 │   └── my_stress.rs
 └── Cargo.toml
 ```
-
-The `stress-demo/` workspace member shows a complete example:
-- `stress-demo/src/lib.rs` - Library with data structures to test
-- `stress-demo/stress/stress_test.rs` - Stress tests for the library
 
 ## Installation
 
@@ -251,9 +229,3 @@ Or for development:
 ```bash
 cargo install --path . --bin cargo-stress
 ```
-
----
-
-## License
-
-MIT OR Apache-2.0

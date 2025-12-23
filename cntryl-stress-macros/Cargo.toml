@@ -3,7 +3,7 @@ name = "cntryl-stress-macros"
 version = "0.1.0"
 edition = "2021"
 description = "Proc macros for cntryl-stress benchmark framework"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 repository = "https://github.com/cntryl/stress"
 
 [lib]
