@@ -1,11 +1,15 @@
-use clap::{Parser, Subcommand};
 use anyhow::Result;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use cntryl_stress::{BenchRunner, BenchRunnerConfig, register_benchmarks};
+use cntryl_stress::{run_with_options, StressRunnerOptions};
 
 #[derive(Debug, Parser)]
-#[command(name = "cargo-stress", about = "Run cntryl-stress benchmarks via `cargo stress`")]
+#[command(
+    name = "cargo-stress",
+    bin_name = "cargo",
+    about = "Run stress benchmarks via `cargo stress`"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Commands,
@@ -13,63 +17,95 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Run registered benchmarks
-    Run {
-        /// Suite name
-        #[arg(long, default_value = "my_suite")]
-        suite: String,
+    /// Run stress benchmarks
+    #[command(name = "stress")]
+    Stress(StressArgs),
+}
 
-        /// Number of measurement runs
-        #[arg(long)]
-        runs: Option<usize>,
+#[derive(Debug, Parser)]
+struct StressArgs {
+    /// Filter benchmarks by glob pattern (e.g., "database*", "*insert*")
+    #[arg(long)]
+    workload: Option<String>,
 
-        /// Number of warmup runs
-        #[arg(long)]
-        warmup: Option<usize>,
+    /// Number of measurement runs (reports median)
+    #[arg(long, default_value_t = 1)]
+    runs: usize,
 
-        /// Verbose output
-        #[arg(long, default_value_t = false)]
-        verbose: bool,
+    /// Number of warmup runs (discarded)
+    #[arg(long, default_value_t = 0)]
+    warmup: usize,
 
-        /// Output directory for JSON results
-        #[arg(long)]
-        output_dir: Option<PathBuf>,
+    /// Verbose output
+    #[arg(long, short = 'v')]
+    verbose: bool,
 
-        /// Baseline JSON path for comparison
-        #[arg(long)]
-        baseline: Option<PathBuf>,
+    /// Quiet mode (minimal output)
+    #[arg(long, short = 'q')]
+    quiet: bool,
 
-        /// Regression threshold (e.g., 0.05 for 5%)
-        #[arg(long, default_value_t = 0.05)]
-        threshold: f64,
-    },
+    /// Include ignored benchmarks
+    #[arg(long)]
+    include_ignored: bool,
+
+    /// Output directory for JSON results
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+
+    /// Baseline JSON file for regression comparison
+    #[arg(long)]
+    baseline: Option<PathBuf>,
+
+    /// Regression threshold percentage (default: 5%)
+    #[arg(long, default_value_t = 0.05)]
+    threshold: f64,
+
+    /// List all registered benchmarks without running them
+    #[arg(long)]
+    list: bool,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.cmd {
-        Commands::Run { suite, runs, warmup, verbose, output_dir, baseline, threshold } => {
-            let mut cfg = BenchRunnerConfig::from_env();
-            if let Some(r) = runs { cfg.runs = r; }
-            if let Some(w) = warmup { cfg.warmup_runs = w; }
-            if let Some(dir) = output_dir { cfg.output_dir = dir; }
-            cfg.verbose = verbose;
-
-            let mut runner = BenchRunner::with_config(&suite, cfg);
-
-            // Register benchmarks (users can edit `src/benches/mod.rs` or call their own)
-            register_benchmarks(&mut runner);
-
-            if let Some(path) = baseline {
-                let (_results, regressions) = runner.finish_with_baseline(path, threshold);
-                if !regressions.is_empty() {
-                    eprintln!("{} regressions found", regressions.len());
-                    std::process::exit(1);
+        Commands::Stress(args) => {
+            if args.list {
+                let benchmarks = cntryl_stress::list_benchmarks();
+                if benchmarks.is_empty() {
+                    println!("No benchmarks registered.");
+                    println!("Add #[stress_test] to your benchmark functions.");
+                } else {
+                    println!("Registered benchmarks ({}):", benchmarks.len());
+                    for name in benchmarks {
+                        println!("  {}", name);
+                    }
                 }
-            } else {
-                let _results = runner.finish();
+                return Ok(());
             }
+
+            let verbose = if args.quiet {
+                false
+            } else {
+                args.verbose || !args.quiet
+            };
+
+            let mut opts = StressRunnerOptions::new()
+                .runs(args.runs)
+                .warmup(args.warmup)
+                .verbose(verbose)
+                .include_ignored(args.include_ignored)
+                .threshold(args.threshold);
+
+            if let Some(pattern) = args.workload {
+                opts = opts.workload(pattern);
+            }
+
+            if let Some(baseline) = args.baseline {
+                opts = opts.baseline(baseline);
+            }
+
+            run_with_options(opts);
         }
     }
 

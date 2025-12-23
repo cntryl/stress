@@ -115,7 +115,7 @@ mod tests {
     fn should_measure_duration_when_called() {
         let mut ctx = BenchContext::new();
         ctx.measure(|| std::thread::sleep(Duration::from_millis(10)));
-        
+
         let d = ctx.duration.unwrap();
         assert!(d >= Duration::from_millis(10));
         assert!(d < Duration::from_millis(100));

@@ -283,9 +283,7 @@ mod tests {
 
     #[test]
     fn should_filter_benchmarks_when_filter_set() {
-        let config = BenchRunnerConfig::new()
-            .verbose(false)
-            .filter("keep");
+        let config = BenchRunnerConfig::new().verbose(false).filter("keep");
         let mut runner = BenchRunner::with_config("test", config);
         runner.reporters(vec![]);
 

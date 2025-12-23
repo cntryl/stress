@@ -27,7 +27,9 @@ pub struct ConsoleReporter {
 
 impl ConsoleReporter {
     pub fn new() -> Self {
-        Self { show_all_runs: false }
+        Self {
+            show_all_runs: false,
+        }
     }
 
     /// Show individual run times (not just median).
@@ -96,7 +98,11 @@ impl Reporter for ConsoleReporter {
         eprintln!("{}{}", time_str, throughput);
 
         if self.show_all_runs && result.all_runs.len() > 1 {
-            let runs: Vec<_> = result.all_runs.iter().map(|d| Self::format_duration(*d)).collect();
+            let runs: Vec<_> = result
+                .all_runs
+                .iter()
+                .map(|d| Self::format_duration(*d))
+                .collect();
             eprintln!("      runs: [{}]", runs.join(", "));
         }
     }
@@ -139,8 +145,7 @@ fn write_json_results(output_dir: &PathBuf, result: &SuiteResult) -> std::io::Re
     let filename = format!("{}.json", result.suite.replace('/', "_"));
     let path = output_dir.join(&filename);
 
-    let json = serde_json::to_string_pretty(result)
-        .map_err(std::io::Error::other)?;
+    let json = serde_json::to_string_pretty(result).map_err(std::io::Error::other)?;
 
     std::fs::write(&path, json)?;
     eprintln!("  Results written to: {}", path.display());
@@ -246,8 +251,8 @@ impl Reporter for MultiReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use std::collections::HashMap;
+    use std::time::Duration;
 
     #[test]
     fn should_format_duration_in_appropriate_units() {

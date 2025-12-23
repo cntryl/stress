@@ -174,7 +174,7 @@ mod tests {
             .warmup(2)
             .verbose(false)
             .filter("my_bench");
-        
+
         assert_eq!(cfg.runs, 5);
         assert_eq!(cfg.warmup_runs, 2);
         assert!(!cfg.verbose);

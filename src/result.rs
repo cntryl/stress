@@ -34,7 +34,8 @@ impl BenchResult {
 
     /// Calculate elements per second throughput.
     pub fn elements_per_sec(&self) -> Option<f64> {
-        self.elements.map(|e| e as f64 / self.duration.as_secs_f64())
+        self.elements
+            .map(|e| e as f64 / self.duration.as_secs_f64())
     }
 
     /// Get minimum duration across all runs.
@@ -52,8 +53,8 @@ impl BenchResult {
         if self.all_runs.len() < 2 {
             return None;
         }
-        let mean = self.all_runs.iter().map(|d| d.as_secs_f64()).sum::<f64>()
-            / self.all_runs.len() as f64;
+        let mean =
+            self.all_runs.iter().map(|d| d.as_secs_f64()).sum::<f64>() / self.all_runs.len() as f64;
         let variance = self
             .all_runs
             .iter()
@@ -108,7 +109,8 @@ impl SuiteResult {
     /// Load a suite result from JSON file.
     pub fn load(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        serde_json::from_str(&content).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        serde_json::from_str(&content)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
     /// Compare this suite against a baseline.
@@ -116,11 +118,13 @@ impl SuiteResult {
     /// Returns a map of benchmark name to ratio (self/baseline).
     pub fn compare(&self, baseline: &SuiteResult) -> HashMap<String, f64> {
         let baseline_map: HashMap<_, _> = baseline.results.iter().map(|r| (&r.name, r)).collect();
-        
+
         self.results
             .iter()
             .filter_map(|r| {
-                baseline_map.get(&r.name).map(|b| (r.name.clone(), r.compare(b)))
+                baseline_map
+                    .get(&r.name)
+                    .map(|b| (r.name.clone(), r.compare(b)))
             })
             .collect()
     }
@@ -128,9 +132,13 @@ impl SuiteResult {
     /// Find regressions compared to baseline.
     ///
     /// Returns benchmarks that are more than `threshold` percent slower.
-    pub fn find_regressions(&self, baseline: &SuiteResult, threshold: f64) -> Vec<(&BenchResult, f64)> {
+    pub fn find_regressions(
+        &self,
+        baseline: &SuiteResult,
+        threshold: f64,
+    ) -> Vec<(&BenchResult, f64)> {
         let baseline_map: HashMap<_, _> = baseline.results.iter().map(|r| (&r.name, r)).collect();
-        
+
         self.results
             .iter()
             .filter_map(|r| {
@@ -166,12 +174,18 @@ mod duration_vec_serde {
     use std::time::Duration;
 
     pub fn serialize<S: Serializer>(v: &[Duration], s: S) -> Result<S::Ok, S::Error> {
-        v.iter().map(|d| d.as_nanos()).collect::<Vec<_>>().serialize(s)
+        v.iter()
+            .map(|d| d.as_nanos())
+            .collect::<Vec<_>>()
+            .serialize(s)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Duration>, D::Error> {
         let nanos: Vec<u128> = Vec::deserialize(d)?;
-        Ok(nanos.into_iter().map(|n| Duration::from_nanos(n as u64)).collect())
+        Ok(nanos
+            .into_iter()
+            .map(|n| Duration::from_nanos(n as u64))
+            .collect())
     }
 }
 

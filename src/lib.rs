@@ -6,7 +6,51 @@
 //! expensive operations where each iteration matters: disk I/O, network calls,
 //! database transactions, compaction, recovery, etc.
 //!
-//! ## Quick Start
+//! ## Quick Start (Attribute Style - Recommended)
+//!
+//! The easiest way to write stress tests is with the `#[stress_test]` attribute:
+//!
+//! ```rust,ignore
+//! use cntryl_stress::{stress_test, BenchContext};
+//!
+//! #[stress_test]
+//! fn write_1mb_file(ctx: &mut BenchContext) {
+//!     let data = vec![0u8; 1024 * 1024];
+//!     ctx.set_bytes(data.len() as u64);
+//!     
+//!     ctx.measure(|| {
+//!         std::fs::write("/tmp/test", &data).unwrap();
+//!     });
+//!     
+//!     std::fs::remove_file("/tmp/test").ok();
+//! }
+//!
+//! #[stress_test]
+//! fn database_insert(ctx: &mut BenchContext) {
+//!     let db = setup_database();
+//!     ctx.measure(|| {
+//!         db.insert("key", "value");
+//!     });
+//! }
+//!
+//! // Generate main function
+//! cntryl_stress::stress_main!();
+//! # fn setup_database() -> FakeDb { FakeDb }
+//! # struct FakeDb;
+//! # impl FakeDb { fn insert(&self, _: &str, _: &str) {} }
+//! ```
+//!
+//! Then run with:
+//!
+//! ```bash
+//! cargo stress                          # Run all stress tests
+//! cargo stress --workload "database*"   # Run matching tests
+//! cargo stress --workload "*insert*"    # Glob patterns supported
+//! ```
+//!
+//! ## Manual Runner Style
+//!
+//! For more control, use the `BenchRunner` directly:
 //!
 //! ```rust,no_run
 //! use cntryl_stress::{BenchRunner, BenchContext};
@@ -14,15 +58,10 @@
 //! let mut runner = BenchRunner::new("my_suite");
 //!
 //! runner.run("expensive_operation", |ctx| {
-//!     // Setup (not timed)
 //!     let data = prepare_data();
-//!     
-//!     // Measure exactly one operation
 //!     ctx.measure(|| {
 //!         expensive_operation(&data);
 //!     });
-//!     
-//!     // Teardown (not timed)
 //!     cleanup(&data);
 //! });
 //!
@@ -35,27 +74,43 @@
 //!
 //! ## Features
 //!
-//! - **`hdr`**: Enable HDR histogram for latency percentiles
-//! - **`async`**: Enable async benchmark support
+//! - **Single-shot measurements** — no statistical sampling overhead
+//! - **Glob filtering** — run subsets with `--workload "pattern*"`
 
+mod config;
 mod context;
+mod harness;
+mod report;
 mod result;
 mod runner;
-mod config;
-mod report;
-mod benches;
 
+pub use config::BenchRunnerConfig;
 pub use context::BenchContext;
+pub use report::{ConsoleReporter, JsonReporter, MultiReporter, Reporter};
 pub use result::{BenchResult, SuiteResult};
 pub use runner::BenchRunner;
-pub use config::BenchRunnerConfig;
-pub use report::{Reporter, ConsoleReporter, JsonReporter, MultiReporter};
 
-// Re-export benches helper so the `cargo-stress` binary (or users) can call it
-pub use benches::register_benchmarks;
+// Harness exports for auto-discovery
+pub use harness::{benchmark_count, list_benchmarks};
+pub use harness::{run_registered_benchmarks, run_with_options, StressRunnerOptions};
 
-#[cfg(feature = "hdr")]
-pub mod histogram;
+// Re-export the proc macro
+pub use cntryl_stress_macros::{stress_main, stress_test};
 
-#[cfg(feature = "async")]
-pub mod async_runner;
+/// Private module for macro internals - do not use directly.
+#[doc(hidden)]
+pub mod __private {
+    pub use crate::harness::{linkme, BenchmarkEntry, STRESS_BENCHMARKS};
+}
+
+/// Prelude module for convenient imports.
+///
+/// ```rust,ignore
+/// use cntryl_stress::prelude::*;
+/// ```
+pub mod prelude {
+    pub use crate::{
+        stress_main, stress_test, BenchContext, BenchResult, BenchRunner, BenchRunnerConfig,
+        StressRunnerOptions,
+    };
+}
