@@ -177,7 +177,7 @@ struct StressFile {
     path: PathBuf,
     /// Stem of the filename (e.g., "fsync")
     stem: String,
-    /// Derived binary name (e.g., "stress_fsync")
+    /// Derived binary name (e.g., "stress_fsync") when built as a bin
     binary_name: String,
 }
 
@@ -186,12 +186,84 @@ impl StressFile {
         let stem = path.file_stem()?.to_str()?.to_string();
         // Binary name: prefix with "stress_" to avoid conflicts
         let binary_name = format!("stress_{}", stem);
-        Some(Self {
-            path,
-            stem,
-            binary_name,
-        })
+        Some(Self { path, stem, binary_name })
     }
+}
+
+/// Create a temporary workspace member (package) containing the `src/bin/` files copied
+/// from the project's `stress/` directory so we can build them without requiring
+/// modifications to the user's `Cargo.toml`.
+fn create_temp_workspace(files: &[StressFile], project_root: &Path) -> Result<(PathBuf, PathBuf)> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let temp_root = project_root
+        .join("target")
+        .join("cargo-stress-temp")
+        .join(format!("run-{}", ts));
+
+    // Paths
+    let manifest_path = temp_root.join("Cargo.toml");
+    let src_bin_dir = temp_root.join("src").join("bin");
+    let target_dir = temp_root.join("target");
+
+    // Create directories
+    fs::create_dir_all(&src_bin_dir).context("Failed to create temp workspace src/bin")?;
+
+    // Read original Cargo.toml to get package name
+    let root_manifest = project_root.join("Cargo.toml");
+    let manifest_text = fs::read_to_string(&root_manifest).context("Failed to read root Cargo.toml")?;
+    let pkg_name = manifest_text
+        .lines()
+        .find_map(|l| {
+            let t = l.trim();
+            if t.starts_with("name") {
+                if let Some(eq) = t.find('=') {
+                    let v = t[eq + 1..].trim();
+                    return v.trim_matches('"').trim().to_string().into();
+                }
+            }
+            None
+        })
+        .unwrap_or_else(|| "cntryl-stress".to_string());
+
+    // Convert path to use forward slashes for TOML compatibility
+    let project_root_str = project_root.display().to_string().replace('\\', "/");
+
+    // Write Cargo.toml for temp package
+    let manifest_contents = format!(r#"[package]
+name = "cargo-stress-temp-{ts}"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+{pkg_name} = {{ path = "{project_root_str}" }}
+"#);
+
+    fs::write(&manifest_path, manifest_contents).context("Failed to write temp Cargo.toml")?;
+
+    // Copy stress files into src/bin, appending stress_main!() if not present
+    for file in files {
+        let dest = src_bin_dir.join(format!("{}.rs", file.stem));
+        let content = fs::read_to_string(&file.path)
+            .with_context(|| format!("Failed to read {}", file.path.display()))?;
+        
+        // Append stress_main!() if not already present
+        let final_content = if content.contains("stress_main!") {
+            content
+        } else {
+            format!("{}\n\ncntryl_stress::stress_main!();\n", content.trim_end())
+        };
+        
+        fs::write(&dest, final_content)
+            .with_context(|| format!("Failed to write {}", dest.display()))?;
+    }
+
+    Ok((manifest_path, target_dir))
 }
 
 // ============================================================================
@@ -251,6 +323,9 @@ fn run_stress(args: StressArgs) -> Result<()> {
         return Ok(());
     }
 
+    // Create temporary workspace so users don't need to update Cargo.toml
+    let (temp_manifest, temp_target_dir) = create_temp_workspace(&stress_files, project_root)?;
+
     if verbosity.is_verbose() {
         eprintln!(
             "🔍 Found {} stress file(s): {}",
@@ -265,11 +340,11 @@ fn run_stress(args: StressArgs) -> Result<()> {
 
     // Step 3: Build stress binaries (unless --no-build)
     if !args.no_build {
-        build_stress_binaries(&stress_files, &args, &manifest_path, verbosity)?;
+        build_stress_binaries(&stress_files, &args, &temp_manifest, verbosity, Some(&temp_target_dir))?;
     }
 
     // Step 4: Run stress binaries
-    let results = run_stress_binaries(&stress_files, &args, project_root, verbosity)?;
+    let results = run_stress_binaries(&stress_files, &args, &temp_target_dir, verbosity)?;
 
     // Step 5: Report results
     report_results(&results, verbosity)?;
@@ -289,6 +364,14 @@ fn run_stress(args: StressArgs) -> Result<()> {
 
     if verbosity.is_normal() {
         eprintln!("\n✅ All {} stress test(s) passed", results.len());
+    }
+
+    // Cleanup temp workspace on success (leave on failure for debugging)
+    let temp_root = temp_manifest.parent().unwrap();
+    if let Err(e) = fs::remove_dir_all(temp_root) {
+        if verbosity.is_verbose() {
+            eprintln!("⚠️  Failed to clean up temp workspace {}: {}", temp_root.display(), e);
+        }
     }
 
     Ok(())
@@ -411,6 +494,7 @@ fn build_stress_binaries(
     args: &StressArgs,
     manifest_path: &Path,
     verbosity: Verbosity,
+    target_dir_override: Option<&Path>,
 ) -> Result<()> {
     if verbosity.is_normal() {
         eprintln!(
@@ -437,9 +521,14 @@ fn build_stress_binaries(
         cmd.arg("--package").arg(package);
     }
 
-    // Add each binary target
+    // Override target-dir if requested (used for temp workspace builds)
+    if let Some(td) = target_dir_override {
+        cmd.arg("--target-dir").arg(td);
+    }
+
+    // Add each binary target (in temp workspace the bin name is the file stem)
     for file in files {
-        cmd.arg("--bin").arg(&file.binary_name);
+        cmd.arg("--bin").arg(&file.stem);
     }
 
     // Additional cargo args
@@ -489,6 +578,10 @@ fn build_stress_binaries(
         eprintln!("   Build complete.");
     }
 
+    if verbosity.is_normal() {
+        eprintln!("   Build complete.");
+    }
+
     Ok(())
 }
 
@@ -500,17 +593,16 @@ fn build_stress_binaries(
 fn run_stress_binaries(
     files: &[StressFile],
     args: &StressArgs,
-    project_root: &Path,
+    target_dir_parent: &Path,
     verbosity: Verbosity,
 ) -> Result<Vec<StressRunResult>> {
-    let target_dir = project_root
-        .join("target")
+    let target_dir = target_dir_parent
         .join(if args.dev { "debug" } else { "release" });
 
     let mut results = Vec::new();
 
     for file in files {
-        let binary_path = target_dir.join(&file.binary_name);
+        let binary_path = target_dir.join(&file.stem);
 
         // On Windows, add .exe extension
         #[cfg(windows)]
@@ -520,7 +612,7 @@ fn run_stress_binaries(
             if verbosity.is_normal() {
                 eprintln!(
                     "⚠️  Binary not found: {} (expected at {})",
-                    file.binary_name,
+                    file.stem,
                     binary_path.display()
                 );
             }

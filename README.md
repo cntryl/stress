@@ -28,7 +28,7 @@ cntryl-stress = "0.1"
 
 ### 2. Create a stress test file
 
-Create a binary or example with stress tests:
+Create `stress/my_test.rs`:
 
 ```rust
 use cntryl_stress::{stress_test, StressContext};
@@ -45,26 +45,12 @@ fn write_1mb_file(ctx: &mut StressContext) {
     std::fs::remove_file("/tmp/stress_test").ok();
 }
 
-// Ignored by default; opt-in with --include-ignored
 #[stress_test(ignore)]
 fn slow_network_test(ctx: &mut StressContext) {
     ctx.measure(|| {
         std::thread::sleep(std::time::Duration::from_secs(5));
     });
 }
-
-// Generate the main function
-cntryl_stress::stress_main!();
-```
-
-Try the included demo:
-
-```bash
-# Run the demo workspace member (has library + stress tests)
-cargo run -p stress-demo
-
-# Or run the simple example
-cargo run --example stress_demo
 ```
 
 ### 3. Run your benchmarks
@@ -206,15 +192,15 @@ cargo stress --runs 5 --baseline baseline.json --threshold 0.05
 
 ## Project Structure
 
-This repository demonstrates the recommended structure:
-
 ```
 your-project/
 ├── src/           # Your library code
-├── stress/        # Stress test binaries (*.rs files)
+├── stress/        # Stress tests (just drop .rs files here)
 │   └── my_stress.rs
 └── Cargo.toml
 ```
+
+That's it! No `Cargo.toml` changes needed. `cargo stress` auto-discovers files in `stress/` and builds them.
 
 ## Installation
 

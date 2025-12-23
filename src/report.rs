@@ -126,7 +126,7 @@ impl Reporter for ConsoleReporter {
             "---------------------------------------------------------------\n\
              Benchmark Suite: {}\n\
              Runs: {}, Warmup: {}\n\
-             ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+             ---------------------------------------------------------------\n",
             suite, config.runs, config.warmup_runs
         );
         self.write_stderr(&header);
@@ -179,9 +179,9 @@ impl Reporter for ConsoleReporter {
 
     fn suite_end(&self, result: &SuiteResult) {
         let footer = format!(
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
+            "---------------------------------------------------------------\n\
              Completed {} benchmarks in {}\n\
-             ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+             ---------------------------------------------------------------\n",
             result.results.len(),
             Self::format_duration(result.total_duration)
         );
