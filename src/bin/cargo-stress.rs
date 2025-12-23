@@ -198,16 +198,9 @@ impl StressFile {
 /// from the project's `stress/` directory so we can build them without requiring
 /// modifications to the user's `Cargo.toml`.
 fn create_temp_workspace(files: &[StressFile], project_root: &Path) -> Result<(PathBuf, PathBuf)> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
     let temp_root = project_root
         .join("target")
-        .join("cargo-stress-temp")
-        .join(format!("run-{}", ts));
+        .join("cargo-stress-temp");
 
     // Paths
     let manifest_path = temp_root.join("Cargo.toml");
@@ -245,8 +238,10 @@ fn create_temp_workspace(files: &[StressFile], project_root: &Path) -> Result<(P
     let manifest_contents = if is_stress_repo {
         // Building stress tests for cntryl-stress itself
         format!(
-            r#"[package]
-name = "cargo-stress-temp-{ts}"
+            r#"[workspace]
+
+[package]
+name = "cargo-stress-temp"
 version = "0.0.0"
 edition = "2021"
 publish = false
@@ -258,8 +253,10 @@ cntryl-stress = {{ path = "{project_root_str}" }}
     } else {
         // Building stress tests for a user project — need both cntryl-stress AND their crate
         format!(
-            r#"[package]
-name = "cargo-stress-temp-{ts}"
+            r#"[workspace]
+
+[package]
+name = "cargo-stress-temp"
 version = "0.0.0"
 edition = "2021"
 publish = false
