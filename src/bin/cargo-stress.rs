@@ -186,7 +186,11 @@ impl StressFile {
         let stem = path.file_stem()?.to_str()?.to_string();
         // Binary name: prefix with "stress_" to avoid conflicts
         let binary_name = format!("stress_{}", stem);
-        Some(Self { path, stem, binary_name })
+        Some(Self {
+            path,
+            stem,
+            binary_name,
+        })
     }
 }
 
@@ -215,7 +219,8 @@ fn create_temp_workspace(files: &[StressFile], project_root: &Path) -> Result<(P
 
     // Read original Cargo.toml to get package name and check if cntryl-stress is already a dep
     let root_manifest = project_root.join("Cargo.toml");
-    let manifest_text = fs::read_to_string(&root_manifest).context("Failed to read root Cargo.toml")?;
+    let manifest_text =
+        fs::read_to_string(&root_manifest).context("Failed to read root Cargo.toml")?;
     let pkg_name = manifest_text
         .lines()
         .find_map(|l| {
@@ -239,7 +244,8 @@ fn create_temp_workspace(files: &[StressFile], project_root: &Path) -> Result<(P
     // Write Cargo.toml for temp package
     let manifest_contents = if is_stress_repo {
         // Building stress tests for cntryl-stress itself
-        format!(r#"[package]
+        format!(
+            r#"[package]
 name = "cargo-stress-temp-{ts}"
 version = "0.0.0"
 edition = "2021"
@@ -247,10 +253,12 @@ publish = false
 
 [dependencies]
 cntryl-stress = {{ path = "{project_root_str}" }}
-"#)
+"#
+        )
     } else {
         // Building stress tests for a user project — need both cntryl-stress AND their crate
-        format!(r#"[package]
+        format!(
+            r#"[package]
 name = "cargo-stress-temp-{ts}"
 version = "0.0.0"
 edition = "2021"
@@ -259,7 +267,8 @@ publish = false
 [dependencies]
 cntryl-stress = "0.1"
 {pkg_name} = {{ path = "{project_root_str}" }}
-"#)
+"#
+        )
     };
 
     fs::write(&manifest_path, manifest_contents).context("Failed to write temp Cargo.toml")?;
@@ -269,14 +278,14 @@ cntryl-stress = "0.1"
         let dest = src_bin_dir.join(format!("{}.rs", file.stem));
         let content = fs::read_to_string(&file.path)
             .with_context(|| format!("Failed to read {}", file.path.display()))?;
-        
+
         // Append stress_main!() if not already present
         let final_content = if content.contains("stress_main!") {
             content
         } else {
             format!("{}\n\ncntryl_stress::stress_main!();\n", content.trim_end())
         };
-        
+
         fs::write(&dest, final_content)
             .with_context(|| format!("Failed to write {}", dest.display()))?;
     }
@@ -358,7 +367,13 @@ fn run_stress(args: StressArgs) -> Result<()> {
 
     // Step 3: Build stress binaries (unless --no-build)
     if !args.no_build {
-        build_stress_binaries(&stress_files, &args, &temp_manifest, verbosity, Some(&temp_target_dir))?;
+        build_stress_binaries(
+            &stress_files,
+            &args,
+            &temp_manifest,
+            verbosity,
+            Some(&temp_target_dir),
+        )?;
     }
 
     // Step 4: Run stress binaries
@@ -388,7 +403,11 @@ fn run_stress(args: StressArgs) -> Result<()> {
     let temp_root = temp_manifest.parent().unwrap();
     if let Err(e) = fs::remove_dir_all(temp_root) {
         if verbosity.is_verbose() {
-            eprintln!("⚠️  Failed to clean up temp workspace {}: {}", temp_root.display(), e);
+            eprintln!(
+                "⚠️  Failed to clean up temp workspace {}: {}",
+                temp_root.display(),
+                e
+            );
         }
     }
 
@@ -614,8 +633,7 @@ fn run_stress_binaries(
     target_dir_parent: &Path,
     verbosity: Verbosity,
 ) -> Result<Vec<StressRunResult>> {
-    let target_dir = target_dir_parent
-        .join(if args.dev { "debug" } else { "release" });
+    let target_dir = target_dir_parent.join(if args.dev { "debug" } else { "release" });
 
     let mut results = Vec::new();
 
@@ -790,7 +808,6 @@ fn report_results(results: &[StressRunResult], verbosity: Verbosity) -> Result<(
         return Ok(());
     }
 
-    eprintln!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     eprintln!("Summary:");
 
     let total_duration: Duration = results.iter().map(|r| r.duration).sum();
@@ -812,7 +829,6 @@ fn report_results(results: &[StressRunResult], verbosity: Verbosity) -> Result<(
         );
     }
 
-    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     eprintln!("Total time: {:.2}s", total_duration.as_secs_f64());
 
     Ok(())
