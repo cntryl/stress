@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "cntryl-stress"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Lightweight single-shot benchmark runner for system-level stress tests"
 license = "Apache-2.0"

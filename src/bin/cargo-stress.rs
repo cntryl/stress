@@ -332,7 +332,7 @@ fn run_stress(args: StressArgs) -> Result<()> {
         .context("Cargo.toml has no parent directory")?;
 
     if verbosity.is_verbose() {
-        eprintln!("📁 Project root: {}", project_root.display());
+        println!("📁 Project root: {}", project_root.display());
     }
 
     // Step 2: Discover stress files
@@ -341,8 +341,8 @@ fn run_stress(args: StressArgs) -> Result<()> {
 
     if stress_files.is_empty() {
         if verbosity.is_normal() {
-            eprintln!("⚠️  No stress test files found in {}", stress_dir.display());
-            eprintln!("   Create .rs files in stress/ with #[stress_test] functions");
+            println!("⚠️  No stress test files found in {}", stress_dir.display());
+            println!("   Create .rs files in stress/ with #[stress_test] functions");
         }
         return Ok(());
     }
@@ -351,7 +351,7 @@ fn run_stress(args: StressArgs) -> Result<()> {
     let (temp_manifest, temp_target_dir) = create_temp_workspace(&stress_files, project_root)?;
 
     if verbosity.is_verbose() {
-        eprintln!(
+        println!(
             "🔍 Found {} stress file(s): {}",
             stress_files.len(),
             stress_files
@@ -383,7 +383,7 @@ fn run_stress(args: StressArgs) -> Result<()> {
     let failed_count = results.iter().filter(|r| !r.success()).count();
     if failed_count > 0 {
         if verbosity.is_normal() {
-            eprintln!(
+            println!(
                 "\n❌ {} of {} stress test(s) failed",
                 failed_count,
                 results.len()
@@ -393,14 +393,14 @@ fn run_stress(args: StressArgs) -> Result<()> {
     }
 
     if verbosity.is_normal() {
-        eprintln!("\n✅ All {} stress test(s) passed", results.len());
+        println!("\n✅ All {} stress test(s) passed", results.len());
     }
 
     // Cleanup temp workspace on success (leave on failure for debugging)
     let temp_root = temp_manifest.parent().unwrap();
     if let Err(e) = fs::remove_dir_all(temp_root) {
         if verbosity.is_verbose() {
-            eprintln!(
+            println!(
                 "⚠️  Failed to clean up temp workspace {}: {}",
                 temp_root.display(),
                 e
@@ -531,7 +531,7 @@ fn build_stress_binaries(
     target_dir_override: Option<&Path>,
 ) -> Result<()> {
     if verbosity.is_normal() {
-        eprintln!(
+        println!(
             "🔨 Building {} stress binary(ies) in {} mode...",
             files.len(),
             if args.dev { "debug" } else { "release" }
@@ -573,7 +573,7 @@ fn build_stress_binaries(
     }
 
     if verbosity.is_verbose() {
-        eprintln!("   Running: {:?}", cmd);
+        println!("   Running: {:?}", cmd);
     }
 
     let output = cmd
@@ -609,11 +609,11 @@ fn build_stress_binaries(
     }
 
     if verbosity.is_normal() {
-        eprintln!("   Build complete.");
+        println!("   Build complete.");
     }
 
     if verbosity.is_normal() {
-        eprintln!("   Build complete.");
+        println!("   Build complete.");
     }
 
     Ok(())
@@ -674,7 +674,7 @@ fn run_single_binary(
     verbosity: Verbosity,
 ) -> Result<StressRunResult> {
     if verbosity.is_normal() {
-        eprintln!("\n🏃 Running stress test: {}", file.stem);
+        println!("\n🏃 Running stress test: {}", file.stem);
     }
 
     let mut cmd = Command::new(binary_path);
@@ -684,7 +684,7 @@ fn run_single_binary(
     build_passthrough_args(&mut cmd, args);
 
     if verbosity.is_verbose() {
-        eprintln!("   Executing: {:?}", cmd);
+        println!("   Executing: {:?}", cmd);
     }
 
     let start = Instant::now();
@@ -734,7 +734,7 @@ fn run_single_binary(
     }
 
     if verbosity.is_verbose() {
-        eprintln!(
+        println!(
             "   Completed in {:.2}s with exit code: {:?}",
             output.duration.as_secs_f64(),
             output.status.code()
@@ -805,7 +805,7 @@ fn report_results(results: &[StressRunResult], verbosity: Verbosity) -> Result<(
         return Ok(());
     }
 
-    eprintln!("Summary:");
+    println!("Summary:");
 
     let total_duration: Duration = results.iter().map(|r| r.duration).sum();
 
@@ -817,7 +817,7 @@ fn report_results(results: &[StressRunResult], verbosity: Verbosity) -> Result<(
             .map(|c| format!("exit {}", c))
             .unwrap_or_else(|| "signal".to_string());
 
-        eprintln!(
+        println!(
             "  {} {} ({:.2}s, {})",
             status,
             result.file.stem,
@@ -826,7 +826,7 @@ fn report_results(results: &[StressRunResult], verbosity: Verbosity) -> Result<(
         );
     }
 
-    eprintln!("Total time: {:.2}s", total_duration.as_secs_f64());
+    println!("Total time: {:.2}s", total_duration.as_secs_f64());
 
     Ok(())
 }

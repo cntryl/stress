@@ -11,7 +11,7 @@ pub struct BenchRunnerConfig {
     pub warmup_runs: usize,
     /// Output directory for JSON results.
     pub output_dir: PathBuf,
-    /// Print results to stderr.
+    /// Print results to stdout.
     pub verbose: bool,
     /// Filter benchmarks by name substring.
     pub filter: Option<String>,

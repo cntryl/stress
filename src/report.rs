@@ -32,21 +32,21 @@ const NAME_WIDTH: usize = 48;
 /// Fixed width for duration column in console output.
 const DURATION_WIDTH: usize = 12;
 
-/// Console reporter that prints results to stderr.
+/// Console reporter that prints results to stdout.
 ///
 /// Output is atomic: each benchmark is printed as a single complete line
 /// in `bench_end`, ensuring logs cannot interleave even if a benchmark panics.
 pub struct ConsoleReporter {
     show_all_runs: bool,
-    /// Mutex ensures atomic writes to stderr across threads.
-    stderr_lock: Mutex<()>,
+    /// Mutex ensures atomic writes across threads.
+    output_lock: Mutex<()>,
 }
 
 impl ConsoleReporter {
     pub fn new() -> Self {
         Self {
             show_all_runs: false,
-            stderr_lock: Mutex::new(()),
+            output_lock: Mutex::new(()),
         }
     }
 
@@ -96,19 +96,14 @@ impl ConsoleReporter {
         }
     }
 
-    /// Atomically write a complete message to stderr.
+    /// Atomically write a complete message to stdout.
     /// Never panics; logs warning on error.
-    fn write_stderr(&self, message: &str) {
+    fn write_stdout(&self, message: &str) {
         // Acquire lock to ensure atomicity; ignore poison (another thread panicked)
-        let _guard = self.stderr_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stderr = std::io::stderr().lock();
-        if let Err(e) = writeln!(stderr, "{}", message) {
-            // Last resort: try to log the error without the lock
-            let _ = writeln!(
-                std::io::stderr(),
-                "Warning: failed to write to stderr: {}",
-                e
-            );
+        let _guard = self.output_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stdout = std::io::stdout().lock();
+        if let Err(e) = writeln!(stdout, "{}", message) {
+            let _ = writeln!(std::io::stderr(), "Warning: failed to write to stdout: {}", e);
         }
     }
 }
@@ -129,7 +124,7 @@ impl Reporter for ConsoleReporter {
              ---------------------------------------------------------------\n",
             suite, config.runs, config.warmup_runs
         );
-        self.write_stderr(&header);
+        self.write_stdout(&header);
     }
 
     fn bench_start(&self, _name: &str) {
@@ -174,7 +169,7 @@ impl Reporter for ConsoleReporter {
             line.push_str(&format!("\n      runs: [{}]", runs_formatted.join(", ")));
         }
 
-        self.write_stderr(&line);
+        self.write_stdout(&line);
     }
 
     fn suite_end(&self, result: &SuiteResult) {
@@ -185,7 +180,7 @@ impl Reporter for ConsoleReporter {
             result.results.len(),
             Self::format_duration(result.total_duration)
         );
-        self.write_stderr(&footer);
+        self.write_stdout(&footer);
     }
 }
 
