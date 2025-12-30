@@ -103,7 +103,11 @@ impl ConsoleReporter {
         let _guard = self.output_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut stdout = std::io::stdout().lock();
         if let Err(e) = writeln!(stdout, "{}", message) {
-            let _ = writeln!(std::io::stderr(), "Warning: failed to write to stdout: {}", e);
+            let _ = writeln!(
+                std::io::stderr(),
+                "Warning: failed to write to stdout: {}",
+                e
+            );
         }
     }
 }

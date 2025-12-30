@@ -22,7 +22,7 @@
 //! my-project/
 //!   Cargo.toml          # Must declare [[bin]] targets for stress files
 //!   src/lib.rs
-//!   stress/
+//!   benches/
 //!     fsync.rs          # -> binary: stress_fsync
 //!     compaction.rs     # -> binary: stress_compaction
 //!     recovery.rs       # -> binary: stress_recovery
@@ -52,7 +52,7 @@ use std::time::{Duration, Instant};
     long_about = "
 cargo-stress is a Cargo subcommand for running system-level stress tests.
 
-Each .rs file in the stress/ directory is compiled as a separate binary
+Each .rs file in the benches/ directory is compiled as a separate binary
 in release mode. Tests are defined with #[stress_test] and discovered
 automatically at runtime by each binary.
 
@@ -169,10 +169,10 @@ struct StressArgs {
 // Discovered Stress File
 // ============================================================================
 
-/// Represents a discovered stress test file in the stress/ directory.
+/// Represents a discovered stress test file in the benches/ directory.
 #[derive(Debug, Clone)]
 struct StressFile {
-    /// Path to the .rs file (e.g., "stress/fsync.rs")
+    /// Path to the .rs file (e.g., "benches/fsync.rs")
     #[allow(dead_code)]
     path: PathBuf,
     /// Stem of the filename (e.g., "fsync")
@@ -195,12 +195,10 @@ impl StressFile {
 }
 
 /// Create a temporary workspace member (package) containing the `src/bin/` files copied
-/// from the project's `stress/` directory so we can build them without requiring
+/// from the project's `benches/` directory so we can build them without requiring
 /// modifications to the user's `Cargo.toml`.
 fn create_temp_workspace(files: &[StressFile], project_root: &Path) -> Result<(PathBuf, PathBuf)> {
-    let temp_root = project_root
-        .join("target")
-        .join("cargo-stress-temp");
+    let temp_root = project_root.join("target").join("cargo-stress-temp");
 
     // Paths
     let manifest_path = temp_root.join("Cargo.toml");
@@ -270,21 +268,13 @@ cntryl-stress = "0.1"
 
     fs::write(&manifest_path, manifest_contents).context("Failed to write temp Cargo.toml")?;
 
-    // Copy stress files into src/bin, appending stress_main!() if not present
+    // Copy stress files into src/bin
     for file in files {
         let dest = src_bin_dir.join(format!("{}.rs", file.stem));
         let content = fs::read_to_string(&file.path)
             .with_context(|| format!("Failed to read {}", file.path.display()))?;
 
-        // Append stress_main!() if not already present
-        let final_content = if content.contains("stress_main!") {
-            content
-        } else {
-            format!("{}\n\ncntryl_stress::stress_main!();\n", content.trim_end())
-        };
-
-        fs::write(&dest, final_content)
-            .with_context(|| format!("Failed to write {}", dest.display()))?;
+        fs::write(&dest, content).with_context(|| format!("Failed to write {}", dest.display()))?;
     }
 
     Ok((manifest_path, target_dir))
@@ -336,13 +326,16 @@ fn run_stress(args: StressArgs) -> Result<()> {
     }
 
     // Step 2: Discover stress files
-    let stress_dir = project_root.join("stress");
-    let stress_files = discover_stress_files(&stress_dir, &args)?;
+    let benches_dir = project_root.join("benches");
+    let stress_files = discover_stress_files(&benches_dir, &args)?;
 
     if stress_files.is_empty() {
         if verbosity.is_normal() {
-            println!("⚠️  No stress test files found in {}", stress_dir.display());
-            println!("   Create .rs files in stress/ with #[stress_test] functions");
+            println!(
+                "⚠️  No stress test files found in {}",
+                benches_dir.display()
+            );
+            println!("   Create .rs files in benches/ that include cntryl_stress::stress_main!()");
         }
         return Ok(());
     }
@@ -479,15 +472,15 @@ fn find_manifest(args: &StressArgs) -> Result<PathBuf> {
 // Stress File Discovery
 // ============================================================================
 
-/// Discover all .rs files in the stress/ directory.
-fn discover_stress_files(stress_dir: &Path, args: &StressArgs) -> Result<Vec<StressFile>> {
-    if !stress_dir.exists() {
+/// Discover all .rs files in the benches/ directory.
+fn discover_stress_files(benches_dir: &Path, args: &StressArgs) -> Result<Vec<StressFile>> {
+    if !benches_dir.exists() {
         return Ok(Vec::new());
     }
 
     let mut files = Vec::new();
 
-    for entry in fs::read_dir(stress_dir).context("Failed to read stress/ directory")? {
+    for entry in fs::read_dir(benches_dir).context("Failed to read benches/ directory")? {
         let entry = entry?;
         let path = entry.path();
 
@@ -498,6 +491,15 @@ fn discover_stress_files(stress_dir: &Path, args: &StressArgs) -> Result<Vec<Str
 
         // Skip if not a file
         if !path.is_file() {
+            continue;
+        }
+
+        // Only treat this as a stress file if it declares a stress_main!() entrypoint.
+        // This prevents accidental conflicts with other bench harnesses (e.g. Criterion)
+        // that also live under benches/.
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        if !content.contains("stress_main!") {
             continue;
         }
 

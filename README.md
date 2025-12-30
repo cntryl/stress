@@ -28,7 +28,7 @@ cntryl-stress = "0.1"
 
 ### 2. Create a stress test file
 
-Create `stress/my_test.rs`:
+Create `benches/my_test.rs`:
 
 ```rust
 use cntryl_stress::{stress_test, StressContext};
@@ -195,12 +195,12 @@ cargo stress --runs 5 --baseline baseline.json --threshold 0.05
 ```
 your-project/
 ├── src/           # Your library code
-├── stress/        # Stress tests (just drop .rs files here)
+├── benches/       # Stress tests (just drop .rs files here)
 │   └── my_stress.rs
 └── Cargo.toml
 ```
 
-That's it! No `Cargo.toml` changes needed. `cargo stress` auto-discovers files in `stress/` and builds them.
+That's it! No `Cargo.toml` changes needed. `cargo stress` auto-discovers files in `benches/` and builds them.
 
 ## Installation
 

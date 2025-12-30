@@ -40,3 +40,5 @@ fn fibonacci(n: u32) -> u64 {
         _ => fibonacci(n - 1) + fibonacci(n - 2),
     }
 }
+
+cntryl_stress::stress_main!();
