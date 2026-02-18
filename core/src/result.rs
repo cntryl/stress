@@ -95,8 +95,12 @@ pub struct SuiteResult {
     /// Total suite duration
     #[serde(with = "duration_serde")]
     pub total_duration: Duration,
-    /// Timestamp when suite started
+    /// Timestamp when suite started (ISO8601 format)
     pub started_at: String,
+    /// Number of measurement runs performed
+    pub runs: usize,
+    /// Number of warmup runs (not included in results)
+    pub warmup_runs: usize,
     /// Git commit hash (if available)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_sha: Option<String>,

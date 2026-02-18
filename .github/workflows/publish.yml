@@ -1,0 +1,38 @@
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      crate:
+        description: "Which crate to publish"
+        required: true
+        default: macros
+        type: choice
+        options:
+          - macros
+          - core
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Update Rust toolchain
+        run: rustup update stable
+
+      - name: Check clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build release
+        working-directory: ${{ github.event.inputs.crate }}
+        run: cargo build --release
+
+      - name: Publish ${{ github.event.inputs.crate }} to crates.io
+        working-directory: ${{ github.event.inputs.crate }}
+        run: cargo publish

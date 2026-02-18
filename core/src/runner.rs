@@ -45,12 +45,11 @@ impl BenchRunner {
     pub fn with_config(suite: &str, config: BenchRunnerConfig) -> Self {
         let suite_start = Instant::now();
 
-        // Default reporters: console (if verbose) + JSON
-        let mut reporters: Vec<Box<dyn Reporter>> = Vec::new();
-        if config.verbose {
-            reporters.push(Box::new(ConsoleReporter::new()));
-        }
-        reporters.push(Box::new(JsonReporter::new(config.output_dir.clone())));
+        // Default reporters: console (always) + JSON
+        let reporters: Vec<Box<dyn Reporter>> = vec![
+            Box::new(ConsoleReporter::new()),
+            Box::new(JsonReporter::new(config.output_dir.clone())),
+        ];
 
         let runner = Self {
             suite: suite.to_string(),
@@ -191,6 +190,8 @@ impl BenchRunner {
             results: self.results.clone(),
             total_duration,
             started_at: chrono_timestamp(),
+            runs: self.config.runs,
+            warmup_runs: self.config.warmup_runs,
             git_sha: self.config.git_sha.clone(),
             metadata: self.metadata,
         };
@@ -220,6 +221,8 @@ impl BenchRunner {
                     results: results.clone(),
                     total_duration: Duration::ZERO,
                     started_at: String::new(),
+                    runs: 0,
+                    warmup_runs: 0,
                     git_sha: None,
                     metadata: HashMap::new(),
                 };
@@ -254,12 +257,14 @@ impl<'a> BenchGroup<'a> {
 }
 
 fn chrono_timestamp() -> String {
-    // Simple ISO 8601 timestamp without chrono dependency
+    // Return a compact unique timestamp (unix seconds with millisecond precision)
+    // This works well for both filenames and JSON values
     let now = std::time::SystemTime::now();
     let duration = now
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    format!("{}", duration.as_secs())
+    // Use milliseconds for better uniqueness when multiple runs happen quickly
+    format!("{}", duration.as_millis())
 }
 
 #[cfg(test)]

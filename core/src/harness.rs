@@ -320,6 +320,34 @@ pub fn run_registered_benchmarks() {
     run_with_options(StressRunnerOptions::new());
 }
 
+/// Get the benchmark suite name from the executable name.
+fn get_suite_name() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.file_stem().map(|s| s.to_string_lossy().to_string()))
+        .map(|name| {
+            // Remove cargo's hash suffix (format: name-HASH)
+            // The hash is always a hex string with exactly 16 characters
+            let clean_name = if let Some(dash_pos) = name.rfind('-') {
+                let potential_hash = &name[dash_pos + 1..];
+                // Check if it looks like a hash (all hex chars and correct length)
+                if potential_hash.len() == 16
+                    && potential_hash.chars().all(|c| c.is_ascii_hexdigit())
+                {
+                    &name[..dash_pos]
+                } else {
+                    &name
+                }
+            } else {
+                &name
+            };
+
+            // Convert underscores to hyphens (cargo converts hyphen to underscore in exe name)
+            clean_name.replace('_', "-")
+        })
+        .unwrap_or_else(|| "stress".to_string())
+}
+
 /// Run all registered benchmarks with custom options.
 pub fn run_with_options(opts: StressRunnerOptions) {
     let benchmarks: Vec<_> = STRESS_BENCHMARKS
@@ -356,7 +384,8 @@ pub fn run_with_options(opts: StressRunnerOptions) {
     }
     config.verbose = opts.verbose;
 
-    let mut runner = BenchRunner::with_config("stress", config);
+    let suite_name = get_suite_name();
+    let mut runner = BenchRunner::with_config(&suite_name, config);
 
     // Run each benchmark
     for bench in &benchmarks {
@@ -377,8 +406,8 @@ pub fn run_with_options(opts: StressRunnerOptions) {
             std::process::exit(1);
         }
     } else {
-        let results = runner.finish();
-        eprintln!("\n✅ {} benchmark(s) completed", results.len());
+        let _results = runner.finish();
+        // Summary already printed by ConsoleReporter
     }
 }
 

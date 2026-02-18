@@ -28,9 +28,9 @@ pub trait Reporter: Send + Sync {
 }
 
 /// Fixed width for benchmark name column in console output.
-const NAME_WIDTH: usize = 48;
+const NAME_WIDTH: usize = 40;
 /// Fixed width for duration column in console output.
-const DURATION_WIDTH: usize = 12;
+const DURATION_WIDTH: usize = 14;
 
 /// Console reporter that prints results to stdout.
 ///
@@ -56,17 +56,10 @@ impl ConsoleReporter {
         self
     }
 
-    /// Format a duration with consistent units: µs, ms, or s.
+    /// Format a duration with consistent units: ns, µs, ms, or s.
     /// Always uses 2 decimal places, no scientific notation.
     fn format_duration(d: std::time::Duration) -> String {
-        let secs = d.as_secs_f64();
-        if secs >= 1.0 {
-            format!("{:.2}s", secs)
-        } else if secs >= 0.001 {
-            format!("{:.2}ms", secs * 1000.0)
-        } else {
-            format!("{:.2}µs", secs * 1_000_000.0)
-        }
+        format_duration(d)
     }
 
     /// Format throughput string, only if bytes or elements are set.
@@ -137,6 +130,14 @@ impl Reporter for ConsoleReporter {
     }
 
     fn bench_end(&self, result: &BenchResult) {
+        // Extract just the benchmark name (remove suite prefix)
+        let name_parts: Vec<&str> = result.name.split('/').collect();
+        let bench_name = if name_parts.len() >= 2 {
+            name_parts[name_parts.len() - 1]
+        } else {
+            &result.name
+        };
+
         // Format duration (median from BenchResult)
         let duration_str = Self::format_duration(result.duration);
 
@@ -147,7 +148,7 @@ impl Reporter for ConsoleReporter {
         let mut line = if throughput_str.is_empty() {
             format!(
                 "  {:<width$} {:>dur_width$}",
-                result.name,
+                bench_name,
                 duration_str,
                 width = NAME_WIDTH,
                 dur_width = DURATION_WIDTH
@@ -155,7 +156,7 @@ impl Reporter for ConsoleReporter {
         } else {
             format!(
                 "  {:<width$} {:>dur_width$}  ({})",
-                result.name,
+                bench_name,
                 duration_str,
                 throughput_str,
                 width = NAME_WIDTH,
@@ -190,8 +191,10 @@ impl Reporter for ConsoleReporter {
 
 /// JSON reporter that writes results to a file.
 ///
-/// Writes both a timestamped suite file and a `latest.json` symlink/copy
-/// for easy access to the most recent results.
+/// Writes timestamped results files organized by suite:
+/// - `{suite}/{timestamp}.json` - Machine-readable results
+/// - `{suite}/{timestamp}.txt` - Human-readable summary
+/// - `{suite}/latest.json` and `latest.txt` - Most recent results
 pub struct JsonReporter {
     output_dir: PathBuf,
 }
@@ -204,35 +207,136 @@ impl JsonReporter {
     }
 
     /// Write JSON results to the output directory.
-    /// Creates both `{suite}.json` and `latest.json`.
+    /// Creates both timestamped JSON and text summary files organized by suite name.
     /// Never panics; logs warnings to stderr on failure.
     fn write_results(&self, result: &SuiteResult) {
         if let Err(e) = self.write_results_inner(result) {
-            eprintln!("Warning: failed to write JSON results: {}", e);
+            eprintln!("Warning: failed to write results: {}", e);
         }
     }
 
     fn write_results_inner(&self, result: &SuiteResult) -> std::io::Result<()> {
-        std::fs::create_dir_all(&self.output_dir)?;
-
-        // Sanitize suite name for filename (replace path separators)
+        // Sanitize suite name for directory (replace path separators)
         let sanitized_name = result.suite.replace(['/', '\\'], "_");
-        let filename = format!("{}.json", sanitized_name);
-        let suite_path = self.output_dir.join(&filename);
+
+        // Create suite-specific subdirectory
+        let suite_dir = self.output_dir.join(&sanitized_name);
+        std::fs::create_dir_all(&suite_dir)?;
+
+        // Create timestamped filename to make each run unique
+        let timestamp_str = &result.started_at;
+        let json_filename = format!("{}.json", timestamp_str);
+        let txt_filename = format!("{}.txt", timestamp_str);
+
+        let timestamped_json_path = suite_dir.join(&json_filename);
+        let timestamped_txt_path = suite_dir.join(&txt_filename);
 
         // Serialize to JSON
         let json = serde_json::to_string_pretty(result).map_err(std::io::Error::other)?;
 
-        // Write suite-specific file
-        std::fs::write(&suite_path, &json)?;
-        eprintln!("  Results written to: {}", suite_path.display());
+        // Write timestamped JSON file
+        std::fs::write(&timestamped_json_path, &json)?;
+        eprintln!("  Results written to: {}", timestamped_json_path.display());
 
-        // Write latest.json for convenient access
-        let latest_path = self.output_dir.join("latest.json");
-        std::fs::write(&latest_path, &json)?;
-        eprintln!("  Latest results at: {}", latest_path.display());
+        // Generate and write text summary
+        let summary = self.format_summary(result);
+        std::fs::write(&timestamped_txt_path, &summary)?;
+
+        // Write latest files for convenient access to most recent results
+        let latest_json_path = suite_dir.join("latest.json");
+        let latest_txt_path = suite_dir.join("latest.txt");
+        std::fs::write(&latest_json_path, &json)?;
+        std::fs::write(&latest_txt_path, &summary)?;
+        eprintln!("  Latest results at: {}", latest_json_path.display());
 
         Ok(())
+    }
+
+    fn format_summary(&self, result: &SuiteResult) -> String {
+        let mut output = String::new();
+        output.push_str("===============================================================\n");
+        output.push_str(&format!("Benchmark Suite: {}\n", result.suite));
+        output.push_str("===============================================================\n\n");
+
+        output.push_str(&format!("Completed: {}\n", result.started_at));
+        if let Some(sha) = &result.git_sha {
+            output.push_str(&format!("Git SHA:   {}\n", sha));
+        }
+        output.push('\n');
+
+        output.push_str("Results:\n");
+        output.push_str("---------------------------------------------------------------\n");
+
+        for result in &result.results {
+            // Extract just the benchmark name (remove suite prefix)
+            let name_parts: Vec<&str> = result.name.split('/').collect();
+            let bench_name = if name_parts.len() >= 2 {
+                name_parts[name_parts.len() - 1]
+            } else {
+                &result.name
+            };
+
+            // Format duration
+            let duration_str = format_duration(result.duration);
+
+            // Format throughput using same logic as console reporter
+            let throughput_str = if let Some(_bps) = result.bytes_per_sec() {
+                let bps = result.bytes_per_sec().unwrap();
+                if bps >= 1_000_000_000.0 {
+                    format!("  ({:.2} GB/s)", bps / 1_000_000_000.0)
+                } else if bps >= 1_000_000.0 {
+                    format!("  ({:.2} MB/s)", bps / 1_000_000.0)
+                } else if bps >= 1_000.0 {
+                    format!("  ({:.2} KB/s)", bps / 1_000.0)
+                } else {
+                    format!("  ({:.2} B/s)", bps)
+                }
+            } else if let Some(_eps) = result.elements_per_sec() {
+                let eps = result.elements_per_sec().unwrap();
+                if eps >= 1_000_000.0 {
+                    format!("  ({:.2}M ops/s)", eps / 1_000_000.0)
+                } else if eps >= 1_000.0 {
+                    format!("  ({:.2}K ops/s)", eps / 1_000.0)
+                } else {
+                    format!("  ({:.0} ops/s)", eps)
+                }
+            } else {
+                String::new()
+            };
+
+            output.push_str(&format!(
+                "  {:<width$} {:>dur_width$}{}
+",
+                bench_name,
+                duration_str,
+                throughput_str,
+                width = NAME_WIDTH,
+                dur_width = DURATION_WIDTH
+            ));
+        }
+
+        output.push_str("---------------------------------------------------------------\n");
+        output.push_str(&format!(
+            "Total time: {}\n",
+            format_duration(result.total_duration)
+        ));
+        output.push_str(&format!("Benchmarks: {}\n", result.results.len()));
+        output.push_str("===============================================================\n");
+
+        output
+    }
+}
+
+fn format_duration(nanos: std::time::Duration) -> String {
+    let secs = nanos.as_secs_f64();
+    if secs >= 1.0 {
+        format!("{:.2}s", secs)
+    } else if secs >= 0.001 {
+        format!("{:.2}ms", secs * 1_000.0)
+    } else if secs >= 0.000_001 {
+        format!("{:.2}us", secs * 1_000_000.0)
+    } else {
+        format!("{:.2}ns", secs * 1_000_000_000.0)
     }
 }
 
@@ -393,7 +497,7 @@ mod tests {
         assert!(ConsoleReporter::format_duration(Duration::from_millis(500)).contains("ms"));
 
         // Microseconds for durations < 1ms
-        assert!(ConsoleReporter::format_duration(Duration::from_micros(100)).contains("µs"));
+        assert!(ConsoleReporter::format_duration(Duration::from_micros(100)).contains("us"));
     }
 
     #[test]
@@ -408,7 +512,7 @@ mod tests {
 
         let d = Duration::from_secs_f64(0.000123456);
         let formatted = ConsoleReporter::format_duration(d);
-        assert_eq!(formatted, "123.46µs");
+        assert_eq!(formatted, "123.46us");
     }
 
     #[test]
