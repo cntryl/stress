@@ -33,6 +33,9 @@ jobs:
         working-directory: ${{ github.event.inputs.crate }}
         run: cargo build --release
 
+      - name: Login
+        uses: rust-lang/crates-io-auth-action@v1
+
       - name: Publish ${{ github.event.inputs.crate }} to crates.io
         working-directory: ${{ github.event.inputs.crate }}
         run: cargo publish
