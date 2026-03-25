@@ -6,7 +6,7 @@
 
 A lightweight benchmark runner for expensive operations: disk I/O, network calls, database transactions, compaction, recovery.
 
-Unlike Criterion (statistical sampling), cntryl-stress measures single expensive operations where each iteration matters.
+Unlike Criterion (statistical sampling), cntryl-stress supports both single-shot measurements and duration-bounded throughput loops where each iteration matters.
 
 ## Quick Start
 
@@ -59,6 +59,7 @@ BENCH_RUNS=5 BENCH_WARMUP=1 cargo bench --bench my_stress
 ## Features
 
 - **Single-shot measurements** — no statistical overhead
+- **Duration-bounded measurements** — keep a benchmark running long enough for authoritative throughput numbers
 - **Explicit timing** — setup/teardown excluded from measurements
 - **Throughput tracking** — bytes/sec or ops/sec reporting
 - **JSON + text output** — machine and human-readable formats
@@ -79,6 +80,7 @@ Runs: 5, Warmup: 1
 
   write_file                             15.32ms  (65.28 MB/s)
   allocate_buffer                        45.18ms
+  hash_items                             3.01s  (25.05M ops/s)
 ---------------------------------------------------------------
 Completed 2 benchmarks in 60.50ms
 ```
@@ -194,10 +196,17 @@ fn compress(ctx: &mut StressContext) {
 // Operations per second
 #[stress_test]
 fn hash_items(ctx: &mut StressContext) {
-    ctx.set_elements(1_000_000);
-    ctx.measure(|| { (0..1_000_000).map(hash).collect::<Vec<_>>() });
+  use std::time::Duration;
+
+  let item_count = 1_000_000usize;
+  let iterations = ctx.measure_for(Duration::from_secs(3), || {
+    let _ = (0..item_count)
+      .map(|value| value.wrapping_mul(31))
+      .collect::<Vec<_>>();
+  });
+  ctx.set_elements((item_count * iterations) as u64);
 }
-// Output: hash_items ... 5.42ms (184.50M ops/s)
+// Output: hash_items ... 3.01s (184.50M ops/s)
 ```
 
 ## Attributes
@@ -214,6 +223,8 @@ fn hash_items(ctx: &mut StressContext) {
 
 ```rust
 pub fn measure<F>(&mut self, f: F)           // Time one operation
+pub fn measure_for<F>(&mut self, duration: Duration, f: F) -> usize
+                                             // Time repeated work for a wall-clock budget
 pub fn set_bytes(&mut self, n: u64)          // Enable bytes/sec throughput
 pub fn set_elements(&mut self, n: u64)       // Enable ops/sec throughput
 pub fn tag(&mut self, key: &str, val: &str)  // Add metadata
@@ -237,7 +248,7 @@ impl BenchRunner {
 See `demo/benches/`:
 - `stress_demo.rs` — I/O, memory, computation basics
 - `stress_demo1.rs` — File writes, allocation, math
-- `stress_demo2.rs` — Sorting, hashing, copying, recursion
+- `stress_demo2.rs` — Sorting, hashing, copying, recursion with both timing modes
 
 ```bash
 cargo bench --bench stress-demo

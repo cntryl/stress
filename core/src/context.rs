@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 /// Context passed to benchmark closures for timing control.
 ///
-/// The closure must call exactly one of the `measure` methods to record timing.
+/// The closure must call exactly one timing method to record a duration.
 pub struct StressContext {
     pub(crate) duration: Option<Duration>,
     pub(crate) bytes: Option<u64>,
@@ -43,6 +43,13 @@ impl StressContext {
         self.tags.push((key.into(), value.into()));
     }
 
+    fn set_duration(&mut self, duration: Duration) {
+        if self.duration.is_some() {
+            panic!("Timing was recorded more than once for this benchmark.");
+        }
+        self.duration = Some(duration);
+    }
+
     /// Time a single-shot operation. Call exactly once per benchmark.
     ///
     /// Everything before this is setup (not timed).
@@ -71,8 +78,34 @@ impl StressContext {
     {
         let start = Instant::now();
         let result = f();
-        self.duration = Some(start.elapsed());
+        self.set_duration(start.elapsed());
         result
+    }
+
+    /// Time a repeated operation until the requested wall-clock budget is met.
+    ///
+    /// The closure is executed as many times as possible until the target
+    /// duration has elapsed. The return value is the number of completed
+    /// iterations, which is useful for reporting total throughput.
+    #[must_use = "use the iteration count to report throughput totals"]
+    pub fn measure_for<F>(&mut self, duration: Duration, mut f: F) -> usize
+    where
+        F: FnMut(),
+    {
+        let start = Instant::now();
+        let mut iterations = 0usize;
+
+        loop {
+            f();
+            iterations += 1;
+
+            if start.elapsed() >= duration {
+                break;
+            }
+        }
+
+        self.set_duration(start.elapsed());
+        iterations
     }
 
     /// Time an operation on a borrowed reference (avoids moves).
@@ -84,7 +117,7 @@ impl StressContext {
     {
         let start = Instant::now();
         let result = f(target);
-        self.duration = Some(start.elapsed());
+        self.set_duration(start.elapsed());
         result
     }
 
@@ -95,7 +128,7 @@ impl StressContext {
     {
         let start = Instant::now();
         let result = f(target);
-        self.duration = Some(start.elapsed());
+        self.set_duration(start.elapsed());
         result
     }
 
@@ -103,7 +136,7 @@ impl StressContext {
     ///
     /// Use this when the timing happens inside the system under test.
     pub fn record_duration(&mut self, duration: Duration) {
-        self.duration = Some(duration);
+        self.set_duration(duration);
     }
 }
 
@@ -119,6 +152,17 @@ mod tests {
         let d = ctx.duration.unwrap();
         assert!(d >= Duration::from_millis(10));
         assert!(d < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn should_measure_duration_for_budget() {
+        let mut ctx = StressContext::new();
+        let iterations = ctx.measure_for(Duration::from_millis(5), || {
+            std::hint::black_box(1usize);
+        });
+
+        assert!(iterations > 0);
+        assert!(ctx.duration.unwrap() >= Duration::from_millis(5));
     }
 
     #[test]

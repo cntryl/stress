@@ -95,7 +95,7 @@ impl BenchRunner {
 
     /// Run a benchmark case.
     ///
-    /// The closure must call `ctx.measure()` exactly once.
+    /// The closure must record exactly one duration with `ctx.measure()` or `ctx.measure_for()`.
     pub fn run<F>(&mut self, name: &str, f: F)
     where
         F: Fn(&mut StressContext),
@@ -131,8 +131,8 @@ impl BenchRunner {
                 durations.push(d);
             } else {
                 panic!(
-                    "Benchmark '{}' did not call ctx.measure(). \
-                     Every benchmark must measure exactly one operation.",
+                    "Benchmark '{}' did not record a duration. \
+                     Call ctx.measure() or ctx.measure_for() exactly once.",
                     name
                 );
             }
@@ -305,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "did not call ctx.measure")]
+    #[should_panic(expected = "did not record a duration")]
     fn should_panic_when_measure_not_called() {
         let config = BenchRunnerConfig::new().verbose(false);
         let mut runner = BenchRunner::with_config("test", config);

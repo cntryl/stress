@@ -1,5 +1,6 @@
 use cntryl_stress::{stress_test, StressContext};
 use std::hint::black_box;
+use std::time::Duration;
 
 #[stress_test]
 fn sort_large_vector(ctx: &mut StressContext) {
@@ -16,15 +17,15 @@ fn sort_large_vector(ctx: &mut StressContext) {
 fn hash_string_throughput(ctx: &mut StressContext) {
     use std::collections::HashSet;
     let strings: Vec<_> = (0..10_000).map(|i| format!("key_{}", i)).collect();
-    ctx.set_elements(strings.len() as u64);
-
-    ctx.measure(|| {
+    let iterations = ctx.measure_for(Duration::from_secs(3), || {
         let mut set = HashSet::new();
         for s in &strings {
             set.insert(s.clone());
         }
         black_box(&set);
     });
+
+    ctx.set_elements((strings.len() * iterations) as u64);
 }
 
 #[stress_test]

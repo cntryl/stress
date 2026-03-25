@@ -1,10 +1,11 @@
 //! # cntryl-stress
 //!
-//! A lightweight single-shot benchmark runner for system-level stress tests.
+//! A lightweight benchmark runner for system-level stress tests.
 //!
 //! Unlike Criterion (which uses statistical sampling), this crate is designed for
 //! expensive operations where each iteration matters: disk I/O, network calls,
-//! database transactions, compaction, recovery, etc.
+//! database transactions, compaction, recovery, etc. It supports both single-shot
+//! measurements and duration-bounded throughput loops.
 //!
 //! ## Quick Start (Attribute Style - Recommended)
 //!
@@ -31,6 +32,17 @@
 //!     ctx.measure(|| {
 //!         db.insert("key", "value");
 //!     });
+//! }
+//!
+//! #[stress_test]
+//! fn database_throughput(ctx: &mut StressContext) {
+//!     use std::time::Duration;
+//!
+//!     let db = setup_database();
+//!     let iterations = ctx.measure_for(Duration::from_secs(3), || {
+//!         db.insert("key", "value");
+//!     });
+//!     ctx.set_elements(iterations as u64);
 //! }
 //!
 //! // Generate main function
@@ -75,6 +87,7 @@
 //! ## Features
 //!
 //! - **Single-shot measurements** — no statistical sampling overhead
+//! - **Duration-bounded measurements** — sustain work for a wall-clock budget
 //! - **Glob filtering** — run subsets with `--workload "pattern*"`
 
 mod config;
