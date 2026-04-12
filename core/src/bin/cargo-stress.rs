@@ -85,13 +85,17 @@ struct StressArgs {
     #[arg(long)]
     workload: Option<String>,
 
-    /// Include ignored benchmarks (those marked with #[stress_test(ignore)])
+    /// Include ignored benchmarks (falls back to BENCH_INCLUDE_IGNORED)
     #[arg(long)]
     include_ignored: bool,
 
     /// List all registered benchmarks without running them
     #[arg(long)]
     list: bool,
+
+    /// Print resolved runner config without running benchmarks
+    #[arg(long)]
+    print_config: bool,
 
     /// Run only a specific stress binary (filename without .rs extension)
     #[arg(long)]
@@ -111,7 +115,7 @@ struct StressArgs {
     // ========================================================================
     // Output Control
     // ========================================================================
-    /// Verbose output
+    /// Verbose output (falls back to BENCH_VERBOSE)
     #[arg(long, short = 'v')]
     verbose: bool,
 
@@ -119,20 +123,20 @@ struct StressArgs {
     #[arg(long, short = 'q')]
     quiet: bool,
 
-    /// Output directory for JSON results
+    /// Output directory for JSON results (falls back to BENCH_OUTPUT_DIR)
     #[arg(long)]
     output_dir: Option<PathBuf>,
 
     // ========================================================================
     // Regression Detection
     // ========================================================================
-    /// Baseline JSON file for regression comparison
+    /// Baseline JSON file for regression comparison (falls back to BENCH_BASELINE)
     #[arg(long)]
     baseline: Option<PathBuf>,
 
-    /// Regression threshold percentage (default: 5%)
-    #[arg(long, default_value_t = 0.05)]
-    threshold: f64,
+    /// Regression threshold percentage (falls back to BENCH_THRESHOLD, then 5%)
+    #[arg(long)]
+    threshold: Option<f64>,
 
     // ========================================================================
     // Build Options
@@ -781,6 +785,10 @@ fn build_passthrough_args(cmd: &mut Command, args: &StressArgs) {
         cmd.arg("--list");
     }
 
+    if args.print_config {
+        cmd.arg("--print-config");
+    }
+
     // Output directory
     if let Some(ref dir) = args.output_dir {
         cmd.arg("--output-dir").arg(dir);
@@ -792,8 +800,8 @@ fn build_passthrough_args(cmd: &mut Command, args: &StressArgs) {
     }
 
     // Threshold
-    if (args.threshold - 0.05).abs() > f64::EPSILON {
-        cmd.arg("--threshold").arg(args.threshold.to_string());
+    if let Some(threshold) = args.threshold {
+        cmd.arg("--threshold").arg(threshold.to_string());
     }
 }
 

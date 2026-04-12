@@ -109,7 +109,9 @@ pub use runner::BenchRunner;
 
 // Harness exports for auto-discovery
 pub use harness::{benchmark_count, list_benchmarks};
-pub use harness::{run_registered_benchmarks, run_with_options, StressRunnerOptions};
+pub use harness::{
+    run_from_env_and_args, run_registered_benchmarks, run_with_options, StressRunnerOptions,
+};
 
 // Entry point for stress binaries (called by stress_main! macro)
 pub use harness::stress_binary_main;

@@ -117,9 +117,10 @@ fn parse_custom_name(attr: &str) -> Option<String> {
 /// - `--quiet` / `-q`: Quiet mode
 /// - `--include-ignored`: Include ignored benchmarks
 /// - `--list`: List benchmarks without running
+/// - `--print-config`: Print the resolved config and exit
 /// - `--output-dir <PATH>`: Output directory for JSON results
-/// - `--baseline <PATH>`: Baseline JSON for regression comparison
-/// - `--threshold <FLOAT>`: Regression threshold (default: 0.05)
+/// - `--baseline <PATH>`: Baseline JSON for regression comparison (fallback: `BENCH_BASELINE`)
+/// - `--threshold <FLOAT>`: Regression threshold (fallback: `BENCH_THRESHOLD`, then `0.05`)
 #[proc_macro]
 pub fn stress_main(_input: TokenStream) -> TokenStream {
     let expanded = quote! {

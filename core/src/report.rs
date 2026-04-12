@@ -38,6 +38,7 @@ const DURATION_WIDTH: usize = 14;
 /// in `bench_end`, ensuring logs cannot interleave even if a benchmark panics.
 pub struct ConsoleReporter {
     show_all_runs: bool,
+    suite_config_lines: Vec<String>,
     /// Mutex ensures atomic writes across threads.
     output_lock: Mutex<()>,
 }
@@ -46,6 +47,7 @@ impl ConsoleReporter {
     pub fn new() -> Self {
         Self {
             show_all_runs: false,
+            suite_config_lines: Vec::new(),
             output_lock: Mutex::new(()),
         }
     }
@@ -53,6 +55,11 @@ impl ConsoleReporter {
     /// Show individual run times (not just median) on a separate indented line.
     pub fn show_all_runs(mut self, show: bool) -> Self {
         self.show_all_runs = show;
+        self
+    }
+
+    pub fn config_lines(mut self, lines: Vec<String>) -> Self {
+        self.suite_config_lines = lines;
         self
     }
 
@@ -114,12 +121,34 @@ impl Default for ConsoleReporter {
 impl Reporter for ConsoleReporter {
     fn suite_start(&self, suite: &str, config: &BenchRunnerConfig) {
         // Build complete header atomically
+        let details = if self.suite_config_lines.is_empty() {
+            vec![
+                format!("Runs: {}", config.runs),
+                format!("Warmup: {}", config.warmup_runs),
+                format!("Output: {}", config.output_dir.display()),
+                format!("Verbose: {}", config.verbose),
+                format!(
+                    "Filter: {}",
+                    config.filter.as_deref().unwrap_or("<none>")
+                ),
+                format!(
+                    "Timeout: {}",
+                    config
+                        .timeout
+                        .map(|timeout| format!("{}s", timeout.as_secs()))
+                        .unwrap_or_else(|| "<none>".to_string())
+                ),
+            ]
+            .join("\n")
+        } else {
+            self.suite_config_lines.join("\n")
+        };
         let header = format!(
             "---------------------------------------------------------------\n\
              Benchmark Suite: {}\n\
-             Runs: {}, Warmup: {}\n\
+             {}\n\
              ---------------------------------------------------------------\n",
-            suite, config.runs, config.warmup_runs
+            suite, details
         );
         self.write_stdout(&header);
     }
@@ -259,8 +288,53 @@ impl JsonReporter {
         output.push_str("===============================================================\n\n");
 
         output.push_str(&format!("Completed: {}\n", result.started_at));
-        output.push_str(&format!("Runs:      {}\n", result.runs));
-        output.push_str(&format!("Warmup:    {}\n", result.warmup_runs));
+        output.push_str(&format_summary_config_line(
+            "Runs",
+            &result.runs.to_string(),
+            result.metadata.get("runs_src"),
+        ));
+        output.push_str(&format_summary_config_line(
+            "Warmup",
+            &result.warmup_runs.to_string(),
+            result.metadata.get("warmup_runs_src"),
+        ));
+        output.push_str(&format_summary_config_line(
+            "Output",
+            result
+                .metadata
+                .get("output_dir")
+                .map(String::as_str)
+                .unwrap_or("target/stress"),
+            result.metadata.get("output_dir_src"),
+        ));
+        output.push_str(&format_summary_config_line(
+            "Filter",
+            result
+                .metadata
+                .get("filter")
+                .map(String::as_str)
+                .unwrap_or("<none>"),
+            result.metadata.get("filter_src"),
+        ));
+        output.push_str(&format_summary_config_line(
+            "Verbose",
+            result
+                .metadata
+                .get("verbose")
+                .map(String::as_str)
+                .unwrap_or("true"),
+            result.metadata.get("verbose_src"),
+        ));
+        let timeout_value = result
+            .metadata
+            .get("timeout_secs")
+            .map(|timeout| format!("{}s", timeout))
+            .unwrap_or_else(|| "<none>".to_string());
+        output.push_str(&format_summary_config_line(
+            "Timeout",
+            &timeout_value,
+            result.metadata.get("timeout_secs_src"),
+        ));
         if let Some(sha) = &result.git_sha {
             output.push_str(&format!("Git SHA:   {}\n", sha));
         }
@@ -339,6 +413,13 @@ fn format_duration(nanos: std::time::Duration) -> String {
         format!("{:.2}us", secs * 1_000_000.0)
     } else {
         format!("{:.2}ns", secs * 1_000_000_000.0)
+    }
+}
+
+fn format_summary_config_line(label: &str, value: &str, source: Option<&String>) -> String {
+    match source {
+        Some(source) => format!("{label:<10} {value} ({source})\n"),
+        None => format!("{label:<10} {value}\n"),
     }
 }
 
@@ -578,6 +659,13 @@ mod tests {
     #[test]
     fn summary_includes_runs_and_warmup() {
         let reporter = JsonReporter::new("target/stress");
+        let mut metadata = HashMap::new();
+        metadata.insert("output_dir".to_string(), "target/stress".to_string());
+        metadata.insert("output_dir_src".to_string(), "env BENCH_OUTPUT_DIR".to_string());
+        metadata.insert("runs_src".to_string(), "env BENCH_RUNS".to_string());
+        metadata.insert("warmup_runs_src".to_string(), "cli --warmup".to_string());
+        metadata.insert("verbose".to_string(), "true".to_string());
+        metadata.insert("verbose_src".to_string(), "default".to_string());
         let suite = SuiteResult {
             suite: "demo".to_string(),
             results: vec![],
@@ -586,11 +674,15 @@ mod tests {
             runs: 3,
             warmup_runs: 1,
             git_sha: None,
-            metadata: HashMap::new(),
+            metadata,
         };
 
         let summary = reporter.format_summary(&suite);
-        assert!(summary.contains("Runs:      3"));
-        assert!(summary.contains("Warmup:    1"));
+        assert!(summary.contains("Runs"));
+        assert!(summary.contains("3 (env BENCH_RUNS)"));
+        assert!(summary.contains("Warmup"));
+        assert!(summary.contains("1 (cli --warmup)"));
+        assert!(summary.contains("target/stress (env BENCH_OUTPUT_DIR)"));
+        assert!(summary.contains("true (default)"));
     }
 }

@@ -16,6 +16,7 @@
 //! parsing - `cargo-stress` just orchestrates which binaries to build and run.
 
 use crate::{BenchRunner, BenchRunnerConfig, StressContext};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// A registered benchmark entry.
@@ -57,19 +58,19 @@ struct StressBinaryArgs {
     /// Number of warmup runs
     warmup: Option<usize>,
     /// Verbose output
-    verbose: bool,
-    /// Quiet mode
-    quiet: bool,
+    verbose: Option<bool>,
     /// Include ignored benchmarks
-    include_ignored: bool,
+    include_ignored: Option<bool>,
     /// List benchmarks without running
     list: bool,
+    /// Print resolved config without running benchmarks
+    print_config: bool,
     /// Output directory for JSON results
     output_dir: Option<PathBuf>,
     /// Baseline JSON for regression comparison
     baseline: Option<PathBuf>,
     /// Regression threshold
-    threshold: f64,
+    threshold: Option<f64>,
 }
 
 impl Default for StressBinaryArgs {
@@ -78,15 +79,27 @@ impl Default for StressBinaryArgs {
             workload: None,
             runs: None,
             warmup: None,
-            verbose: false,
-            quiet: false,
-            include_ignored: false,
+            verbose: None,
+            include_ignored: None,
             list: false,
+            print_config: false,
             output_dir: None,
             baseline: None,
-            threshold: 0.05,
+            threshold: None,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedStressConfig {
+    config: BenchRunnerConfig,
+    metadata: HashMap<String, String>,
+    warnings: Vec<String>,
+    workload: Option<String>,
+    include_ignored: bool,
+    baseline: Option<PathBuf>,
+    threshold: f64,
+    print_config: bool,
 }
 
 impl StressBinaryArgs {
@@ -128,16 +141,19 @@ impl StressBinaryArgs {
                     }
                 }
                 "--verbose" | "-v" => {
-                    result.verbose = true;
+                    result.verbose = Some(true);
                 }
                 "--quiet" | "-q" => {
-                    result.quiet = true;
+                    result.verbose = Some(false);
                 }
                 "--include-ignored" => {
-                    result.include_ignored = true;
+                    result.include_ignored = Some(true);
                 }
                 "--list" => {
                     result.list = true;
+                }
+                "--print-config" | "--dry-run-config" => {
+                    result.print_config = true;
                 }
                 "--output-dir" => {
                     i += 1;
@@ -154,7 +170,9 @@ impl StressBinaryArgs {
                 "--threshold" => {
                     i += 1;
                     if i < args.len() {
-                        result.threshold = args[i].parse().unwrap_or(0.05);
+                        if let Ok(threshold) = args[i].parse() {
+                            result.threshold = Some(threshold);
+                        }
                     }
                 }
                 "--help" | "-h" => {
@@ -182,13 +200,14 @@ fn print_help() {
     eprintln!("    --workload <PATTERN>   Filter benchmarks by glob pattern");
     eprintln!("    --runs <N>             Number of measurement runs (fallback: BENCH_RUNS, then 1)");
     eprintln!("    --warmup <N>           Number of warmup runs (fallback: BENCH_WARMUP, then 0)");
-    eprintln!("    -v, --verbose          Verbose output");
-    eprintln!("    -q, --quiet            Quiet mode");
-    eprintln!("    --include-ignored      Include ignored benchmarks");
+    eprintln!("    -v, --verbose          Verbose output (fallback: BENCH_VERBOSE, then true)");
+    eprintln!("    -q, --quiet            Quiet mode (overrides BENCH_VERBOSE)");
+    eprintln!("    --include-ignored      Include ignored benchmarks (fallback: BENCH_INCLUDE_IGNORED)");
     eprintln!("    --list                 List benchmarks without running");
-    eprintln!("    --output-dir <PATH>    Output directory for JSON results");
-    eprintln!("    --baseline <PATH>      Baseline JSON for regression comparison");
-    eprintln!("    --threshold <FLOAT>    Regression threshold (default: 0.05)");
+    eprintln!("    --print-config         Print resolved config and exit");
+    eprintln!("    --output-dir <PATH>    Output directory for JSON results (fallback: BENCH_OUTPUT_DIR)");
+    eprintln!("    --baseline <PATH>      Baseline JSON for regression comparison (fallback: BENCH_BASELINE)");
+    eprintln!("    --threshold <FLOAT>    Regression threshold (fallback: BENCH_THRESHOLD, then 0.05)");
     eprintln!("    -h, --help             Show this help message");
 }
 
@@ -210,6 +229,10 @@ fn print_help() {
 /// - 0: All benchmarks passed
 /// - 1: One or more benchmarks failed or regressed
 pub fn stress_binary_main() {
+    run_from_env_and_args();
+}
+
+pub fn run_from_env_and_args() {
     let args = StressBinaryArgs::parse();
 
     // Handle --list mode
@@ -227,36 +250,17 @@ pub fn stress_binary_main() {
         return;
     }
 
-    // Build options
-    let verbose = if args.quiet {
-        false
-    } else {
-        args.verbose || !args.quiet
-    };
-
-    let mut opts = StressRunnerOptions::new()
-        .verbose(verbose)
-        .include_ignored(args.include_ignored)
-        .threshold(args.threshold);
-
-    if let Some(runs) = args.runs {
-        opts = opts.runs(runs);
+    let resolved = resolve_from_binary_args(&args);
+    for warning in &resolved.warnings {
+        eprintln!("Warning: {}", warning);
     }
 
-    if let Some(warmup) = args.warmup {
-        opts = opts.warmup(warmup);
+    if resolved.print_config {
+        print_resolved_config(&get_suite_name(), &resolved);
+        return;
     }
 
-    if let Some(pattern) = args.workload {
-        opts = opts.workload(pattern);
-    }
-
-    if let Some(baseline) = args.baseline {
-        opts = opts.baseline(baseline);
-    }
-
-    // Run benchmarks
-    run_with_options(opts);
+    run_with_resolved_config(resolved);
 }
 
 // ============================================================================
@@ -364,6 +368,17 @@ fn get_suite_name() -> String {
 
 /// Run all registered benchmarks with custom options.
 pub fn run_with_options(opts: StressRunnerOptions) {
+    let mut metadata = HashMap::new();
+    metadata.insert("runs_src".to_string(), source_label(opts.runs.is_some(), "cli --runs"));
+    metadata.insert(
+        "warmup_runs_src".to_string(),
+        source_label(opts.warmup.is_some(), "cli --warmup"),
+    );
+    metadata.insert("verbose_src".to_string(), "explicit option".to_string());
+    metadata.insert("output_dir_src".to_string(), "default".to_string());
+    metadata.insert("filter_src".to_string(), "default".to_string());
+    metadata.insert("timeout_secs_src".to_string(), "default".to_string());
+
     let benchmarks: Vec<_> = STRESS_BENCHMARKS
         .iter()
         .filter(|b| {
@@ -393,7 +408,7 @@ pub fn run_with_options(opts: StressRunnerOptions) {
     apply_runner_option_overrides(&mut config, &opts);
 
     let suite_name = get_suite_name();
-    let mut runner = BenchRunner::with_config(&suite_name, config);
+    let mut runner = BenchRunner::with_config_and_metadata(&suite_name, config, metadata);
 
     // Run each benchmark
     for bench in &benchmarks {
@@ -416,6 +431,268 @@ pub fn run_with_options(opts: StressRunnerOptions) {
     } else {
         let _results = runner.finish();
         // Summary already printed by ConsoleReporter
+    }
+}
+
+fn resolve_from_binary_args(args: &StressBinaryArgs) -> ResolvedStressConfig {
+    resolve_from_binary_args_with(args, |key| std::env::var(key).ok())
+}
+
+fn resolve_from_binary_args_with<F>(args: &StressBinaryArgs, get_var: F) -> ResolvedStressConfig
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let env_resolution = BenchRunnerConfig::resolve_from_env_with(&get_var);
+    let mut config = env_resolution.config;
+    let mut metadata = env_resolution.metadata;
+    let mut warnings = env_resolution.warnings;
+
+    let mut include_ignored = false;
+    metadata.insert("include_ignored_src".to_string(), "default".to_string());
+    if let Some(v) = get_var("BENCH_INCLUDE_IGNORED") {
+        match parse_bool_env(&v) {
+            Some(value) => {
+                include_ignored = value;
+                metadata.insert(
+                    "include_ignored_src".to_string(),
+                    "env BENCH_INCLUDE_IGNORED".to_string(),
+                );
+            }
+            None => warnings.push("invalid BENCH_INCLUDE_IGNORED, using default false".to_string()),
+        }
+    }
+
+    let mut baseline = None;
+    metadata.insert("baseline_src".to_string(), "default".to_string());
+    if let Some(v) = get_var("BENCH_BASELINE") {
+        baseline = Some(PathBuf::from(v));
+        metadata.insert("baseline_src".to_string(), "env BENCH_BASELINE".to_string());
+    }
+
+    let mut threshold = 0.05;
+    metadata.insert("threshold_src".to_string(), "default".to_string());
+    if let Some(v) = get_var("BENCH_THRESHOLD") {
+        match v.parse::<f64>() {
+            Ok(value) => {
+                threshold = value;
+                metadata.insert("threshold_src".to_string(), "env BENCH_THRESHOLD".to_string());
+            }
+            Err(_) => warnings.push("invalid BENCH_THRESHOLD, using default 0.05".to_string()),
+        }
+    }
+
+    if let Some(runs) = args.runs {
+        config.runs = runs;
+        metadata.insert("runs_src".to_string(), "cli --runs".to_string());
+    }
+    if let Some(warmup) = args.warmup {
+        config.warmup_runs = warmup;
+        metadata.insert("warmup_runs_src".to_string(), "cli --warmup".to_string());
+    }
+    if let Some(verbose) = args.verbose {
+        config.verbose = verbose;
+        metadata.insert(
+            "verbose_src".to_string(),
+            if verbose {
+                "cli --verbose".to_string()
+            } else {
+                "cli --quiet".to_string()
+            },
+        );
+    }
+    if let Some(output_dir) = &args.output_dir {
+        config.output_dir = output_dir.clone();
+        metadata.insert("output_dir_src".to_string(), "cli --output-dir".to_string());
+    }
+    if let Some(pattern) = &args.workload {
+        metadata.insert("filter".to_string(), pattern.clone());
+        metadata.insert("filter_src".to_string(), "cli --workload".to_string());
+    } else if let Some(filter) = &config.filter {
+        metadata.insert("filter".to_string(), filter.clone());
+    }
+    if let Some(include) = args.include_ignored {
+        include_ignored = include;
+        metadata.insert(
+            "include_ignored_src".to_string(),
+            "cli --include-ignored".to_string(),
+        );
+    }
+    if let Some(path) = &args.baseline {
+        baseline = Some(path.clone());
+        metadata.insert("baseline_src".to_string(), "cli --baseline".to_string());
+    }
+    if let Some(value) = args.threshold {
+        threshold = value;
+        metadata.insert("threshold_src".to_string(), "cli --threshold".to_string());
+    }
+
+    ResolvedStressConfig {
+        config,
+        metadata,
+        warnings,
+        workload: args.workload.clone(),
+        include_ignored,
+        baseline,
+        threshold,
+        print_config: args.print_config,
+    }
+}
+
+fn run_with_resolved_config(resolved: ResolvedStressConfig) {
+    let benchmarks: Vec<_> = STRESS_BENCHMARKS
+        .iter()
+        .filter(|b| {
+            if b.ignored && !resolved.include_ignored {
+                return false;
+            }
+            if let Some(ref pattern) = resolved.workload {
+                return matches_glob(b.name, pattern) || matches_glob(b.module_path, pattern);
+            }
+            true
+        })
+        .collect();
+
+    if benchmarks.is_empty() {
+        if resolved.workload.is_some() {
+            eprintln!("No benchmarks matched the workload pattern");
+        } else {
+            eprintln!("No benchmarks registered. Add #[stress_test] to your benchmark functions.");
+        }
+        return;
+    }
+
+    let suite_name = get_suite_name();
+    let mut runner =
+        BenchRunner::with_config_and_metadata(&suite_name, resolved.config, resolved.metadata);
+
+    for bench in &benchmarks {
+        let name = format!("{}::{}", bench.module_path, bench.name);
+        runner.run(&name, bench.func);
+    }
+
+    if let Some(baseline_path) = resolved.baseline {
+        let (_results, regressions) = runner.finish_with_baseline(baseline_path, resolved.threshold);
+        if !regressions.is_empty() {
+            eprintln!("\n❌ {} regression(s) detected!", regressions.len());
+            for (result, ratio) in &regressions {
+                let pct = (ratio - 1.0) * 100.0;
+                eprintln!("  {} is {:.1}% slower", result.name, pct);
+            }
+            std::process::exit(1);
+        }
+    } else {
+        let _results = runner.finish();
+    }
+}
+
+fn print_resolved_config(suite: &str, resolved: &ResolvedStressConfig) {
+    println!("Benchmark Suite: {}", suite);
+    println!(
+        "Runs: {} ({})",
+        resolved.config.runs,
+        resolved.metadata.get("runs_src").map(String::as_str).unwrap_or("unknown")
+    );
+    println!(
+        "Warmup: {} ({})",
+        resolved.config.warmup_runs,
+        resolved
+            .metadata
+            .get("warmup_runs_src")
+            .map(String::as_str)
+            .unwrap_or("unknown")
+    );
+    println!(
+        "Output: {} ({})",
+        resolved.config.output_dir.display(),
+        resolved
+            .metadata
+            .get("output_dir_src")
+            .map(String::as_str)
+            .unwrap_or("unknown")
+    );
+    println!(
+        "Filter: {} ({})",
+        resolved
+            .metadata
+            .get("filter")
+            .map(String::as_str)
+            .unwrap_or("<none>"),
+        resolved
+            .metadata
+            .get("filter_src")
+            .map(String::as_str)
+            .unwrap_or("unknown")
+    );
+    println!(
+        "Verbose: {} ({})",
+        resolved.config.verbose,
+        resolved
+            .metadata
+            .get("verbose_src")
+            .map(String::as_str)
+            .unwrap_or("unknown")
+    );
+    println!(
+        "Timeout: {} ({})",
+        resolved
+            .config
+            .timeout
+            .map(|timeout| format!("{}s", timeout.as_secs()))
+            .unwrap_or_else(|| "<none>".to_string()),
+        resolved
+            .metadata
+            .get("timeout_secs_src")
+            .map(String::as_str)
+            .unwrap_or("unknown")
+    );
+    println!(
+        "Include ignored: {} ({})",
+        resolved.include_ignored,
+        resolved
+            .metadata
+            .get("include_ignored_src")
+            .map(String::as_str)
+            .unwrap_or("unknown")
+    );
+    println!(
+        "Baseline: {} ({})",
+        resolved
+            .baseline
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<none>".to_string()),
+        resolved
+            .metadata
+            .get("baseline_src")
+            .map(String::as_str)
+            .unwrap_or("unknown")
+    );
+    println!(
+        "Threshold: {} ({})",
+        resolved.threshold,
+        resolved
+            .metadata
+            .get("threshold_src")
+            .map(String::as_str)
+            .unwrap_or("unknown")
+    );
+}
+
+fn parse_bool_env(value: &str) -> Option<bool> {
+    if value == "1" || value.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if value == "0" || value.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn source_label(explicit: bool, label: &str) -> String {
+    if explicit {
+        label.to_string()
+    } else {
+        "default".to_string()
     }
 }
 
@@ -576,5 +853,47 @@ mod tests {
 
         assert_eq!(cfg.runs, 1);
         assert_eq!(cfg.warmup_runs, 2);
+    }
+
+    #[test]
+    fn resolve_from_binary_args_uses_env_when_cli_absent() {
+        let args = StressBinaryArgs::default();
+        let env = HashMap::from([
+            ("BENCH_RUNS", "3".to_string()),
+            ("BENCH_WARMUP", "1".to_string()),
+        ]);
+
+        let resolved = resolve_from_binary_args_with(&args, |key| env.get(key).cloned());
+
+        assert_eq!(resolved.config.runs, 3);
+        assert_eq!(resolved.config.warmup_runs, 1);
+        assert_eq!(resolved.metadata.get("runs_src"), Some(&"env BENCH_RUNS".to_string()));
+    }
+
+    #[test]
+    fn resolve_from_binary_args_cli_overrides_env() {
+        let args = StressBinaryArgs {
+            runs: Some(5),
+            ..StressBinaryArgs::default()
+        };
+        let env = HashMap::from([("BENCH_RUNS", "3".to_string())]);
+
+        let resolved = resolve_from_binary_args_with(&args, |key| env.get(key).cloned());
+
+        assert_eq!(resolved.config.runs, 5);
+        assert_eq!(resolved.metadata.get("runs_src"), Some(&"cli --runs".to_string()));
+    }
+
+    #[test]
+    fn resolve_from_binary_args_warns_on_malformed_env() {
+        let args = StressBinaryArgs::default();
+        let env = HashMap::from([("BENCH_THRESHOLD", "nope".to_string())]);
+
+        let resolved = resolve_from_binary_args_with(&args, |key| env.get(key).cloned());
+
+        assert_eq!(resolved.threshold, 0.05);
+        assert!(resolved
+            .warnings
+            .contains(&"invalid BENCH_THRESHOLD, using default 0.05".to_string()));
     }
 }

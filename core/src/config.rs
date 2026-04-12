@@ -1,6 +1,25 @@
 //! Configuration for the benchmark runner.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
+
+#[derive(Debug, Clone)]
+pub(crate) struct EnvConfigResolution {
+    pub config: BenchRunnerConfig,
+    pub metadata: HashMap<String, String>,
+    pub warnings: Vec<String>,
+}
+
+impl EnvConfigResolution {
+    fn new(config: BenchRunnerConfig) -> Self {
+        Self {
+            config,
+            metadata: HashMap::new(),
+            warnings: Vec::new(),
+        }
+    }
+}
 
 /// Configuration for the benchmark runner.
 #[derive(Debug, Clone)]
@@ -52,49 +71,115 @@ impl BenchRunnerConfig {
     /// - `BENCH_GIT_SHA`: git commit hash
     /// - `BENCH_TIMEOUT_SECS`: timeout per benchmark in seconds
     pub fn from_env() -> Self {
-        Self::from_env_with(|key| std::env::var(key).ok())
+        let resolution = Self::resolve_from_env();
+        for warning in &resolution.warnings {
+            eprintln!("Warning: {}", warning);
+        }
+        resolution.config
     }
 
-    fn from_env_with<F>(get_var: F) -> Self
+    pub(crate) fn resolve_from_env() -> EnvConfigResolution {
+        Self::resolve_from_env_with(|key| std::env::var(key).ok())
+    }
+
+    pub(crate) fn resolve_from_env_with<F>(get_var: F) -> EnvConfigResolution
     where
         F: Fn(&str) -> Option<String>,
     {
-        let mut cfg = Self::default();
+        let mut resolution = EnvConfigResolution::new(Self::default());
 
         if let Some(v) = get_var("BENCH_RUNS") {
-            if let Ok(n) = v.parse() {
-                cfg.runs = n;
+            match v.parse() {
+                Ok(n) => {
+                    resolution.config.runs = n;
+                    resolution
+                        .metadata
+                        .insert("runs_src".to_string(), "env BENCH_RUNS".to_string());
+                }
+                Err(_) => resolution
+                    .warnings
+                    .push("invalid BENCH_RUNS, using default 1".to_string()),
             }
         }
+
         if let Some(v) = get_var("BENCH_WARMUP") {
-            if let Ok(n) = v.parse() {
-                cfg.warmup_runs = n;
+            match v.parse() {
+                Ok(n) => {
+                    resolution.config.warmup_runs = n;
+                    resolution.metadata.insert(
+                        "warmup_runs_src".to_string(),
+                        "env BENCH_WARMUP".to_string(),
+                    );
+                }
+                Err(_) => resolution
+                    .warnings
+                    .push("invalid BENCH_WARMUP, using default 0".to_string()),
             }
         }
+
         if let Some(v) = get_var("BENCH_VERBOSE") {
-            cfg.verbose = v != "0" && !v.eq_ignore_ascii_case("false");
-        }
-        if let Some(v) = get_var("BENCH_OUTPUT_DIR") {
-            cfg.output_dir = PathBuf::from(v);
-        }
-        if let Some(v) = get_var("BENCH_FILTER") {
-            cfg.filter = Some(v);
-        }
-        if let Some(v) = get_var("BENCH_GIT_SHA") {
-            cfg.git_sha = Some(v);
-        }
-        if let Some(v) = get_var("BENCH_TIMEOUT_SECS") {
-            if let Ok(secs) = v.parse::<u64>() {
-                cfg.timeout = Some(std::time::Duration::from_secs(secs));
+            match parse_bool_env(&v) {
+                Some(verbose) => {
+                    resolution.config.verbose = verbose;
+                    resolution.metadata.insert(
+                        "verbose_src".to_string(),
+                        "env BENCH_VERBOSE".to_string(),
+                    );
+                }
+                None => resolution
+                    .warnings
+                    .push("invalid BENCH_VERBOSE, using default true".to_string()),
             }
         }
 
-        // Try to detect git SHA if not set
-        if cfg.git_sha.is_none() {
-            cfg.git_sha = detect_git_sha();
+        if let Some(v) = get_var("BENCH_OUTPUT_DIR") {
+            resolution.config.output_dir = PathBuf::from(v);
+            resolution
+                .metadata
+                .insert("output_dir_src".to_string(), "env BENCH_OUTPUT_DIR".to_string());
         }
 
-        cfg
+        if let Some(v) = get_var("BENCH_FILTER") {
+            resolution.config.filter = Some(v);
+            resolution
+                .metadata
+                .insert("filter_src".to_string(), "env BENCH_FILTER".to_string());
+        }
+
+        if let Some(v) = get_var("BENCH_GIT_SHA") {
+            resolution.config.git_sha = Some(v);
+            resolution
+                .metadata
+                .insert("git_sha_src".to_string(), "env BENCH_GIT_SHA".to_string());
+        }
+
+        if let Some(v) = get_var("BENCH_TIMEOUT_SECS") {
+            match v.parse::<u64>() {
+                Ok(secs) => {
+                    resolution.config.timeout = Some(Duration::from_secs(secs));
+                    resolution.metadata.insert(
+                        "timeout_secs_src".to_string(),
+                        "env BENCH_TIMEOUT_SECS".to_string(),
+                    );
+                }
+                Err(_) => resolution
+                    .warnings
+                    .push("invalid BENCH_TIMEOUT_SECS, using no timeout".to_string()),
+            }
+        }
+
+        apply_default_sources(&mut resolution.metadata);
+
+        if resolution.config.git_sha.is_none() {
+            resolution.config.git_sha = detect_git_sha();
+            if resolution.config.git_sha.is_some() {
+                resolution
+                    .metadata
+                    .insert("git_sha_src".to_string(), "auto_detect".to_string());
+            }
+        }
+
+        resolution
     }
 
     /// Set the number of measurement runs.
@@ -146,6 +231,32 @@ impl BenchRunnerConfig {
     }
 }
 
+fn apply_default_sources(metadata: &mut HashMap<String, String>) {
+    for key in [
+        "runs_src",
+        "warmup_runs_src",
+        "output_dir_src",
+        "verbose_src",
+        "filter_src",
+        "git_sha_src",
+        "timeout_secs_src",
+    ] {
+        metadata
+            .entry(key.to_string())
+            .or_insert_with(|| "default".to_string());
+    }
+}
+
+fn parse_bool_env(value: &str) -> Option<bool> {
+    if value == "1" || value.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if value == "0" || value.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn detect_git_sha() -> Option<String> {
     std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
@@ -165,7 +276,6 @@ fn detect_git_sha() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     #[test]
     fn should_use_defaults_when_env_not_set() {
@@ -197,19 +307,45 @@ mod tests {
             ("BENCH_VERBOSE", "false".to_string()),
         ]);
 
-        let cfg = BenchRunnerConfig::from_env_with(|key| env.get(key).cloned());
+        let resolution = BenchRunnerConfig::resolve_from_env_with(|key| env.get(key).cloned());
+        let cfg = resolution.config;
 
         assert_eq!(cfg.runs, 5);
         assert_eq!(cfg.warmup_runs, 2);
         assert!(!cfg.verbose);
+        assert!(resolution.warnings.is_empty());
     }
 
     #[test]
     fn should_use_defaults_when_env_missing() {
-        let cfg = BenchRunnerConfig::from_env_with(|_| None);
+        let cfg = BenchRunnerConfig::resolve_from_env_with(|_| None).config;
 
         assert_eq!(cfg.runs, 1);
         assert_eq!(cfg.warmup_runs, 0);
         assert!(cfg.verbose);
+    }
+
+    #[test]
+    fn should_warn_when_env_values_are_invalid() {
+        let env = HashMap::from([
+            ("BENCH_RUNS", "abc".to_string()),
+            ("BENCH_VERBOSE", "maybe".to_string()),
+            ("BENCH_TIMEOUT_SECS", "soon".to_string()),
+        ]);
+
+        let resolution = BenchRunnerConfig::resolve_from_env_with(|key| env.get(key).cloned());
+
+        assert_eq!(resolution.config.runs, 1);
+        assert!(resolution.config.verbose);
+        assert_eq!(resolution.config.timeout, None);
+        assert!(resolution
+            .warnings
+            .contains(&"invalid BENCH_RUNS, using default 1".to_string()));
+        assert!(resolution
+            .warnings
+            .contains(&"invalid BENCH_VERBOSE, using default true".to_string()));
+        assert!(resolution
+            .warnings
+            .contains(&"invalid BENCH_TIMEOUT_SECS, using no timeout".to_string()));
     }
 }

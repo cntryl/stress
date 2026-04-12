@@ -116,6 +116,9 @@ docs/book/
 # Test outputs
 test-results/
 
+# Demo benchmark output overrides used during local validation
+demo/custom-stress/
+
 # Legacy test database directories (now in target/tmp/)
 # Keep these for backwards compatibility with older checkouts
 midge_db/

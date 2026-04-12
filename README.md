@@ -131,6 +131,9 @@ Configuration precedence for runtime settings is:
 For run counts specifically: `--runs`/`--warmup` override `BENCH_RUNS`/`BENCH_WARMUP`,
 and environment values fall back to defaults (`runs = 1`, `warmup = 0`) when unset.
 
+Malformed environment values are warned about and ignored. For example, `BENCH_RUNS=abc`
+emits a warning and falls back to the default resolution path.
+
 ### Environment Variables
 
 | Variable | Default | Description |
@@ -141,6 +144,8 @@ and environment values fall back to defaults (`runs = 1`, `warmup = 0`) when uns
 | `BENCH_OUTPUT_DIR` | `target/stress` | Output directory for results |
 | `BENCH_VERBOSE` | `true` | Print to console |
 | `BENCH_INCLUDE_IGNORED` | `false` | Include `#[stress_test(ignore)]` |
+| `BENCH_BASELINE` | - | Baseline JSON for regression comparison |
+| `BENCH_THRESHOLD` | `0.05` | Regression threshold |
 | `BENCH_GIT_SHA` | auto | Override git SHA in results |
 
 ```bash
@@ -154,6 +159,7 @@ Pass arguments to the stress harness using `--` separator:
 ```bash
 cargo bench --bench my_stress -- --runs 5 --warmup 2
 cargo bench --bench 'stress-*' -- --runs 3 --workload write
+cargo bench --bench my_stress -- --print-config
 cargo bench -- --help
 ```
 
@@ -165,9 +171,10 @@ cargo bench -- --help
 - `--quiet`, `-q` — Quiet mode
 - `--include-ignored` — Include ignored benchmarks
 - `--list` — List benchmarks without running
+- `--print-config` — Print resolved config and exit
 - `--output-dir <PATH>` — Output directory
-- `--baseline <PATH>` — Baseline JSON for regression comparison
-- `--threshold <FLOAT>` — Regression threshold (default: 0.05)
+- `--baseline <PATH>` — Baseline JSON for regression comparison (fallback: `BENCH_BASELINE`)
+- `--threshold <FLOAT>` — Regression threshold (fallback: `BENCH_THRESHOLD`, then `0.05`)
 
 **Important:** The `--` is required to separate cargo flags from stress harness flags.
 
@@ -185,6 +192,18 @@ let mut runner = BenchRunner::with_config("my_suite", config);
 runner.run("op", |ctx| ctx.measure(|| { /* ... */ }));
 runner.finish();
 ```
+
+### Env-Aware Entry Point
+
+For integrations that want the same precedence behavior as `stress_main!()` without relying on the macro, use the explicit env-aware entrypoint:
+
+```rust
+fn main() {
+  cntryl_stress::run_from_env_and_args();
+}
+```
+
+This resolves config with `CLI > env > defaults`, prints warnings for malformed env vars, and supports `--print-config`.
 
 ## Throughput
 

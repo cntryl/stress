@@ -43,13 +43,29 @@ impl BenchRunner {
 
     /// Create a new runner with explicit config.
     pub fn with_config(suite: &str, config: BenchRunnerConfig) -> Self {
+        Self::with_config_and_metadata(suite, config, HashMap::new())
+    }
+
+    /// Create a new runner with explicit config and initial metadata.
+    pub fn with_config_and_metadata(
+        suite: &str,
+        config: BenchRunnerConfig,
+        metadata: HashMap<String, String>,
+    ) -> Self {
         let suite_start = Instant::now();
 
-        // Default reporters: console (always) + JSON
-        let reporters: Vec<Box<dyn Reporter>> = vec![
-            Box::new(ConsoleReporter::new()),
-            Box::new(JsonReporter::new(config.output_dir.clone())),
-        ];
+        let mut reporters: Vec<Box<dyn Reporter>> = vec![Box::new(JsonReporter::new(
+            config.output_dir.clone(),
+        ))];
+
+        if config.verbose {
+            reporters.insert(
+                0,
+                Box::new(ConsoleReporter::new().config_lines(build_suite_config_lines(
+                    &config, &metadata,
+                ))),
+            );
+        }
 
         let runner = Self {
             suite: suite.to_string(),
@@ -57,7 +73,7 @@ impl BenchRunner {
             results: Vec::new(),
             suite_start,
             reporters,
-            metadata: HashMap::new(),
+            metadata,
         };
 
         // Notify reporters of suite start
@@ -190,6 +206,17 @@ impl BenchRunner {
             "effective_warmup".to_string(),
             self.config.warmup_runs.to_string(),
         );
+        metadata.insert(
+            "output_dir".to_string(),
+            self.config.output_dir.display().to_string(),
+        );
+        metadata.insert("verbose".to_string(), self.config.verbose.to_string());
+        if let Some(filter) = &self.config.filter {
+            metadata.insert("filter".to_string(), filter.clone());
+        }
+        if let Some(timeout) = self.config.timeout {
+            metadata.insert("timeout_secs".to_string(), timeout.as_secs().to_string());
+        }
 
         let suite_result = SuiteResult {
             suite: self.suite.clone(),
@@ -243,6 +270,75 @@ impl BenchRunner {
 
         (results, regressions)
     }
+}
+
+fn build_suite_config_lines(
+    config: &BenchRunnerConfig,
+    metadata: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "Runs: {} ({})",
+            config.runs,
+            metadata
+                .get("runs_src")
+                .map(String::as_str)
+                .unwrap_or("unknown")
+        ),
+        format!(
+            "Warmup: {} ({})",
+            config.warmup_runs,
+            metadata
+                .get("warmup_runs_src")
+                .map(String::as_str)
+                .unwrap_or("unknown")
+        ),
+        format!(
+            "Output: {} ({})",
+            config.output_dir.display(),
+            metadata
+                .get("output_dir_src")
+                .map(String::as_str)
+                .unwrap_or("unknown")
+        ),
+        format!(
+            "Verbose: {} ({})",
+            config.verbose,
+            metadata
+                .get("verbose_src")
+                .map(String::as_str)
+                .unwrap_or("unknown")
+        ),
+    ];
+
+    let filter_value = metadata
+        .get("filter")
+        .map(String::as_str)
+        .or(config.filter.as_deref())
+        .unwrap_or("<none>");
+    lines.push(format!(
+        "Filter: {} ({})",
+        filter_value,
+        metadata
+            .get("filter_src")
+            .map(String::as_str)
+            .unwrap_or("unknown")
+    ));
+
+    let timeout_value = config
+        .timeout
+        .map(|timeout| format!("{}s", timeout.as_secs()))
+        .unwrap_or_else(|| "<none>".to_string());
+    lines.push(format!(
+        "Timeout: {} ({})",
+        timeout_value,
+        metadata
+            .get("timeout_secs_src")
+            .map(String::as_str)
+            .unwrap_or("unknown")
+    ));
+
+    lines
 }
 
 /// A benchmark group for organizing related benchmarks.
