@@ -54,16 +54,16 @@ impl BenchRunner {
     ) -> Self {
         let suite_start = Instant::now();
 
-        let mut reporters: Vec<Box<dyn Reporter>> = vec![Box::new(JsonReporter::new(
-            config.output_dir.clone(),
-        ))];
+        let mut reporters: Vec<Box<dyn Reporter>> =
+            vec![Box::new(JsonReporter::new(config.output_dir.clone()))];
 
         if config.verbose {
             reporters.insert(
                 0,
-                Box::new(ConsoleReporter::new().config_lines(build_suite_config_lines(
-                    &config, &metadata,
-                ))),
+                Box::new(
+                    ConsoleReporter::new()
+                        .config_lines(build_suite_config_lines(&config, &metadata)),
+                ),
             );
         }
 

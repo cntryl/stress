@@ -198,16 +198,24 @@ fn print_help() {
     eprintln!();
     eprintln!("OPTIONS:");
     eprintln!("    --workload <PATTERN>   Filter benchmarks by glob pattern");
-    eprintln!("    --runs <N>             Number of measurement runs (fallback: BENCH_RUNS, then 1)");
+    eprintln!(
+        "    --runs <N>             Number of measurement runs (fallback: BENCH_RUNS, then 1)"
+    );
     eprintln!("    --warmup <N>           Number of warmup runs (fallback: BENCH_WARMUP, then 0)");
     eprintln!("    -v, --verbose          Verbose output (fallback: BENCH_VERBOSE, then true)");
     eprintln!("    -q, --quiet            Quiet mode (overrides BENCH_VERBOSE)");
-    eprintln!("    --include-ignored      Include ignored benchmarks (fallback: BENCH_INCLUDE_IGNORED)");
+    eprintln!(
+        "    --include-ignored      Include ignored benchmarks (fallback: BENCH_INCLUDE_IGNORED)"
+    );
     eprintln!("    --list                 List benchmarks without running");
     eprintln!("    --print-config         Print resolved config and exit");
-    eprintln!("    --output-dir <PATH>    Output directory for JSON results (fallback: BENCH_OUTPUT_DIR)");
+    eprintln!(
+        "    --output-dir <PATH>    Output directory for JSON results (fallback: BENCH_OUTPUT_DIR)"
+    );
     eprintln!("    --baseline <PATH>      Baseline JSON for regression comparison (fallback: BENCH_BASELINE)");
-    eprintln!("    --threshold <FLOAT>    Regression threshold (fallback: BENCH_THRESHOLD, then 0.05)");
+    eprintln!(
+        "    --threshold <FLOAT>    Regression threshold (fallback: BENCH_THRESHOLD, then 0.05)"
+    );
     eprintln!("    -h, --help             Show this help message");
 }
 
@@ -369,7 +377,10 @@ fn get_suite_name() -> String {
 /// Run all registered benchmarks with custom options.
 pub fn run_with_options(opts: StressRunnerOptions) {
     let mut metadata = HashMap::new();
-    metadata.insert("runs_src".to_string(), source_label(opts.runs.is_some(), "cli --runs"));
+    metadata.insert(
+        "runs_src".to_string(),
+        source_label(opts.runs.is_some(), "cli --runs"),
+    );
     metadata.insert(
         "warmup_runs_src".to_string(),
         source_label(opts.warmup.is_some(), "cli --warmup"),
@@ -475,7 +486,10 @@ where
         match v.parse::<f64>() {
             Ok(value) => {
                 threshold = value;
-                metadata.insert("threshold_src".to_string(), "env BENCH_THRESHOLD".to_string());
+                metadata.insert(
+                    "threshold_src".to_string(),
+                    "env BENCH_THRESHOLD".to_string(),
+                );
             }
             Err(_) => warnings.push("invalid BENCH_THRESHOLD, using default 0.05".to_string()),
         }
@@ -571,7 +585,8 @@ fn run_with_resolved_config(resolved: ResolvedStressConfig) {
     }
 
     if let Some(baseline_path) = resolved.baseline {
-        let (_results, regressions) = runner.finish_with_baseline(baseline_path, resolved.threshold);
+        let (_results, regressions) =
+            runner.finish_with_baseline(baseline_path, resolved.threshold);
         if !regressions.is_empty() {
             eprintln!("\n❌ {} regression(s) detected!", regressions.len());
             for (result, ratio) in &regressions {
@@ -590,7 +605,11 @@ fn print_resolved_config(suite: &str, resolved: &ResolvedStressConfig) {
     println!(
         "Runs: {} ({})",
         resolved.config.runs,
-        resolved.metadata.get("runs_src").map(String::as_str).unwrap_or("unknown")
+        resolved
+            .metadata
+            .get("runs_src")
+            .map(String::as_str)
+            .unwrap_or("unknown")
     );
     println!(
         "Warmup: {} ({})",
@@ -820,10 +839,7 @@ mod tests {
     #[test]
     fn cli_options_override_base_config_values() {
         let mut cfg = BenchRunnerConfig::new().runs(3).warmup(1).verbose(true);
-        let opts = StressRunnerOptions::new()
-            .runs(1)
-            .warmup(0)
-            .verbose(false);
+        let opts = StressRunnerOptions::new().runs(1).warmup(0).verbose(false);
         apply_runner_option_overrides(&mut cfg, &opts);
         assert_eq!(cfg.runs, 1);
         assert_eq!(cfg.warmup_runs, 0);
@@ -867,7 +883,10 @@ mod tests {
 
         assert_eq!(resolved.config.runs, 3);
         assert_eq!(resolved.config.warmup_runs, 1);
-        assert_eq!(resolved.metadata.get("runs_src"), Some(&"env BENCH_RUNS".to_string()));
+        assert_eq!(
+            resolved.metadata.get("runs_src"),
+            Some(&"env BENCH_RUNS".to_string())
+        );
     }
 
     #[test]
@@ -881,7 +900,10 @@ mod tests {
         let resolved = resolve_from_binary_args_with(&args, |key| env.get(key).cloned());
 
         assert_eq!(resolved.config.runs, 5);
-        assert_eq!(resolved.metadata.get("runs_src"), Some(&"cli --runs".to_string()));
+        assert_eq!(
+            resolved.metadata.get("runs_src"),
+            Some(&"cli --runs".to_string())
+        );
     }
 
     #[test]

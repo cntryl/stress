@@ -121,10 +121,9 @@ impl BenchRunnerConfig {
             match parse_bool_env(&v) {
                 Some(verbose) => {
                     resolution.config.verbose = verbose;
-                    resolution.metadata.insert(
-                        "verbose_src".to_string(),
-                        "env BENCH_VERBOSE".to_string(),
-                    );
+                    resolution
+                        .metadata
+                        .insert("verbose_src".to_string(), "env BENCH_VERBOSE".to_string());
                 }
                 None => resolution
                     .warnings
@@ -134,9 +133,10 @@ impl BenchRunnerConfig {
 
         if let Some(v) = get_var("BENCH_OUTPUT_DIR") {
             resolution.config.output_dir = PathBuf::from(v);
-            resolution
-                .metadata
-                .insert("output_dir_src".to_string(), "env BENCH_OUTPUT_DIR".to_string());
+            resolution.metadata.insert(
+                "output_dir_src".to_string(),
+                "env BENCH_OUTPUT_DIR".to_string(),
+            );
         }
 
         if let Some(v) = get_var("BENCH_FILTER") {

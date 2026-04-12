@@ -127,10 +127,7 @@ impl Reporter for ConsoleReporter {
                 format!("Warmup: {}", config.warmup_runs),
                 format!("Output: {}", config.output_dir.display()),
                 format!("Verbose: {}", config.verbose),
-                format!(
-                    "Filter: {}",
-                    config.filter.as_deref().unwrap_or("<none>")
-                ),
+                format!("Filter: {}", config.filter.as_deref().unwrap_or("<none>")),
                 format!(
                     "Timeout: {}",
                     config
@@ -661,7 +658,10 @@ mod tests {
         let reporter = JsonReporter::new("target/stress");
         let mut metadata = HashMap::new();
         metadata.insert("output_dir".to_string(), "target/stress".to_string());
-        metadata.insert("output_dir_src".to_string(), "env BENCH_OUTPUT_DIR".to_string());
+        metadata.insert(
+            "output_dir_src".to_string(),
+            "env BENCH_OUTPUT_DIR".to_string(),
+        );
         metadata.insert("runs_src".to_string(), "env BENCH_RUNS".to_string());
         metadata.insert("warmup_runs_src".to_string(), "cli --warmup".to_string());
         metadata.insert("verbose".to_string(), "true".to_string());
