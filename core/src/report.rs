@@ -122,7 +122,7 @@ impl Reporter for ConsoleReporter {
     fn suite_start(&self, suite: &str, config: &BenchRunnerConfig) {
         // Build complete header atomically
         let details = if self.suite_config_lines.is_empty() {
-            vec![
+            [
                 format!("Runs: {}", config.runs),
                 format!("Warmup: {}", config.warmup_runs),
                 format!("Output: {}", config.output_dir.display()),

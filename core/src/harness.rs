@@ -49,7 +49,7 @@ pub static STRESS_BENCHMARKS: [BenchmarkEntry];
 ///
 /// These arguments are parsed by the generated main() function from stress_main!().
 /// They match the flags that cargo-stress passes through.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct StressBinaryArgs {
     /// Filter benchmarks by glob pattern
     workload: Option<String>,
@@ -71,23 +71,6 @@ struct StressBinaryArgs {
     baseline: Option<PathBuf>,
     /// Regression threshold
     threshold: Option<f64>,
-}
-
-impl Default for StressBinaryArgs {
-    fn default() -> Self {
-        Self {
-            workload: None,
-            runs: None,
-            warmup: None,
-            verbose: None,
-            include_ignored: None,
-            list: false,
-            print_config: false,
-            output_dir: None,
-            baseline: None,
-            threshold: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
