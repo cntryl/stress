@@ -259,6 +259,8 @@ impl JsonReporter {
         output.push_str("===============================================================\n\n");
 
         output.push_str(&format!("Completed: {}\n", result.started_at));
+        output.push_str(&format!("Runs:      {}\n", result.runs));
+        output.push_str(&format!("Warmup:    {}\n", result.warmup_runs));
         if let Some(sha) = &result.git_sha {
             output.push_str(&format!("Git SHA:   {}\n", sha));
         }
@@ -571,5 +573,24 @@ mod tests {
         // Should show bytes throughput, not elements
         assert!(throughput.contains("MB/s") || throughput.contains("KB/s"));
         assert!(!throughput.contains("ops/s"));
+    }
+
+    #[test]
+    fn summary_includes_runs_and_warmup() {
+        let reporter = JsonReporter::new("target/stress");
+        let suite = SuiteResult {
+            suite: "demo".to_string(),
+            results: vec![],
+            total_duration: Duration::from_millis(10),
+            started_at: "12345".to_string(),
+            runs: 3,
+            warmup_runs: 1,
+            git_sha: None,
+            metadata: HashMap::new(),
+        };
+
+        let summary = reporter.format_summary(&suite);
+        assert!(summary.contains("Runs:      3"));
+        assert!(summary.contains("Warmup:    1"));
     }
 }

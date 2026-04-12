@@ -184,6 +184,12 @@ impl BenchRunner {
     /// This writes JSON output and prints summary.
     pub fn finish(self) -> Vec<BenchResult> {
         let total_duration = self.suite_start.elapsed();
+        let mut metadata = self.metadata;
+        metadata.insert("effective_runs".to_string(), self.config.runs.to_string());
+        metadata.insert(
+            "effective_warmup".to_string(),
+            self.config.warmup_runs.to_string(),
+        );
 
         let suite_result = SuiteResult {
             suite: self.suite.clone(),
@@ -193,7 +199,7 @@ impl BenchRunner {
             runs: self.config.runs,
             warmup_runs: self.config.warmup_runs,
             git_sha: self.config.git_sha.clone(),
-            metadata: self.metadata,
+            metadata,
         };
 
         // Notify reporters

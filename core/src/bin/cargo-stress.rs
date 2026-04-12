@@ -100,13 +100,13 @@ struct StressArgs {
     // ========================================================================
     // Execution Options
     // ========================================================================
-    /// Number of measurement runs per benchmark (reports median)
-    #[arg(long, default_value_t = 1)]
-    runs: usize,
+    /// Number of measurement runs per benchmark (falls back to BENCH_RUNS, then 1)
+    #[arg(long)]
+    runs: Option<usize>,
 
-    /// Number of warmup runs (discarded, not reported)
-    #[arg(long, default_value_t = 0)]
-    warmup: usize,
+    /// Number of warmup runs (falls back to BENCH_WARMUP, then 0)
+    #[arg(long)]
+    warmup: Option<usize>,
 
     // ========================================================================
     // Output Control
@@ -754,13 +754,13 @@ fn build_passthrough_args(cmd: &mut Command, args: &StressArgs) {
     }
 
     // Runs
-    if args.runs != 1 {
-        cmd.arg("--runs").arg(args.runs.to_string());
+    if let Some(runs) = args.runs {
+        cmd.arg("--runs").arg(runs.to_string());
     }
 
     // Warmup
-    if args.warmup != 0 {
-        cmd.arg("--warmup").arg(args.warmup.to_string());
+    if let Some(warmup) = args.warmup {
+        cmd.arg("--warmup").arg(warmup.to_string());
     }
 
     // Verbosity

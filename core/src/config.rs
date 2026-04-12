@@ -52,31 +52,38 @@ impl BenchRunnerConfig {
     /// - `BENCH_GIT_SHA`: git commit hash
     /// - `BENCH_TIMEOUT_SECS`: timeout per benchmark in seconds
     pub fn from_env() -> Self {
+        Self::from_env_with(|key| std::env::var(key).ok())
+    }
+
+    fn from_env_with<F>(get_var: F) -> Self
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         let mut cfg = Self::default();
 
-        if let Ok(v) = std::env::var("BENCH_RUNS") {
+        if let Some(v) = get_var("BENCH_RUNS") {
             if let Ok(n) = v.parse() {
                 cfg.runs = n;
             }
         }
-        if let Ok(v) = std::env::var("BENCH_WARMUP") {
+        if let Some(v) = get_var("BENCH_WARMUP") {
             if let Ok(n) = v.parse() {
                 cfg.warmup_runs = n;
             }
         }
-        if let Ok(v) = std::env::var("BENCH_VERBOSE") {
+        if let Some(v) = get_var("BENCH_VERBOSE") {
             cfg.verbose = v != "0" && !v.eq_ignore_ascii_case("false");
         }
-        if let Ok(v) = std::env::var("BENCH_OUTPUT_DIR") {
+        if let Some(v) = get_var("BENCH_OUTPUT_DIR") {
             cfg.output_dir = PathBuf::from(v);
         }
-        if let Ok(v) = std::env::var("BENCH_FILTER") {
+        if let Some(v) = get_var("BENCH_FILTER") {
             cfg.filter = Some(v);
         }
-        if let Ok(v) = std::env::var("BENCH_GIT_SHA") {
+        if let Some(v) = get_var("BENCH_GIT_SHA") {
             cfg.git_sha = Some(v);
         }
-        if let Ok(v) = std::env::var("BENCH_TIMEOUT_SECS") {
+        if let Some(v) = get_var("BENCH_TIMEOUT_SECS") {
             if let Ok(secs) = v.parse::<u64>() {
                 cfg.timeout = Some(std::time::Duration::from_secs(secs));
             }
@@ -158,6 +165,7 @@ fn detect_git_sha() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn should_use_defaults_when_env_not_set() {
@@ -179,5 +187,29 @@ mod tests {
         assert_eq!(cfg.warmup_runs, 2);
         assert!(!cfg.verbose);
         assert_eq!(cfg.filter, Some("my_bench".to_string()));
+    }
+
+    #[test]
+    fn should_use_env_values_when_present() {
+        let env = HashMap::from([
+            ("BENCH_RUNS", "5".to_string()),
+            ("BENCH_WARMUP", "2".to_string()),
+            ("BENCH_VERBOSE", "false".to_string()),
+        ]);
+
+        let cfg = BenchRunnerConfig::from_env_with(|key| env.get(key).cloned());
+
+        assert_eq!(cfg.runs, 5);
+        assert_eq!(cfg.warmup_runs, 2);
+        assert!(!cfg.verbose);
+    }
+
+    #[test]
+    fn should_use_defaults_when_env_missing() {
+        let cfg = BenchRunnerConfig::from_env_with(|_| None);
+
+        assert_eq!(cfg.runs, 1);
+        assert_eq!(cfg.warmup_runs, 0);
+        assert!(cfg.verbose);
     }
 }

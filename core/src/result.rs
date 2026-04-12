@@ -251,4 +251,29 @@ mod tests {
         };
         assert!(!current.is_regression(&baseline, 0.05)); // 3% slower < 5% threshold
     }
+
+    #[test]
+    fn should_serialize_suite_result_with_effective_run_metadata() {
+        let mut metadata = HashMap::new();
+        metadata.insert("effective_runs".to_string(), "3".to_string());
+        metadata.insert("effective_warmup".to_string(), "1".to_string());
+
+        let suite = SuiteResult {
+            suite: "suite".to_string(),
+            results: vec![],
+            total_duration: Duration::from_millis(1),
+            started_at: "123".to_string(),
+            runs: 3,
+            warmup_runs: 1,
+            git_sha: None,
+            metadata,
+        };
+
+        let json = serde_json::to_value(&suite).expect("suite serialization should work");
+
+        assert_eq!(json["runs"], 3);
+        assert_eq!(json["warmup_runs"], 1);
+        assert_eq!(json["metadata"]["effective_runs"], "3");
+        assert_eq!(json["metadata"]["effective_warmup"], "1");
+    }
 }

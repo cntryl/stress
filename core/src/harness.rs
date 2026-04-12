@@ -53,9 +53,9 @@ struct StressBinaryArgs {
     /// Filter benchmarks by glob pattern
     workload: Option<String>,
     /// Number of measurement runs
-    runs: usize,
+    runs: Option<usize>,
     /// Number of warmup runs
-    warmup: usize,
+    warmup: Option<usize>,
     /// Verbose output
     verbose: bool,
     /// Quiet mode
@@ -76,8 +76,8 @@ impl Default for StressBinaryArgs {
     fn default() -> Self {
         Self {
             workload: None,
-            runs: 1,
-            warmup: 0,
+            runs: None,
+            warmup: None,
             verbose: false,
             quiet: false,
             include_ignored: false,
@@ -96,6 +96,10 @@ impl StressBinaryArgs {
     /// for every stress binary. The argument format matches what cargo-stress passes.
     fn parse() -> Self {
         let args: Vec<String> = std::env::args().collect();
+        Self::parse_from_args(&args)
+    }
+
+    fn parse_from_args(args: &[String]) -> Self {
         let mut result = Self::default();
         let mut i = 1;
 
@@ -110,13 +114,17 @@ impl StressBinaryArgs {
                 "--runs" => {
                     i += 1;
                     if i < args.len() {
-                        result.runs = args[i].parse().unwrap_or(1);
+                        if let Ok(runs) = args[i].parse() {
+                            result.runs = Some(runs);
+                        }
                     }
                 }
                 "--warmup" => {
                     i += 1;
                     if i < args.len() {
-                        result.warmup = args[i].parse().unwrap_or(0);
+                        if let Ok(warmup) = args[i].parse() {
+                            result.warmup = Some(warmup);
+                        }
                     }
                 }
                 "--verbose" | "-v" => {
@@ -172,8 +180,8 @@ fn print_help() {
     eprintln!();
     eprintln!("OPTIONS:");
     eprintln!("    --workload <PATTERN>   Filter benchmarks by glob pattern");
-    eprintln!("    --runs <N>             Number of measurement runs (default: 1)");
-    eprintln!("    --warmup <N>           Number of warmup runs (default: 0)");
+    eprintln!("    --runs <N>             Number of measurement runs (fallback: BENCH_RUNS, then 1)");
+    eprintln!("    --warmup <N>           Number of warmup runs (fallback: BENCH_WARMUP, then 0)");
     eprintln!("    -v, --verbose          Verbose output");
     eprintln!("    -q, --quiet            Quiet mode");
     eprintln!("    --include-ignored      Include ignored benchmarks");
@@ -227,11 +235,17 @@ pub fn stress_binary_main() {
     };
 
     let mut opts = StressRunnerOptions::new()
-        .runs(args.runs)
-        .warmup(args.warmup)
         .verbose(verbose)
         .include_ignored(args.include_ignored)
         .threshold(args.threshold);
+
+    if let Some(runs) = args.runs {
+        opts = opts.runs(runs);
+    }
+
+    if let Some(warmup) = args.warmup {
+        opts = opts.warmup(warmup);
+    }
 
     if let Some(pattern) = args.workload {
         opts = opts.workload(pattern);
@@ -376,13 +390,7 @@ pub fn run_with_options(opts: StressRunnerOptions) {
 
     // Build config
     let mut config = BenchRunnerConfig::from_env();
-    if let Some(r) = opts.runs {
-        config.runs = r;
-    }
-    if let Some(w) = opts.warmup {
-        config.warmup_runs = w;
-    }
-    config.verbose = opts.verbose;
+    apply_runner_option_overrides(&mut config, &opts);
 
     let suite_name = get_suite_name();
     let mut runner = BenchRunner::with_config(&suite_name, config);
@@ -409,6 +417,16 @@ pub fn run_with_options(opts: StressRunnerOptions) {
         let _results = runner.finish();
         // Summary already printed by ConsoleReporter
     }
+}
+
+fn apply_runner_option_overrides(config: &mut BenchRunnerConfig, opts: &StressRunnerOptions) {
+    if let Some(r) = opts.runs {
+        config.runs = r;
+    }
+    if let Some(w) = opts.warmup {
+        config.warmup_runs = w;
+    }
+    config.verbose = opts.verbose;
 }
 
 /// Simple glob matching supporting * and ?
@@ -488,5 +506,75 @@ mod tests {
     fn glob_is_case_insensitive() {
         assert!(matches_glob("FooBar", "foobar"));
         assert!(matches_glob("foobar", "FOO*"));
+    }
+
+    #[test]
+    fn parse_args_keeps_runs_and_warmup_unset_when_not_provided() {
+        let args = vec!["stress-demo".to_string(), "--list".to_string()];
+        let parsed = StressBinaryArgs::parse_from_args(&args);
+        assert_eq!(parsed.runs, None);
+        assert_eq!(parsed.warmup, None);
+    }
+
+    #[test]
+    fn parse_args_sets_runs_and_warmup_only_when_provided() {
+        let args = vec![
+            "stress-demo".to_string(),
+            "--runs".to_string(),
+            "4".to_string(),
+            "--warmup".to_string(),
+            "2".to_string(),
+        ];
+        let parsed = StressBinaryArgs::parse_from_args(&args);
+        assert_eq!(parsed.runs, Some(4));
+        assert_eq!(parsed.warmup, Some(2));
+    }
+
+    #[test]
+    fn options_without_cli_values_keep_base_config_values() {
+        let mut cfg = BenchRunnerConfig::new().runs(3).warmup(1).verbose(true);
+        let opts = StressRunnerOptions::new().verbose(false);
+        apply_runner_option_overrides(&mut cfg, &opts);
+        assert_eq!(cfg.runs, 3);
+        assert_eq!(cfg.warmup_runs, 1);
+        assert!(!cfg.verbose);
+    }
+
+    #[test]
+    fn cli_options_override_base_config_values() {
+        let mut cfg = BenchRunnerConfig::new().runs(3).warmup(1).verbose(true);
+        let opts = StressRunnerOptions::new()
+            .runs(1)
+            .warmup(0)
+            .verbose(false);
+        apply_runner_option_overrides(&mut cfg, &opts);
+        assert_eq!(cfg.runs, 1);
+        assert_eq!(cfg.warmup_runs, 0);
+        assert!(!cfg.verbose);
+    }
+
+    #[test]
+    fn parse_plus_option_override_matches_expected_precedence_flow() {
+        // Simulate env-derived base config and explicit CLI override.
+        let mut cfg = BenchRunnerConfig::new().runs(3).warmup(2);
+        let args = vec![
+            "stress-demo".to_string(),
+            "--runs".to_string(),
+            "1".to_string(),
+        ];
+        let parsed = StressBinaryArgs::parse_from_args(&args);
+
+        let mut opts = StressRunnerOptions::new();
+        if let Some(runs) = parsed.runs {
+            opts = opts.runs(runs);
+        }
+        if let Some(warmup) = parsed.warmup {
+            opts = opts.warmup(warmup);
+        }
+
+        apply_runner_option_overrides(&mut cfg, &opts);
+
+        assert_eq!(cfg.runs, 1);
+        assert_eq!(cfg.warmup_runs, 2);
     }
 }

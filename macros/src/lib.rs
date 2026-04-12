@@ -111,8 +111,8 @@ fn parse_custom_name(attr: &str) -> Option<String> {
 /// The generated binary accepts these arguments:
 ///
 /// - `--workload <PATTERN>`: Filter benchmarks by glob pattern
-/// - `--runs <N>`: Number of measurement runs (default: 1)
-/// - `--warmup <N>`: Number of warmup runs (default: 0)
+/// - `--runs <N>`: Number of measurement runs (fallback: `BENCH_RUNS`, then `1`)
+/// - `--warmup <N>`: Number of warmup runs (fallback: `BENCH_WARMUP`, then `0`)
 /// - `--verbose` / `-v`: Verbose output
 /// - `--quiet` / `-q`: Quiet mode
 /// - `--include-ignored`: Include ignored benchmarks

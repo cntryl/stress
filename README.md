@@ -122,7 +122,14 @@ Benchmarks: 2
 
 ## Configuration
 
-Configuration via environment variables or command-line arguments.
+Configuration precedence for runtime settings is:
+
+1. Explicit command-line arguments
+2. Environment variables
+3. Crate defaults
+
+For run counts specifically: `--runs`/`--warmup` override `BENCH_RUNS`/`BENCH_WARMUP`,
+and environment values fall back to defaults (`runs = 1`, `warmup = 0`) when unset.
 
 ### Environment Variables
 
@@ -151,8 +158,8 @@ cargo bench -- --help
 ```
 
 **Available options:**
-- `--runs <N>` — Measurement runs
-- `--warmup <N>` — Warmup runs
+- `--runs <N>` — Measurement runs (fallback: `BENCH_RUNS`, then `1`)
+- `--warmup <N>` — Warmup runs (fallback: `BENCH_WARMUP`, then `0`)
 - `--workload <PATTERN>` — Filter benchmarks by glob pattern
 - `--verbose`, `-v` — Verbose output
 - `--quiet`, `-q` — Quiet mode

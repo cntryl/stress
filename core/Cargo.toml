@@ -1,6 +1,6 @@
 [package]
 name = "cntryl-stress"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Lightweight benchmark runner for single-shot and duration-based stress tests"
 license = "Apache-2.0"
