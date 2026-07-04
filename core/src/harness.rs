@@ -171,7 +171,7 @@ fn print_help() {
     eprintln!("    <binary> [OPTIONS]");
     eprintln!();
     eprintln!("OPTIONS:");
-    eprintln!("    --profile <release|smoke|lab>  Optional profile override; default is release");
+    eprintln!("    --profile <release|smoke|lab>  Optional profile override; default is lab");
     eprintln!("    --workload <PATTERN>           Filter benchmarks by name/module glob");
     eprintln!("    --tier <N>                     Run one numeric tier");
     eprintln!("    --samples <N>                  Measured samples per benchmark");

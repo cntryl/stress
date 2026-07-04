@@ -441,7 +441,7 @@ where
             Err(_) => (
                 RunProfile::default(),
                 "default".to_string(),
-                Some("invalid STRESS_PROFILE, using release".to_string()),
+                Some("invalid STRESS_PROFILE, using lab".to_string()),
             ),
         },
         None => (RunProfile::default(), "default".to_string(), None),
@@ -661,15 +661,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_profile_enforces_quality_and_regression_gates() {
+    fn default_profile_is_lab_exploration() {
         let cfg = StressRunnerConfig::default();
 
-        assert_eq!(cfg.profile, RunProfile::Release);
-        assert_eq!(cfg.samples, 10);
-        assert_eq!(cfg.warmup_samples, 1);
-        assert_eq!(cfg.min_quality, QualityClass::Acceptable);
-        assert!(cfg.fail_on_quality);
-        assert!(cfg.fail_on_regression);
+        assert_eq!(cfg.profile, RunProfile::Lab);
+        assert_eq!(cfg.samples, 30);
+        assert_eq!(cfg.warmup_samples, 2);
+        assert_eq!(cfg.cooldown_samples, 1);
+        assert_eq!(cfg.min_quality, QualityClass::Noisy);
+        assert!(!cfg.fail_on_quality);
+        assert!(!cfg.fail_on_regression);
     }
 
     #[test]
@@ -702,7 +703,7 @@ mod tests {
         assert_eq!(cfg.filter, Some("my_bench".to_string()));
         assert_eq!(cfg.tier, Some(3));
         assert_eq!(cfg.operations_per_sample, 10);
-        assert_eq!(cfg.micro_sample_duration, Duration::from_millis(100));
+        assert_eq!(cfg.micro_sample_duration, Duration::from_millis(200));
     }
 
     #[test]
@@ -735,7 +736,7 @@ mod tests {
 
         let resolution = StressRunnerConfig::resolve_from_env_with(|key| env.get(key).cloned());
 
-        assert_eq!(resolution.config.samples, 10);
+        assert_eq!(resolution.config.samples, 30);
         assert_eq!(resolution.config.console, ConsoleMode::Default);
         assert_eq!(resolution.config.timeout, None);
         assert_eq!(resolution.warnings.len(), 3);
@@ -747,14 +748,14 @@ mod tests {
 
         let resolution = StressRunnerConfig::resolve_from_env_with(|key| env.get(key).cloned());
 
-        assert_eq!(resolution.config.profile, RunProfile::Release);
+        assert_eq!(resolution.config.profile, RunProfile::Lab);
         assert_eq!(
             resolution.metadata.get("profile_src"),
             Some(&"default".to_string())
         );
         assert_eq!(
             resolution.warnings,
-            vec!["invalid STRESS_PROFILE, using release".to_string()]
+            vec!["invalid STRESS_PROFILE, using lab".to_string()]
         );
     }
 
@@ -795,7 +796,7 @@ mod tests {
         assert_eq!(
             cfg.mode_for_kind(BenchmarkModeKind::Micro),
             BenchmarkMode::Micro {
-                target_sample_duration: Duration::from_millis(100)
+                target_sample_duration: Duration::from_millis(200)
             }
         );
     }

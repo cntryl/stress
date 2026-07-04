@@ -66,8 +66,9 @@ cargo stress --baseline target/stress/storage_stress/latest.json
   - Tier 4: integration
   - Tier 5: saturation/scaling
   - Tier 6: soak/endurance
-- The default run is the trustworthy release-quality gate: 10 measured samples, 1 warmup sample, quality enforcement, and regression enforcement when a baseline is supplied.
-- `smoke` and `lab` remain explicit diagnostic overrides for callers that need a quick check or deeper exploration.
+- The default run is the deeper `lab` profile: 30 measured samples, 2 warmup samples, 1 cooldown sample, reported quality findings, and no quality/regression process gate.
+- Use `release` for the trustworthy release-quality gate: 10 measured samples, 1 warmup sample, quality enforcement, and regression enforcement when a baseline is supplied.
+- Use `smoke` for a quick correctness-focused diagnostic run.
 - JSON artifacts use `schema_version: "cntryl-stress.v1"`.
 - Raw `Sample` rows are authoritative; summaries, quality, and comparisons are derived from measured samples only.
 - Warmup and cooldown samples are retained in JSON and excluded from summary statistics and baseline comparison.

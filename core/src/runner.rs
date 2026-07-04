@@ -467,6 +467,7 @@ mod tests {
         let config = StressRunnerConfig::new()
             .samples(2)
             .warmup_samples(1)
+            .cooldown_samples(0)
             .verbose(false);
         let mut runner = StressRunner::with_config("suite", config);
         runner.reporters(Vec::new());

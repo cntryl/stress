@@ -9,16 +9,16 @@ use std::time::Duration;
 /// Authoritative JSON schema version for current cntryl-stress artifacts.
 pub const SCHEMA_VERSION: &str = "cntryl-stress.v1";
 
-/// Benchmark run profile. The default profile is the trustworthy release gate.
+/// Benchmark run profile. The default profile is the deeper exploratory lab run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RunProfile {
     /// Fast correctness-focused diagnostic runs.
     Smoke,
     /// Trustworthy runs with quality and regression gates.
-    #[default]
     Release,
     /// Deep exploratory runs. Correctness still fails, quality is reported.
+    #[default]
     Lab,
 }
 
@@ -476,18 +476,18 @@ pub struct ProfileConfig {
 impl Default for ProfileConfig {
     fn default() -> Self {
         Self {
-            profile: RunProfile::Release,
-            measured_samples: 10,
-            warmup_samples: 1,
-            cooldown_samples: 0,
-            min_quality: QualityClass::Acceptable,
-            fail_on_quality: true,
-            fail_on_regression: true,
+            profile: RunProfile::Lab,
+            measured_samples: 30,
+            warmup_samples: 2,
+            cooldown_samples: 1,
+            min_quality: QualityClass::Noisy,
+            fail_on_quality: false,
+            fail_on_regression: false,
             regression_threshold: 0.05,
-            sample_duration: Duration::from_secs(1),
+            sample_duration: Duration::from_secs(5),
             operations_per_sample: 1,
-            micro_sample_duration: Duration::from_millis(100),
-            report_depth: "gated".to_string(),
+            micro_sample_duration: Duration::from_millis(200),
+            report_depth: "deep".to_string(),
         }
     }
 }

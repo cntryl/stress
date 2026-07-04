@@ -1282,8 +1282,8 @@ mod tests {
     use super::*;
     use crate::result::{
         BenchmarkBudgets, BenchmarkMode, BenchmarkSpec, BudgetResult, ComparisonResult,
-        CorrectnessCounters, CorrectnessSummary, EnvironmentInfo, ProfileConfig, Sample,
-        SamplePhase, SummaryStats, SCHEMA_VERSION,
+        CorrectnessCounters, CorrectnessSummary, EnvironmentInfo, Sample, SamplePhase,
+        SummaryStats, SCHEMA_VERSION,
     };
 
     fn summary(name: &str, value: f64, quality: QualityClass) -> BenchmarkSummary {
@@ -1321,13 +1321,15 @@ mod tests {
     }
 
     fn run_with_summaries(summaries: Vec<BenchmarkSummary>) -> StressRun {
-        let profile_config = ProfileConfig::default();
+        let profile_config =
+            crate::config::StressRunnerConfig::for_profile(crate::result::RunProfile::Release)
+                .profile_config();
         StressRun {
             schema_version: SCHEMA_VERSION.to_string(),
             tool_version: "0.3.0".to_string(),
             suite: "suite".to_string(),
             run_profile: profile_config.profile,
-            environment: EnvironmentInfo::unknown(profile_config),
+            environment: EnvironmentInfo::unknown(profile_config.clone()),
             benchmark_specs: vec![BenchmarkSpec {
                 id: "bench".to_string(),
                 name: "bench".to_string(),
@@ -1365,7 +1367,7 @@ mod tests {
                     completed: 1,
                     ..CorrectnessCounters::default()
                 },
-                environment: EnvironmentInfo::unknown(ProfileConfig::default()),
+                environment: EnvironmentInfo::unknown(profile_config),
             }],
             summaries,
             comparisons: Vec::new(),
