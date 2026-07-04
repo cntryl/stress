@@ -63,12 +63,12 @@ pub struct StressRunnerConfig {
 
 impl Default for StressRunnerConfig {
     fn default() -> Self {
-        Self::for_profile(RunProfile::Smoke)
+        Self::for_profile(RunProfile::default())
     }
 }
 
 impl StressRunnerConfig {
-    /// Create a default smoke-profile config.
+    /// Create a default trustworthy config.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -168,7 +168,7 @@ impl StressRunnerConfig {
         if get_var("STRESS_PROFILE").is_some_and(|value| value.parse::<RunProfile>().is_err()) {
             resolution
                 .warnings
-                .push("invalid STRESS_PROFILE, using smoke".to_string());
+                .push("invalid STRESS_PROFILE, using release".to_string());
         }
         resolution.metadata.insert(
             "profile_src".to_string(),
@@ -535,25 +535,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn smoke_profile_defaults_to_fast_correctness_run() {
+    fn default_profile_enforces_quality_and_regression_gates() {
         let cfg = StressRunnerConfig::default();
 
-        assert_eq!(cfg.profile, RunProfile::Smoke);
-        assert_eq!(cfg.samples, 1);
-        assert_eq!(cfg.warmup_samples, 0);
-        assert!(!cfg.fail_on_quality);
-        assert!(!cfg.fail_on_regression);
-    }
-
-    #[test]
-    fn release_profile_enforces_quality_and_regression_gates() {
-        let cfg = StressRunnerConfig::for_profile(RunProfile::Release);
-
+        assert_eq!(cfg.profile, RunProfile::Release);
         assert_eq!(cfg.samples, 10);
         assert_eq!(cfg.warmup_samples, 1);
         assert_eq!(cfg.min_quality, QualityClass::Acceptable);
         assert!(cfg.fail_on_quality);
         assert!(cfg.fail_on_regression);
+    }
+
+    #[test]
+    fn smoke_profile_is_an_explicit_fast_correctness_run() {
+        let cfg = StressRunnerConfig::for_profile(RunProfile::Smoke);
+
+        assert_eq!(cfg.profile, RunProfile::Smoke);
+        assert_eq!(cfg.samples, 1);
+        assert_eq!(cfg.warmup_samples, 0);
+        assert_eq!(cfg.min_quality, QualityClass::Untrustworthy);
+        assert!(!cfg.fail_on_quality);
+        assert!(!cfg.fail_on_regression);
     }
 
     #[test]
@@ -606,7 +608,7 @@ mod tests {
 
         let resolution = StressRunnerConfig::resolve_from_env_with(|key| env.get(key).cloned());
 
-        assert_eq!(resolution.config.samples, 1);
+        assert_eq!(resolution.config.samples, 10);
         assert!(resolution.config.verbose);
         assert_eq!(resolution.config.timeout, None);
         assert_eq!(resolution.warnings.len(), 3);

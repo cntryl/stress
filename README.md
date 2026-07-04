@@ -38,15 +38,16 @@ stress_main!();
 
 ```bash
 cargo bench --bench storage_stress
-cargo bench --bench storage_stress -- --profile release --samples 10
-cargo stress --profile smoke
-cargo stress --profile release --baseline target/stress/storage_stress/latest.json
+cargo bench --bench storage_stress -- --workload '*fanout*'
+cargo stress
+cargo stress --baseline target/stress/storage_stress/latest.json
 ```
 
 ## Model
 
 - `tier = 2..N` describes benchmark scope.
-- `smoke`, `release`, and `lab` are run profiles that control samples, gates, and report depth.
+- The default run is the trustworthy release-quality gate: 10 measured samples, 1 warmup sample, quality enforcement, and regression enforcement when a baseline is supplied.
+- `smoke` and `lab` remain explicit diagnostic overrides for callers that need a quick check or deeper exploration.
 - JSON artifacts use `schema_version: "cntryl-stress.v2"`.
 - Raw `Sample` rows are authoritative; summaries, quality, and comparisons are derived from measured samples only.
 - Warmup and cooldown samples are retained in JSON and excluded from summary statistics and baseline comparison.
@@ -101,12 +102,12 @@ ctx.measure_workload(|| work());
 
 Tiers start at 2. The macro rejects `tier = 1`.
 
-## Profiles
+## Run Policy
 
 | Profile | Default Samples | Gate Behavior |
 |---------|-----------------|---------------|
-| `smoke` | 1 measured, 0 warmup | Correctness-focused, no quality/regression failure |
-| `release` | 10 measured, 1 warmup | Fails correctness, quality below acceptable, and meaningful regressions |
+| `release` (default) | 10 measured, 1 warmup | Fails correctness, quality below acceptable, and meaningful regressions |
+| `smoke` | 1 measured, 0 warmup | Explicit diagnostic override; correctness-focused, no quality/regression failure |
 | `lab` | 30 measured, 2 warmup, 1 cooldown | Fails correctness; reports noisy rows without failing quality |
 
 Quality classes:
@@ -120,11 +121,11 @@ Baseline regressions are meaningful only when the primary metric moves past thre
 
 ## Configuration
 
-Command-line arguments override `STRESS_*` environment variables, which override profile defaults.
+Command-line arguments override `STRESS_*` environment variables, which override the trustworthy defaults.
 
 | Variable | Description |
 |----------|-------------|
-| `STRESS_PROFILE` | `smoke`, `release`, or `lab` |
+| `STRESS_PROFILE` | Optional profile override: `release`, `smoke`, or `lab` |
 | `STRESS_SAMPLES` | Measured samples per benchmark |
 | `STRESS_WARMUP_SAMPLES` | Warmup samples |
 | `STRESS_COOLDOWN_SAMPLES` | Cooldown samples |
@@ -142,7 +143,6 @@ Command-line arguments override `STRESS_*` environment variables, which override
 Harness options:
 
 ```bash
-cargo bench --bench storage_stress -- --profile release
 cargo bench --bench storage_stress -- --tier 3 --workload '*fanout*'
 cargo bench --bench storage_stress -- --samples 10 --warmup-samples 1
 cargo bench --bench storage_stress -- --baseline target/stress/storage_stress/latest.json
@@ -164,10 +164,7 @@ The JSON artifact contains tool version, run profile, environment, benchmark spe
 ```rust
 use cntryl_stress::{StressRunner, StressRunnerConfig};
 
-let config = StressRunnerConfig::new()
-    .samples(10)
-    .warmup_samples(1)
-    .filter("write");
+let config = StressRunnerConfig::new().filter("write");
 
 let mut runner = StressRunner::with_config("storage", config);
 runner.run("write_batch", |ctx| {

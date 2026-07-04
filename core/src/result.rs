@@ -9,14 +9,14 @@ use std::time::Duration;
 /// Authoritative JSON schema version for cntryl-stress v0.3 artifacts.
 pub const SCHEMA_VERSION: &str = "cntryl-stress.v2";
 
-/// Benchmark run profile. Profiles control sample counts, gates, and report depth.
+/// Benchmark run profile. The default profile is the trustworthy release gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RunProfile {
-    /// Fast correctness-focused runs.
-    #[default]
+    /// Fast correctness-focused diagnostic runs.
     Smoke,
-    /// CI/release runs with quality and regression gates.
+    /// Trustworthy runs with quality and regression gates.
+    #[default]
     Release,
     /// Deep exploratory runs. Correctness still fails, quality is reported.
     Lab,
@@ -407,17 +407,17 @@ pub struct ProfileConfig {
 impl Default for ProfileConfig {
     fn default() -> Self {
         Self {
-            profile: RunProfile::Smoke,
-            measured_samples: 1,
-            warmup_samples: 0,
+            profile: RunProfile::Release,
+            measured_samples: 10,
+            warmup_samples: 1,
             cooldown_samples: 0,
-            min_quality: QualityClass::Untrustworthy,
-            fail_on_quality: false,
-            fail_on_regression: false,
+            min_quality: QualityClass::Acceptable,
+            fail_on_quality: true,
+            fail_on_regression: true,
             regression_threshold: 0.05,
-            sample_duration: Duration::from_millis(100),
+            sample_duration: Duration::from_secs(1),
             operations_per_sample: 1,
-            report_depth: "summary".to_string(),
+            report_depth: "gated".to_string(),
         }
     }
 }
@@ -1208,7 +1208,7 @@ mod tests {
             schema_version: SCHEMA_VERSION.to_string(),
             tool_version: "0.3.0".to_string(),
             suite: "suite".to_string(),
-            run_profile: RunProfile::Smoke,
+            run_profile: profile_config.profile,
             environment: EnvironmentInfo::unknown(profile_config),
             benchmark_specs: Vec::new(),
             samples: Vec::new(),
@@ -1239,7 +1239,7 @@ mod tests {
             schema_version: "cntryl-stress.v999".to_string(),
             tool_version: "0.3.0".to_string(),
             suite: "suite".to_string(),
-            run_profile: RunProfile::Smoke,
+            run_profile: profile_config.profile,
             environment: EnvironmentInfo::unknown(profile_config),
             benchmark_specs: Vec::new(),
             samples: Vec::new(),

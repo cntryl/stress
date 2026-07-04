@@ -57,9 +57,9 @@ in release mode. Tests are defined with #[stress_test] and discovered
 automatically at runtime by each binary.
 
 Example:
-    cargo stress                        # Run all stress tests
+    cargo stress                        # Run all stress tests with the trustworthy default gate
     cargo stress --workload 'fsync*'    # Filter by pattern
-    cargo stress --profile release      # Release-profile sample policy
+    cargo stress --baseline latest.json # Compare against a v2 baseline
     cargo stress --list                 # List available tests
 "
 )]
@@ -105,7 +105,7 @@ struct StressArgs {
     // ========================================================================
     // Execution Options
     // ========================================================================
-    /// Run profile: smoke, release, or lab (falls back to `STRESS_PROFILE`)
+    /// Optional profile override: release, smoke, or lab (falls back to `STRESS_PROFILE`)
     #[arg(long)]
     profile: Option<String>,
 
