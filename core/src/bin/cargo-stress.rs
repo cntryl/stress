@@ -105,7 +105,7 @@ struct StressArgs {
     // ========================================================================
     // Execution Options
     // ========================================================================
-    /// Optional profile override: release, smoke, or lab (falls back to `STRESS_PROFILE`)
+    /// Optional profile override: default, smoke, lab, or release (falls back to `STRESS_PROFILE`)
     #[arg(long)]
     profile: Option<String>,
 

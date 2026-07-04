@@ -320,9 +320,9 @@ pub(crate) fn format_markdown_report(run: &StressRun) -> String {
     let _ = writeln!(output);
     let _ = writeln!(
         output,
-        "| Benchmark | Tier | Metric | Value | Quality | Samples |"
+        "| Benchmark | Tier | Metric | Value | Quality | Samples | Wall |"
     );
-    let _ = writeln!(output, "|---|---:|---|---:|---|---:|");
+    let _ = writeln!(output, "|---|---:|---|---:|---|---:|---:|");
     for summary in &run.summaries {
         let value = summary.primary_value().map_or_else(
             || "n/a".to_string(),
@@ -330,13 +330,14 @@ pub(crate) fn format_markdown_report(run: &StressRun) -> String {
         );
         let _ = writeln!(
             output,
-            "| {} | {} | {:?} | {} | {} | {} |",
+            "| {} | {} | {:?} | {} | {} | {} | {} |",
             summary.name,
             summary.tier,
             summary.primary_metric,
             value,
             summary.quality,
-            summary.measured_samples
+            summary.measured_samples,
+            format_duration_ns(summary.total_wall_clock_ns)
         );
     }
     output
@@ -438,7 +439,7 @@ fn write_grouped_tables(
 fn write_console_table_header(output: &mut String) {
     let _ = writeln!(
         output,
-        "  {name:<NAME_WIDTH$} {metric:>8} {value:>NUMBER_WIDTH$} {mean:>NUMBER_WIDTH$} {p50:>NUMBER_WIDTH$} {p95:>NUMBER_WIDTH$} {p99:>NUMBER_WIDTH$} {allocs:>NUMBER_WIDTH$} {bytes:>NUMBER_WIDTH$} {overhead:>NUMBER_WIDTH$} {rsd:>8} {quality:>13} {samples:>7} {delta:>18}  notes",
+        "  {name:<NAME_WIDTH$} {metric:>8} {value:>NUMBER_WIDTH$} {mean:>NUMBER_WIDTH$} {p50:>NUMBER_WIDTH$} {p95:>NUMBER_WIDTH$} {p99:>NUMBER_WIDTH$} {allocs:>NUMBER_WIDTH$} {bytes:>NUMBER_WIDTH$} {overhead:>NUMBER_WIDTH$} {rsd:>8} {quality:>13} {samples:>7} {wall:>NUMBER_WIDTH$} {delta:>18}  notes",
         name = "name",
         metric = "metric",
         value = "value",
@@ -452,6 +453,7 @@ fn write_console_table_header(output: &mut String) {
         rsd = "rsd",
         quality = "quality",
         samples = "samples",
+        wall = "wall",
         delta = "delta"
     );
 }
@@ -484,7 +486,7 @@ fn write_console_table_row(
         );
         let _ = writeln!(
             output,
-            "{marker} {name:<NAME_WIDTH$} {metric:>8} {value:>NUMBER_WIDTH$} {mean:>NUMBER_WIDTH$} {p50:>NUMBER_WIDTH$} {p95:>NUMBER_WIDTH$} {p99:>NUMBER_WIDTH$} {allocs:>NUMBER_WIDTH$} {bytes:>NUMBER_WIDTH$} {overhead:>NUMBER_WIDTH$} {rsd:>8} {quality:>13} {samples:>7} {delta:>18}  {notes}",
+            "{marker} {name:<NAME_WIDTH$} {metric:>8} {value:>NUMBER_WIDTH$} {mean:>NUMBER_WIDTH$} {p50:>NUMBER_WIDTH$} {p95:>NUMBER_WIDTH$} {p99:>NUMBER_WIDTH$} {allocs:>NUMBER_WIDTH$} {bytes:>NUMBER_WIDTH$} {overhead:>NUMBER_WIDTH$} {rsd:>8} {quality:>13} {samples:>7} {wall:>NUMBER_WIDTH$} {delta:>18}  {notes}",
             mean = format_metric_value(stats.mean, summary.primary_metric),
             p50 = format_metric_value(stats.p50, summary.primary_metric),
             p95 = format_metric_value(stats.p95, summary.primary_metric),
@@ -494,13 +496,15 @@ fn write_console_table_row(
             overhead = format_optional_duration_stat(summary.overhead_ns_per_op.as_ref()),
             rsd = format_percent(stats.relative_std_dev),
             samples = summary.measured_samples,
+            wall = format_duration_ns(summary.total_wall_clock_ns),
         );
     } else {
         let unavailable = "n/a";
         let _ = writeln!(
             output,
-            "{marker} {name:<NAME_WIDTH$} {metric:>8} {unavailable:>NUMBER_WIDTH$} {unavailable:>NUMBER_WIDTH$} {unavailable:>NUMBER_WIDTH$} {unavailable:>NUMBER_WIDTH$} {unavailable:>NUMBER_WIDTH$} {unavailable:>NUMBER_WIDTH$} {unavailable:>NUMBER_WIDTH$} {unavailable:>NUMBER_WIDTH$} {unavailable:>8} {quality:>13} {samples:>7} {delta:>18}  {notes}",
+            "{marker} {name:<NAME_WIDTH$} {metric:>8} {unavailable:>NUMBER_WIDTH$} {unavailable:>NUMBER_WIDTH$} {unavailable:>NUMBER_WIDTH$} {unavailable:>NUMBER_WIDTH$} {unavailable:>NUMBER_WIDTH$} {unavailable:>NUMBER_WIDTH$} {unavailable:>NUMBER_WIDTH$} {unavailable:>NUMBER_WIDTH$} {unavailable:>8} {quality:>13} {samples:>7} {wall:>NUMBER_WIDTH$} {delta:>18}  {notes}",
             samples = summary.measured_samples,
+            wall = format_duration_ns(summary.total_wall_clock_ns),
         );
     }
 }
@@ -1252,11 +1256,12 @@ fn write_summary_line(output: &mut String, summary: &BenchmarkSummary) {
     );
     let _ = writeln!(
         output,
-        "  {name:<NAME_WIDTH$} {value:>VALUE_WIDTH$}  tier={tier} quality={quality} samples={samples}",
+        "  {name:<NAME_WIDTH$} {value:>VALUE_WIDTH$}  tier={tier} quality={quality} samples={samples} wall={wall}",
         name = summary.name,
         tier = summary.tier,
         quality = summary.quality,
-        samples = summary.measured_samples
+        samples = summary.measured_samples,
+        wall = format_duration_ns(summary.total_wall_clock_ns)
     );
 }
 
@@ -1457,6 +1462,8 @@ mod tests {
             cooldown_samples: 0,
             stats: SummaryStats::from_values(&[value, value * 1.01])
                 .or_else(|| SummaryStats::from_values(&[value])),
+            wall_clock: SummaryStats::from_values(&[1_000_000.0]),
+            total_wall_clock_ns: 1_000_000,
             ns_per_op: None,
             gross_ns_per_op: None,
             overhead_ns_per_op: None,
@@ -1506,6 +1513,7 @@ mod tests {
                 sample_number: 0,
                 phase: SamplePhase::Measured,
                 elapsed_ns: 1,
+                wall_clock_ns: 1,
                 operations_attempted: 1,
                 operations_completed: 1,
                 throughput: 1.0,
@@ -1569,6 +1577,8 @@ mod tests {
         assert!(report.contains("B/op"));
         assert!(report.contains("overhead"));
         assert!(report.contains("samples"));
+        assert!(report.contains("wall"));
+        assert!(report.contains("1.00ms"));
         assert!(report.contains("authoritative"));
         assert!(report.contains("Summary"));
         assert!(report.contains("Needs attention"));

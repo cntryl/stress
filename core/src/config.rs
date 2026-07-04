@@ -126,6 +126,20 @@ impl StressRunnerConfig {
     #[must_use]
     pub fn for_profile(profile: RunProfile) -> Self {
         let profile_config = match profile {
+            RunProfile::Default => ProfileConfig {
+                profile,
+                measured_samples: 5,
+                warmup_samples: 1,
+                cooldown_samples: 0,
+                min_quality: QualityClass::Noisy,
+                fail_on_quality: false,
+                fail_on_regression: false,
+                regression_threshold: 0.05,
+                sample_duration: Duration::from_millis(500),
+                operations_per_sample: 1,
+                micro_sample_duration: Duration::from_millis(25),
+                report_depth: "default".to_string(),
+            },
             RunProfile::Smoke => ProfileConfig {
                 profile,
                 measured_samples: 1,
@@ -135,9 +149,9 @@ impl StressRunnerConfig {
                 fail_on_quality: false,
                 fail_on_regression: false,
                 regression_threshold: 0.05,
-                sample_duration: Duration::from_millis(100),
+                sample_duration: Duration::from_millis(10),
                 operations_per_sample: 1,
-                micro_sample_duration: Duration::from_millis(50),
+                micro_sample_duration: Duration::from_millis(5),
                 report_depth: "summary".to_string(),
             },
             RunProfile::Release => ProfileConfig {
@@ -452,7 +466,7 @@ where
             Err(_) => (
                 RunProfile::default(),
                 "default".to_string(),
-                Some("invalid STRESS_PROFILE, using lab".to_string()),
+                Some("invalid STRESS_PROFILE, using default".to_string()),
             ),
         },
         None => (RunProfile::default(), "default".to_string(), None),
@@ -672,13 +686,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_profile_is_lab_exploration() {
+    fn default_profile_is_moderate_day_to_day_run() {
         let cfg = StressRunnerConfig::default();
 
-        assert_eq!(cfg.profile, RunProfile::Lab);
-        assert_eq!(cfg.samples, 30);
-        assert_eq!(cfg.warmup_samples, 2);
-        assert_eq!(cfg.cooldown_samples, 1);
+        assert_eq!(cfg.profile, RunProfile::Default);
+        assert_eq!(cfg.samples, 5);
+        assert_eq!(cfg.warmup_samples, 1);
+        assert_eq!(cfg.cooldown_samples, 0);
+        assert_eq!(cfg.sample_duration, Duration::from_millis(500));
+        assert_eq!(cfg.micro_sample_duration, Duration::from_millis(25));
         assert_eq!(cfg.min_quality, QualityClass::Noisy);
         assert!(!cfg.fail_on_quality);
         assert!(!cfg.fail_on_regression);
@@ -691,7 +707,24 @@ mod tests {
         assert_eq!(cfg.profile, RunProfile::Smoke);
         assert_eq!(cfg.samples, 1);
         assert_eq!(cfg.warmup_samples, 0);
+        assert_eq!(cfg.sample_duration, Duration::from_millis(10));
+        assert_eq!(cfg.micro_sample_duration, Duration::from_millis(5));
         assert_eq!(cfg.min_quality, QualityClass::Untrustworthy);
+        assert!(!cfg.fail_on_quality);
+        assert!(!cfg.fail_on_regression);
+    }
+
+    #[test]
+    fn lab_profile_is_exhaustive_exploration() {
+        let cfg = StressRunnerConfig::for_profile(RunProfile::Lab);
+
+        assert_eq!(cfg.profile, RunProfile::Lab);
+        assert_eq!(cfg.samples, 30);
+        assert_eq!(cfg.warmup_samples, 2);
+        assert_eq!(cfg.cooldown_samples, 1);
+        assert_eq!(cfg.sample_duration, Duration::from_secs(5));
+        assert_eq!(cfg.micro_sample_duration, Duration::from_millis(200));
+        assert_eq!(cfg.min_quality, QualityClass::Noisy);
         assert!(!cfg.fail_on_quality);
         assert!(!cfg.fail_on_regression);
     }
@@ -714,7 +747,7 @@ mod tests {
         assert_eq!(cfg.filter, Some("my_bench".to_string()));
         assert_eq!(cfg.tier, Some(3));
         assert_eq!(cfg.operations_per_sample, 10);
-        assert_eq!(cfg.micro_sample_duration, Duration::from_millis(200));
+        assert_eq!(cfg.micro_sample_duration, Duration::from_millis(25));
     }
 
     #[test]
@@ -757,7 +790,7 @@ mod tests {
 
         let resolution = StressRunnerConfig::resolve_from_env_with(|key| env.get(key).cloned());
 
-        assert_eq!(resolution.config.samples, 30);
+        assert_eq!(resolution.config.samples, 5);
         assert_eq!(resolution.config.console, ConsoleMode::Default);
         assert_eq!(resolution.config.timeout, None);
         assert_eq!(resolution.warnings.len(), 3);
@@ -769,14 +802,14 @@ mod tests {
 
         let resolution = StressRunnerConfig::resolve_from_env_with(|key| env.get(key).cloned());
 
-        assert_eq!(resolution.config.profile, RunProfile::Lab);
+        assert_eq!(resolution.config.profile, RunProfile::Default);
         assert_eq!(
             resolution.metadata.get("profile_src"),
             Some(&"default".to_string())
         );
         assert_eq!(
             resolution.warnings,
-            vec!["invalid STRESS_PROFILE, using lab".to_string()]
+            vec!["invalid STRESS_PROFILE, using default".to_string()]
         );
     }
 
@@ -817,7 +850,7 @@ mod tests {
         assert_eq!(
             cfg.mode_for_kind(BenchmarkModeKind::Micro),
             BenchmarkMode::Micro {
-                target_sample_duration: Duration::from_millis(200)
+                target_sample_duration: Duration::from_millis(25)
             }
         );
     }

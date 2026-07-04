@@ -12,25 +12,28 @@ pub const SCHEMA_VERSION: &str = "cntryl-stress.v1";
 /// Highest defined benchmark tier.
 pub const MAX_TIER: u32 = 6;
 
-/// Benchmark run profile. The default profile is the deeper exploratory lab run.
+/// Benchmark run profile. The default profile is a moderate day-to-day run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RunProfile {
+    /// Moderate day-to-day run with useful per-tier signal.
+    #[default]
+    Default,
     /// Fast correctness-focused diagnostic runs.
     Smoke,
+    /// Deep exploratory runs. Correctness still fails, quality is reported.
+    Lab,
     /// Trustworthy runs with quality and regression gates.
     Release,
-    /// Deep exploratory runs. Correctness still fails, quality is reported.
-    #[default]
-    Lab,
 }
 
 impl fmt::Display for RunProfile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Default => f.write_str("default"),
             Self::Smoke => f.write_str("smoke"),
-            Self::Release => f.write_str("release"),
             Self::Lab => f.write_str("lab"),
+            Self::Release => f.write_str("release"),
         }
     }
 }
@@ -40,9 +43,10 @@ impl std::str::FromStr for RunProfile {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
+            "default" => Ok(Self::Default),
             "smoke" => Ok(Self::Smoke),
-            "release" => Ok(Self::Release),
             "lab" => Ok(Self::Lab),
+            "release" => Ok(Self::Release),
             other => Err(format!("unknown run profile '{other}'")),
         }
     }
@@ -528,18 +532,18 @@ pub struct ProfileConfig {
 impl Default for ProfileConfig {
     fn default() -> Self {
         Self {
-            profile: RunProfile::Lab,
-            measured_samples: 30,
-            warmup_samples: 2,
-            cooldown_samples: 1,
+            profile: RunProfile::Default,
+            measured_samples: 5,
+            warmup_samples: 1,
+            cooldown_samples: 0,
             min_quality: QualityClass::Noisy,
             fail_on_quality: false,
             fail_on_regression: false,
             regression_threshold: 0.05,
-            sample_duration: Duration::from_secs(5),
+            sample_duration: Duration::from_millis(500),
             operations_per_sample: 1,
-            micro_sample_duration: Duration::from_millis(200),
-            report_depth: "deep".to_string(),
+            micro_sample_duration: Duration::from_millis(25),
+            report_depth: "default".to_string(),
         }
     }
 }
@@ -573,8 +577,14 @@ pub struct Sample {
     pub sample_number: usize,
     /// Sample phase.
     pub phase: SamplePhase,
-    /// Elapsed wall-clock time in nanoseconds.
+    /// Measured workload duration in nanoseconds.
     pub elapsed_ns: u128,
+    /// Wall-clock time spent executing the benchmark function for this sample.
+    ///
+    /// This includes framework work done inside the benchmark method, such as
+    /// Tier 1 calibration and overhead measurement.
+    #[serde(default)]
+    pub wall_clock_ns: u128,
     /// Operations attempted.
     pub operations_attempted: u64,
     /// Operations completed.
@@ -671,6 +681,12 @@ pub struct BenchmarkSummary {
     pub cooldown_samples: usize,
     /// Summary statistics from measured samples only.
     pub stats: Option<SummaryStats>,
+    /// Wall-clock statistics from measured samples only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_clock: Option<SummaryStats>,
+    /// Total wall-clock time across warmup, measured, and cooldown samples.
+    #[serde(default)]
+    pub total_wall_clock_ns: u128,
     /// Net nanoseconds per operation statistics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ns_per_op: Option<SummaryStats>,
@@ -882,6 +898,13 @@ pub fn summarize_benchmark(spec: &BenchmarkSpec, samples: &[Sample]) -> Benchmar
         SummaryStats::from_values(&per_op_values(&measured, |sample| sample.bytes_per_op));
     let values = primary_values(primary_metric, &measured);
     let stats = SummaryStats::from_values(&values);
+    let wall_clock = SummaryStats::from_values(&wall_clock_values(&measured));
+    let total_wall_clock_ns = samples
+        .iter()
+        .filter(|sample| sample.benchmark_id == spec.id)
+        .fold(0_u128, |total, sample| {
+            total.saturating_add(sample.wall_clock_ns)
+        });
     let budget_results = evaluate_budgets(
         spec.budgets,
         stats.as_ref(),
@@ -914,6 +937,8 @@ pub fn summarize_benchmark(spec: &BenchmarkSpec, samples: &[Sample]) -> Benchmar
         warmup_samples,
         cooldown_samples,
         stats,
+        wall_clock,
+        total_wall_clock_ns,
         ns_per_op,
         gross_ns_per_op,
         overhead_ns_per_op,
@@ -1134,6 +1159,16 @@ where
         .iter()
         .filter_map(|sample| value_for(sample))
         .filter(|value| value.is_finite())
+        .collect()
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn wall_clock_values(samples: &[&Sample]) -> Vec<f64> {
+    samples
+        .iter()
+        .map(|sample| sample.wall_clock_ns)
+        .filter(|wall_clock_ns| *wall_clock_ns != 0)
+        .map(|wall_clock_ns| wall_clock_ns as f64)
         .collect()
 }
 
@@ -1418,6 +1453,7 @@ mod tests {
             sample_number,
             phase,
             elapsed_ns,
+            wall_clock_ns: elapsed_ns,
             operations_attempted: completed,
             operations_completed: completed,
             throughput,
@@ -1476,6 +1512,8 @@ mod tests {
         assert_eq!(summary.warmup_samples, 1);
         assert_eq!(summary.measured_samples, 2);
         assert_eq!(summary.cooldown_samples, 1);
+        assert_eq!(summary.total_wall_clock_ns, 2_000_000_300);
+        assert_close(summary.wall_clock.as_ref().expect("wall").min, 100.0);
         assert_close(summary.stats.as_ref().expect("stats").min, 5_000_000.0);
     }
 
@@ -1548,6 +1586,14 @@ mod tests {
         }
         assert_eq!(BenchmarkModeKind::for_tier(0), None);
         assert_eq!(BenchmarkModeKind::for_tier(MAX_TIER + 1), None);
+    }
+
+    #[test]
+    fn run_profile_parses_all_named_profiles() {
+        assert_eq!("default".parse::<RunProfile>(), Ok(RunProfile::Default));
+        assert_eq!("smoke".parse::<RunProfile>(), Ok(RunProfile::Smoke));
+        assert_eq!("lab".parse::<RunProfile>(), Ok(RunProfile::Lab));
+        assert_eq!("release".parse::<RunProfile>(), Ok(RunProfile::Release));
     }
 
     #[test]

@@ -269,7 +269,9 @@ impl StressRunner {
         F: Fn(&mut StressContext),
     {
         let mut ctx = StressContext::new(spec.tier, spec.mode.clone());
+        let wall_clock_start = Instant::now();
         f(&mut ctx);
+        let wall_clock = wall_clock_start.elapsed();
         let duration = ctx.duration.unwrap_or_else(|| {
             panic!(
                 "Benchmark '{}' did not record a duration. Call the tier-appropriate timing helper exactly once.",
@@ -309,6 +311,7 @@ impl StressRunner {
             sample_number,
             phase,
             elapsed_ns: duration.as_nanos(),
+            wall_clock_ns: wall_clock.as_nanos(),
             operations_attempted,
             operations_completed,
             throughput,
@@ -499,8 +502,11 @@ mod tests {
 
         assert_eq!(run.schema_version, SCHEMA_VERSION);
         assert_eq!(run.samples.len(), 3);
+        assert!(run.samples.iter().all(|sample| sample.wall_clock_ns > 0));
         assert_eq!(run.summaries[0].warmup_samples, 1);
         assert_eq!(run.summaries[0].measured_samples, 2);
+        assert!(run.summaries[0].total_wall_clock_ns > 0);
+        assert!(run.summaries[0].wall_clock.is_some());
         assert_eq!(
             run.summaries[0].parameters.get("client_count"),
             Some(&"1".to_string())

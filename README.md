@@ -66,14 +66,16 @@ cargo stress --baseline target/stress/storage_stress/latest.json
   - Tier 4: integration
   - Tier 5: saturation/scaling
   - Tier 6: soak/endurance
-- The default run is the deeper `lab` profile: 30 measured samples, 2 warmup samples, 1 cooldown sample, reported quality findings, and no quality/regression process gate.
-- Use `release` for the trustworthy release-quality gate: 10 measured samples, 1 warmup sample, quality enforcement, and regression enforcement when a baseline is supplied.
 - Use `smoke` for a quick correctness-focused diagnostic run.
+- The `default` profile is the normal day-to-day run: useful per-tier signal without paying the exhaustive lab cost.
+- Use `lab` for deeper exploratory runs with more samples and longer sample windows.
+- Use `release` for the trustworthy release-quality gate: quality enforcement and regression enforcement when a baseline is supplied.
 - JSON artifacts use `schema_version: "cntryl-stress.v1"`.
 - Raw `Sample` rows are authoritative; summaries, quality, and comparisons are derived from measured samples only.
 - Warmup and cooldown samples are retained in JSON and excluded from summary statistics and baseline comparison.
 - Tier drives benchmark mode: Tier 1 uses `micro`, Tier 2 uses `fixed_operations`, and Tiers 3-6 use `fixed_duration`.
 - `mode = "..."` is optional compatibility syntax and must match the tier-derived mode.
+- Console rows include a `wall` column with total wall-clock time spent running that benchmark method across warmup, measured, and cooldown samples.
 
 ## Tier Recipes
 
@@ -179,9 +181,10 @@ Tiers are defined as 1 through 6. The macro rejects `tier = 0`, `tier > 6`, and 
 
 | Profile | Default Samples | Gate Behavior |
 |---------|-----------------|---------------|
-| `lab` (default) | 30 measured, 2 warmup, 1 cooldown | Fails correctness; reports noisy rows without failing quality |
-| `release` | 10 measured, 1 warmup | Fails correctness, quality below acceptable, and meaningful regressions |
+| `default` | 5 measured, 1 warmup | Fails correctness; reports noisy rows without failing quality |
 | `smoke` | 1 measured, 0 warmup | Explicit diagnostic override; correctness-focused, no quality/regression failure |
+| `lab` | 30 measured, 2 warmup, 1 cooldown | Exhaustive exploration; fails correctness and reports quality findings |
+| `release` | 10 measured, 1 warmup | Fails correctness, quality below acceptable, and meaningful regressions |
 
 Quality classes:
 
@@ -199,7 +202,7 @@ Command-line arguments override `STRESS_*` environment variables, which override
 
 | Variable | Description |
 |----------|-------------|
-| `STRESS_PROFILE` | Optional profile override: `release`, `smoke`, or `lab` |
+| `STRESS_PROFILE` | Optional profile override: `default`, `smoke`, `lab`, or `release` |
 | `STRESS_SAMPLES` | Measured samples per benchmark |
 | `STRESS_WARMUP_SAMPLES` | Warmup samples |
 | `STRESS_COOLDOWN_SAMPLES` | Cooldown samples |
@@ -234,7 +237,7 @@ cargo bench --bench storage_stress -- --console json
 cargo bench --bench storage_stress -- --console markdown
 ```
 
-The default console output is a compact decision surface: grouped benchmark rows, `ns/op` for Tier 1 micro rows, optional allocation and overhead columns, quality labels, baseline deltas, summary counts, and a needs-attention block. Throughput percentile columns are sample-throughput percentiles, not operation latency percentiles.
+The default console output is a compact decision surface: grouped benchmark rows, `ns/op` for Tier 1 micro rows, optional allocation and overhead columns, wall-clock time per benchmark, quality labels, baseline deltas, summary counts, and a needs-attention block. Throughput percentile columns are sample-throughput percentiles, not operation latency percentiles.
 
 ## Artifacts
 
