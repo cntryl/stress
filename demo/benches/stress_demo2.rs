@@ -1,61 +1,64 @@
-use cntryl_stress::{stress_test, StressContext};
-use std::hint::black_box;
+use cntryl_stress::{black_box, stress_test, StressContext};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
-#[stress_test]
-fn sort_large_vector(ctx: &mut StressContext) {
-    let mut data = vec![42u32; 1_000_000];
-    ctx.parameter("item_count", data.len());
-
-    ctx.measure(|| {
-        data.sort_unstable();
-        black_box(&data);
-    });
-}
-
-#[stress_test]
-fn hash_string_throughput(ctx: &mut StressContext) {
-    use std::collections::HashSet;
-    let strings: Vec<_> = (0..10_000).map(|i| format!("key_{i}")).collect();
-    let iterations = ctx.measure_for(Duration::from_secs(3), || {
-        let mut set = HashSet::new();
-        for s in &strings {
-            set.insert(s.clone());
+#[stress_test(tier = 4, metadata(tier_name = "integration"))]
+fn tier4_integration_worker_exchange(ctx: &mut StressContext) {
+    let (request_tx, request_rx) = mpsc::channel::<u64>();
+    let (response_tx, response_rx) = mpsc::channel::<u64>();
+    let worker = thread::spawn(move || {
+        while let Ok(value) = request_rx.recv() {
+            if response_tx.send(value.wrapping_mul(2)).is_err() {
+                break;
+            }
         }
-        black_box(&set);
     });
-
-    let operations = (strings.len() * iterations) as u64;
-    let _ = ctx
-        .correctness()
-        .attempted(operations)
-        .completed(operations);
-}
-
-#[stress_test]
-fn memory_copy_1mb(ctx: &mut StressContext) {
-    let src = vec![1u8; 1024 * 1024];
-    ctx.parameter("payload_size", src.len());
 
     ctx.measure(|| {
-        let dst = src.clone();
-        black_box(&dst);
+        request_tx.send(21).expect("send request");
+        black_box(response_rx.recv().expect("receive response"))
     });
+
+    drop(request_tx);
+    worker.join().expect("worker exits");
 }
 
-#[stress_test]
-fn recursive_sum(ctx: &mut StressContext) {
-    ctx.measure(|| {
-        let _ = sum_range(0, 1000);
+#[stress_test(
+    tier = 5,
+    mode = "fixed_duration",
+    metadata(tier_name = "saturation_scaling")
+)]
+fn tier5_saturation_scaling_client_fanout(ctx: &mut StressContext) {
+    let clients = 32_u64;
+    ctx.parameter("client_count", clients);
+
+    let iterations = ctx.measure_for(Duration::from_millis(25), || {
+        let mut total = 0_u64;
+        for client in 0..clients {
+            total = total.wrapping_add(client.wrapping_mul(17));
+        }
+        black_box(total);
     });
+    let completed = iterations as u64;
+    let _ = ctx.correctness().attempted(completed).completed(completed);
 }
 
-fn sum_range(start: u64, end: u64) -> u64 {
-    if start >= end {
-        0
-    } else {
-        start + sum_range(start + 1, end)
-    }
+#[stress_test(
+    tier = 6,
+    mode = "fixed_duration",
+    metadata(tier_name = "soak_endurance")
+)]
+fn tier6_soak_endurance_error_free_loop(ctx: &mut StressContext) {
+    let mut checksum = 0_u64;
+    ctx.parameter("window", "demo_short");
+
+    let iterations = ctx.measure_for(Duration::from_millis(25), || {
+        checksum = checksum.rotate_left(1) ^ 0xa5a5_a5a5_a5a5_a5a5;
+        black_box(checksum);
+    });
+    let completed = iterations as u64;
+    let _ = ctx.correctness().attempted(completed).completed(completed);
 }
 
 cntryl_stress::stress_main!();

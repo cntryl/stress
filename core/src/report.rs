@@ -1,7 +1,10 @@
-//! Pluggable reporters for v2 stress artifacts.
+//! Pluggable reporters for current stress artifacts.
 
-use crate::config::StressRunnerConfig;
-use crate::result::{BenchmarkSummary, ComparisonClass, PrimaryMetric, QualityClass, StressRun};
+use crate::config::{ConsoleMode, StressRunnerConfig};
+use crate::result::{
+    BenchmarkSummary, ComparisonClass, ComparisonResult, CorrectnessSummary, PrimaryMetric,
+    QualityClass, StressRun, SummaryStats,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as FmtWrite;
 use std::io::Write;
@@ -20,30 +23,27 @@ pub trait Reporter: Send + Sync {
     fn suite_end(&self, _run: &StressRun) {}
 }
 
-const NAME_WIDTH: usize = 48;
+const NAME_WIDTH: usize = 36;
+const NUMBER_WIDTH: usize = 12;
 const VALUE_WIDTH: usize = 16;
+const DEFAULT_ROWS_PER_GROUP: usize = 12;
 
 /// Console reporter that prints compact progress to stdout.
 pub struct ConsoleReporter {
-    suite_config_lines: Vec<String>,
+    mode: ConsoleMode,
+    summaries: Mutex<Vec<BenchmarkSummary>>,
     output_lock: Mutex<()>,
 }
 
 impl ConsoleReporter {
     /// Create a console reporter.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(mode: ConsoleMode) -> Self {
         Self {
-            suite_config_lines: Vec::new(),
+            mode,
+            summaries: Mutex::new(Vec::new()),
             output_lock: Mutex::new(()),
         }
-    }
-
-    /// Attach resolved config lines to the suite header.
-    #[must_use]
-    pub fn config_lines(mut self, lines: Vec<String>) -> Self {
-        self.suite_config_lines = lines;
-        self
     }
 
     fn write_stdout(&self, message: &str) {
@@ -63,56 +63,32 @@ impl ConsoleReporter {
 
 impl Default for ConsoleReporter {
     fn default() -> Self {
-        Self::new()
+        Self::new(ConsoleMode::Default)
     }
 }
 
 impl Reporter for ConsoleReporter {
-    fn suite_start(&self, suite: &str, config: &StressRunnerConfig) {
-        let details = if self.suite_config_lines.is_empty() {
-            default_config_lines(config).join("\n")
-        } else {
-            self.suite_config_lines.join("\n")
-        };
-        let header = format!(
-            "---------------------------------------------------------------\n\
-             Benchmark Suite: {suite}\n\
-             {details}\n\
-             ---------------------------------------------------------------"
-        );
-        self.write_stdout(&header);
-    }
-
     fn bench_end(&self, summary: &BenchmarkSummary) {
-        let value = summary.primary_value().map_or_else(
-            || "n/a".to_string(),
-            |value| format_metric(value, summary.primary_metric),
-        );
-        let line = format!(
-            "  {name:<NAME_WIDTH$} {value:>VALUE_WIDTH$}  tier={tier} quality={quality}",
-            name = summary.name,
-            tier = summary.tier,
-            quality = summary.quality
-        );
-        self.write_stdout(&line);
+        self.summaries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(summary.clone());
     }
 
     fn suite_end(&self, run: &StressRun) {
-        let footer = format!(
-            "---------------------------------------------------------------\n\
-             Completed {} benchmark(s), {} sample row(s) in {}\n\
-             ---------------------------------------------------------------",
-            run.summaries.len(),
-            run.samples.len(),
-            format_duration_ns(run.total_elapsed_ns)
-        );
-        self.write_stdout(&footer);
+        let summaries = self
+            .summaries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        self.write_stdout(&format_console_output(run, &summaries, self.mode));
     }
 }
 
-/// JSON reporter that writes v2 JSON, text, and Markdown reports.
+/// JSON reporter that writes JSON, text, and Markdown reports.
 pub struct JsonReporter {
     output_dir: PathBuf,
+    announce: bool,
 }
 
 impl JsonReporter {
@@ -121,7 +97,15 @@ impl JsonReporter {
     pub fn new(output_dir: impl Into<PathBuf>) -> Self {
         Self {
             output_dir: output_dir.into(),
+            announce: true,
         }
+    }
+
+    /// Set whether artifact paths are printed to stderr.
+    #[must_use]
+    pub const fn announce(mut self, value: bool) -> Self {
+        self.announce = value;
+        self
     }
 
     fn write_results(&self, run: &StressRun) {
@@ -154,8 +138,10 @@ impl JsonReporter {
         std::fs::write(&latest_txt_path, &report)?;
         std::fs::write(&latest_md_path, &markdown)?;
 
-        eprintln!("  Results written to: {}", json_path.display());
-        eprintln!("  Latest results at: {}", latest_json_path.display());
+        if self.announce {
+            eprintln!("  Results written to: {}", json_path.display());
+            eprintln!("  Latest results at: {}", latest_json_path.display());
+        }
         Ok(())
     }
 }
@@ -337,21 +323,663 @@ pub(crate) fn format_markdown_report(run: &StressRun) -> String {
     output
 }
 
-fn default_config_lines(config: &StressRunnerConfig) -> Vec<String> {
-    vec![
-        format!("Profile: {}", config.profile),
-        format!("Samples: {}", config.samples),
-        format!("Warmup samples: {}", config.warmup_samples),
-        format!("Cooldown samples: {}", config.cooldown_samples),
-        format!("Output: {}", config.output_dir.display()),
-        format!("Filter: {}", config.filter.as_deref().unwrap_or("<none>")),
-        format!(
-            "Tier: {}",
-            config
-                .tier
-                .map_or_else(|| "<any>".to_string(), |tier| tier.to_string())
-        ),
-    ]
+fn format_console_output(
+    run: &StressRun,
+    summaries: &[BenchmarkSummary],
+    mode: ConsoleMode,
+) -> String {
+    match mode {
+        ConsoleMode::Default => format_human_console(run, summaries, false),
+        ConsoleMode::Verbose => format_human_console(run, summaries, true),
+        ConsoleMode::Quiet => format_summary_blocks(run),
+        ConsoleMode::Json => serde_json::to_string_pretty(run).unwrap_or_else(|error| {
+            format!(r#"{{"error":"failed to serialize stress run: {error}"}}"#)
+        }),
+        ConsoleMode::Markdown => format_markdown_report(run),
+    }
+}
+
+fn format_human_console(run: &StressRun, summaries: &[BenchmarkSummary], verbose: bool) -> String {
+    let summaries = if summaries.is_empty() {
+        run.summaries.as_slice()
+    } else {
+        summaries
+    };
+
+    let mut output = String::new();
+    write_console_header(&mut output, run);
+
+    if !summaries.is_empty() {
+        let _ = writeln!(output);
+        write_grouped_tables(&mut output, run, summaries, verbose);
+    }
+
+    let _ = writeln!(output);
+    output.push_str(&format_summary_blocks(run));
+    write_attention_block(&mut output, run);
+    write_console_footer(&mut output, summaries);
+    output
+}
+
+fn write_console_header(output: &mut String, run: &StressRun) {
+    let profile = &run.environment.profile_config;
+    let _ = writeln!(output, "@cntryl/stress v{}", run.tool_version);
+    let _ = writeln!(output, "suite: {}", run.suite);
+    let _ = writeln!(
+        output,
+        "profile: {} | samples: {} measured, {} warmup, {} cooldown",
+        run.run_profile, profile.measured_samples, profile.warmup_samples, profile.cooldown_samples
+    );
+    let _ = writeln!(
+        output,
+        "measure: {} fixed-duration default, {} op fixed-operations default",
+        format_duration_ns(profile.sample_duration.as_nanos()),
+        profile.operations_per_sample
+    );
+    let _ = writeln!(output, "commit: {}", short_commit(run));
+    let _ = writeln!(
+        output,
+        "baseline: {} | threshold: {:.1}%",
+        baseline_status(run),
+        profile.regression_threshold * 100.0
+    );
+    let _ = writeln!(output, "machine: {}", machine_summary(run));
+}
+
+fn write_grouped_tables(
+    output: &mut String,
+    run: &StressRun,
+    summaries: &[BenchmarkSummary],
+    verbose: bool,
+) {
+    let comparisons = comparison_by_benchmark(run);
+    for (group, rows) in grouped_summaries(summaries) {
+        let _ = writeln!(output, "{group}");
+        write_console_table_header(output);
+        let limit = if verbose {
+            rows.len()
+        } else {
+            DEFAULT_ROWS_PER_GROUP.min(rows.len())
+        };
+        for summary in rows.iter().take(limit) {
+            let comparison = comparisons.get(summary.benchmark_id.as_str()).copied();
+            write_console_table_row(output, summary, comparison, &group);
+        }
+        if rows.len() > limit {
+            let _ = writeln!(
+                output,
+                "  ... {} more row(s); use --console verbose to show all",
+                rows.len() - limit
+            );
+        }
+        let _ = writeln!(output);
+    }
+}
+
+fn write_console_table_header(output: &mut String) {
+    let _ = writeln!(
+        output,
+        "  {name:<NAME_WIDTH$} {metric:>8} {value:>NUMBER_WIDTH$} {mean:>NUMBER_WIDTH$} {p50:>NUMBER_WIDTH$} {p95:>NUMBER_WIDTH$} {p99:>NUMBER_WIDTH$} {allocs:>NUMBER_WIDTH$} {bytes:>NUMBER_WIDTH$} {overhead:>NUMBER_WIDTH$} {rsd:>8} {quality:>13} {samples:>7} {delta:>18}  notes",
+        name = "name",
+        metric = "metric",
+        value = "value",
+        mean = "mean",
+        p50 = "p50",
+        p95 = "p95",
+        p99 = "p99",
+        allocs = "alloc/op",
+        bytes = "B/op",
+        overhead = "overhead",
+        rsd = "rsd",
+        quality = "quality",
+        samples = "samples",
+        delta = "delta"
+    );
+}
+
+fn write_console_table_row(
+    output: &mut String,
+    summary: &BenchmarkSummary,
+    comparison: Option<&ComparisonResult>,
+    group: &str,
+) {
+    let name = compact_name(&display_name(&summary.name, group));
+    let metric = metric_label(summary.primary_metric);
+    let quality = if summary.correctness.passed {
+        summary.quality.to_string()
+    } else {
+        "correctness_failed".to_string()
+    };
+    let marker = if summary.correctness.passed {
+        " "
+    } else {
+        "✗"
+    };
+    let delta = comparison.map_or_else(|| "-".to_string(), format_delta_cell);
+    let notes = row_notes(summary);
+
+    if let Some(stats) = &summary.stats {
+        let value = summary.primary_value().map_or_else(
+            || "n/a".to_string(),
+            |value| format_metric_value(value, summary.primary_metric),
+        );
+        let _ = writeln!(
+            output,
+            "{marker} {name:<NAME_WIDTH$} {metric:>8} {value:>NUMBER_WIDTH$} {mean:>NUMBER_WIDTH$} {p50:>NUMBER_WIDTH$} {p95:>NUMBER_WIDTH$} {p99:>NUMBER_WIDTH$} {allocs:>NUMBER_WIDTH$} {bytes:>NUMBER_WIDTH$} {overhead:>NUMBER_WIDTH$} {rsd:>8} {quality:>13} {samples:>7} {delta:>18}  {notes}",
+            mean = format_metric_value(stats.mean, summary.primary_metric),
+            p50 = format_metric_value(stats.p50, summary.primary_metric),
+            p95 = format_metric_value(stats.p95, summary.primary_metric),
+            p99 = format_metric_value(stats.p99, summary.primary_metric),
+            allocs = format_optional_compact_stat(summary.allocs_per_op.as_ref()),
+            bytes = format_optional_compact_stat(summary.bytes_per_op.as_ref()),
+            overhead = format_optional_duration_stat(summary.overhead_ns_per_op.as_ref()),
+            rsd = format_percent(stats.relative_std_dev),
+            samples = summary.measured_samples,
+        );
+    } else {
+        let unavailable = "n/a";
+        let _ = writeln!(
+            output,
+            "{marker} {name:<NAME_WIDTH$} {metric:>8} {unavailable:>NUMBER_WIDTH$} {unavailable:>NUMBER_WIDTH$} {unavailable:>NUMBER_WIDTH$} {unavailable:>NUMBER_WIDTH$} {unavailable:>NUMBER_WIDTH$} {unavailable:>NUMBER_WIDTH$} {unavailable:>NUMBER_WIDTH$} {unavailable:>NUMBER_WIDTH$} {unavailable:>8} {quality:>13} {samples:>7} {delta:>18}  {notes}",
+            samples = summary.measured_samples,
+        );
+    }
+}
+
+fn metric_label(metric: PrimaryMetric) -> &'static str {
+    match metric {
+        PrimaryMetric::Throughput => "ops/s",
+        PrimaryMetric::LatencyP95 => "latency",
+        PrimaryMetric::NsPerOp => "ns/op",
+    }
+}
+
+fn format_summary_blocks(run: &StressRun) -> String {
+    let mut output = String::new();
+    let failed = failed_correctness_count(&run.summaries);
+    let regressions = comparison_count(run, ComparisonClass::Regression);
+    let improvements = comparison_count(run, ComparisonClass::Improvement);
+    let _ = writeln!(output, "Summary");
+    let _ = writeln!(output, "  benchmarks:      {}", run.summaries.len());
+    let _ = writeln!(
+        output,
+        "  passed:          {}",
+        run.summaries.len().saturating_sub(failed)
+    );
+    let _ = writeln!(output, "  failed:          {failed}");
+    let _ = writeln!(output, "  regressions:     {regressions}");
+    let _ = writeln!(output, "  improvements:    {improvements}");
+    let counts = quality_counts(&run.summaries);
+    let _ = writeln!(output, "Quality");
+    let _ = writeln!(output, "  authoritative:   {}", counts.authoritative);
+    let _ = writeln!(output, "  acceptable:      {}", counts.acceptable);
+    let _ = writeln!(output, "  noisy:           {}", counts.noisy);
+    let _ = writeln!(output, "  untrustworthy:   {}", counts.untrustworthy);
+    output
+}
+
+fn write_attention_block(output: &mut String, run: &StressRun) {
+    let items = attention_items(run);
+    if items.is_empty() {
+        let _ = writeln!(output);
+        let _ = writeln!(output, "Needs attention");
+        let _ = writeln!(output, "  none");
+        return;
+    }
+
+    let _ = writeln!(output);
+    let _ = writeln!(output, "Needs attention");
+    for item in items.into_iter().take(8) {
+        let _ = writeln!(output, "  {item}");
+    }
+}
+
+fn write_console_footer(output: &mut String, summaries: &[BenchmarkSummary]) {
+    if summaries
+        .iter()
+        .any(|summary| summary.primary_metric == PrimaryMetric::Throughput)
+    {
+        let _ = writeln!(output);
+        let _ = writeln!(
+            output,
+            "Note: throughput p50/p95/p99 are sample-throughput percentiles, not operation latency percentiles."
+        );
+    }
+}
+
+fn attention_items(run: &StressRun) -> Vec<String> {
+    let comparisons = comparison_by_benchmark(run);
+    let mut items = Vec::new();
+    let mut seen = BTreeSet::new();
+    push_correctness_attention(&mut items, &mut seen, &run.summaries);
+    push_budget_attention(&mut items, &mut seen, &run.summaries);
+    push_comparison_attention(
+        &mut items,
+        &mut seen,
+        &run.summaries,
+        &comparisons,
+        ComparisonClass::Regression,
+    );
+    push_flag_attention(&mut items, &mut seen, &run.summaries, "suspicious_micro");
+    push_untrustworthy_attention(&mut items, &mut seen, &run.summaries);
+    push_comparison_attention(
+        &mut items,
+        &mut seen,
+        &run.summaries,
+        &comparisons,
+        ComparisonClass::Improvement,
+    );
+    push_stable_change_attention(&mut items, &mut seen, &run.summaries, &comparisons);
+    items
+}
+
+fn push_budget_attention(
+    items: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+    summaries: &[BenchmarkSummary],
+) {
+    for summary in summaries
+        .iter()
+        .filter(|summary| summary.budget_results.iter().any(|result| !result.passed))
+    {
+        if seen.insert(summary.benchmark_id.clone()) {
+            items.push(format!(
+                "! {} budget failed: {}",
+                summary.name,
+                budget_note(summary)
+            ));
+        }
+    }
+}
+
+fn push_flag_attention(
+    items: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+    summaries: &[BenchmarkSummary],
+    flag: &str,
+) {
+    for summary in summaries
+        .iter()
+        .filter(|summary| summary.flags.iter().any(|item| item == flag))
+    {
+        if seen.insert(summary.benchmark_id.clone()) {
+            items.push(format!("! {} {flag}", summary.name));
+        }
+    }
+}
+
+fn push_correctness_attention(
+    items: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+    summaries: &[BenchmarkSummary],
+) {
+    for summary in summaries
+        .iter()
+        .filter(|summary| !summary.correctness.passed)
+    {
+        seen.insert(summary.benchmark_id.clone());
+        items.push(format!(
+            "✗ {} correctness failed: {}",
+            summary.name,
+            correctness_note(&summary.correctness)
+        ));
+    }
+}
+
+fn push_comparison_attention(
+    items: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+    summaries: &[BenchmarkSummary],
+    comparisons: &BTreeMap<&str, &ComparisonResult>,
+    class: ComparisonClass,
+) {
+    let mut rows = summaries
+        .iter()
+        .filter_map(|summary| comparisons.get(summary.benchmark_id.as_str()).copied())
+        .filter(|comparison| comparison_is_trustworthy(comparison))
+        .filter(|comparison| comparison.classification == class)
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .change_percent
+            .unwrap_or_default()
+            .abs()
+            .total_cmp(&left.change_percent.unwrap_or_default().abs())
+    });
+    for comparison in rows {
+        if seen.insert(comparison.benchmark_id.clone()) {
+            let icon = if class == ComparisonClass::Regression {
+                "↓"
+            } else {
+                "↑"
+            };
+            items.push(format!(
+                "{icon} {} {}",
+                comparison.benchmark_id,
+                format_delta_cell(comparison)
+            ));
+        }
+    }
+}
+
+fn push_untrustworthy_attention(
+    items: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+    summaries: &[BenchmarkSummary],
+) {
+    let mut rows = summaries
+        .iter()
+        .filter(|summary| summary.quality == QualityClass::Untrustworthy)
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .stats
+            .as_ref()
+            .map_or(0.0, |stats| stats.relative_std_dev)
+            .total_cmp(
+                &left
+                    .stats
+                    .as_ref()
+                    .map_or(0.0, |stats| stats.relative_std_dev),
+            )
+    });
+    for summary in rows {
+        if seen.insert(summary.benchmark_id.clone()) {
+            items.push(format!("! {} {}", summary.name, row_notes(summary)));
+        }
+    }
+}
+
+fn push_stable_change_attention(
+    items: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+    summaries: &[BenchmarkSummary],
+    comparisons: &BTreeMap<&str, &ComparisonResult>,
+) {
+    let mut rows = summaries
+        .iter()
+        .filter(|summary| is_trustworthy(summary))
+        .filter_map(|summary| comparisons.get(summary.benchmark_id.as_str()).copied())
+        .filter(|comparison| comparison.classification == ComparisonClass::Inconclusive)
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .change_percent
+            .unwrap_or_default()
+            .abs()
+            .total_cmp(&left.change_percent.unwrap_or_default().abs())
+    });
+    for comparison in rows.into_iter().take(3) {
+        if seen.insert(comparison.benchmark_id.clone()) {
+            items.push(format!(
+                "~ {} {}",
+                comparison.benchmark_id,
+                format_delta_cell(comparison)
+            ));
+        }
+    }
+}
+
+fn grouped_summaries(summaries: &[BenchmarkSummary]) -> BTreeMap<String, Vec<&BenchmarkSummary>> {
+    let mut groups = BTreeMap::<String, Vec<&BenchmarkSummary>>::new();
+    for summary in summaries {
+        groups
+            .entry(group_name(&summary.name))
+            .or_default()
+            .push(summary);
+    }
+    for rows in groups.values_mut() {
+        rows.sort_by(|left, right| left.name.cmp(&right.name));
+    }
+    groups
+}
+
+fn comparison_by_benchmark(run: &StressRun) -> BTreeMap<&str, &ComparisonResult> {
+    run.comparisons
+        .iter()
+        .map(|comparison| (comparison.benchmark_id.as_str(), comparison))
+        .collect()
+}
+
+fn format_delta_cell(comparison: &ComparisonResult) -> String {
+    let Some(change) = comparison.change_percent else {
+        return "-".to_string();
+    };
+    if !comparison_is_trustworthy(comparison) {
+        return format!("{change:+.1}% noisy");
+    }
+    let label = match comparison.classification {
+        ComparisonClass::Regression => "regression",
+        ComparisonClass::Improvement => "improved",
+        ComparisonClass::Inconclusive | ComparisonClass::MissingBaseline => "unchanged",
+    };
+    format!("{change:+.1}% {label}")
+}
+
+fn comparison_is_trustworthy(comparison: &ComparisonResult) -> bool {
+    is_comparison_quality_trustworthy(comparison.current_quality)
+        && comparison
+            .baseline_quality
+            .is_some_and(is_comparison_quality_trustworthy)
+}
+
+const fn is_comparison_quality_trustworthy(quality: QualityClass) -> bool {
+    matches!(
+        quality,
+        QualityClass::Authoritative | QualityClass::Acceptable
+    )
+}
+
+fn row_notes(summary: &BenchmarkSummary) -> String {
+    if !summary.correctness.passed {
+        return correctness_note(&summary.correctness);
+    }
+    if summary.budget_results.iter().any(|result| !result.passed) {
+        return budget_note(summary);
+    }
+    if !summary.flags.is_empty() {
+        return summary.flags.join(", ");
+    }
+    match summary.quality {
+        QualityClass::Authoritative | QualityClass::Acceptable => String::new(),
+        QualityClass::Noisy => quality_note("noisy", summary),
+        QualityClass::Untrustworthy => quality_note("untrustworthy", summary),
+    }
+}
+
+fn budget_note(summary: &BenchmarkSummary) -> String {
+    summary
+        .budget_results
+        .iter()
+        .filter(|result| !result.passed)
+        .map(|result| {
+            result.reason.as_ref().map_or_else(
+                || format!("{} failed", result.metric),
+                |reason| format!("{} {reason}", result.metric),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn quality_note(label: &str, summary: &BenchmarkSummary) -> String {
+    let mut parts = vec![label.to_string()];
+    if summary.measured_samples < 2 {
+        parts.push(format!("samples={}", summary.measured_samples));
+    }
+    if let Some(stats) = &summary.stats {
+        parts.push(format!("rsd={}", format_percent(stats.relative_std_dev)));
+    }
+    parts.join(", ")
+}
+
+fn correctness_note(correctness: &CorrectnessSummary) -> String {
+    let counters = correctness.counters;
+    let mut parts = vec![
+        format!("attempted={}", counters.attempted),
+        format!("completed={}", counters.completed),
+    ];
+    if counters.attempted > counters.completed {
+        parts.push(format!("lost={}", counters.attempted - counters.completed));
+    }
+    for (label, value) in [
+        ("failed", counters.failures),
+        ("timed_out", counters.timeouts),
+        ("duplicates", counters.duplicates),
+        ("dropped", counters.dropped),
+        ("validation_errors", counters.validation_errors),
+    ] {
+        if value != 0 {
+            parts.push(format!("{label}={value}"));
+        }
+    }
+    parts.join(" ")
+}
+
+fn quality_counts(summaries: &[BenchmarkSummary]) -> QualityCounts {
+    summaries
+        .iter()
+        .fold(QualityCounts::default(), |mut acc, summary| {
+            match summary.quality {
+                QualityClass::Authoritative => acc.authoritative += 1,
+                QualityClass::Acceptable => acc.acceptable += 1,
+                QualityClass::Noisy => acc.noisy += 1,
+                QualityClass::Untrustworthy => acc.untrustworthy += 1,
+            }
+            acc
+        })
+}
+
+#[derive(Default)]
+struct QualityCounts {
+    authoritative: usize,
+    acceptable: usize,
+    noisy: usize,
+    untrustworthy: usize,
+}
+
+fn failed_correctness_count(summaries: &[BenchmarkSummary]) -> usize {
+    summaries
+        .iter()
+        .filter(|summary| !summary.correctness.passed)
+        .count()
+}
+
+fn comparison_count(run: &StressRun, class: ComparisonClass) -> usize {
+    run.comparisons
+        .iter()
+        .filter(|comparison| comparison_is_trustworthy(comparison))
+        .filter(|comparison| comparison.classification == class)
+        .count()
+}
+
+fn is_trustworthy(summary: &BenchmarkSummary) -> bool {
+    summary.correctness.passed
+        && matches!(
+            summary.quality,
+            QualityClass::Authoritative | QualityClass::Acceptable
+        )
+}
+
+fn group_name(name: &str) -> String {
+    name.split("::").next().unwrap_or(name).to_string()
+}
+
+fn display_name(name: &str, group: &str) -> String {
+    name.strip_prefix(group)
+        .and_then(|name| name.strip_prefix("::"))
+        .unwrap_or(name)
+        .to_string()
+}
+
+fn compact_name(name: &str) -> String {
+    let chars = name.chars().collect::<Vec<_>>();
+    if chars.len() <= NAME_WIDTH {
+        return name.to_string();
+    }
+
+    let keep = NAME_WIDTH.saturating_sub(2);
+    let tail = chars[chars.len() - keep..].iter().collect::<String>();
+    format!("..{tail}")
+}
+
+fn format_metric_value(value: f64, metric: PrimaryMetric) -> String {
+    if !value.is_finite() {
+        return "n/a".to_string();
+    }
+    match metric {
+        PrimaryMetric::Throughput => format_compact_number(value),
+        PrimaryMetric::LatencyP95 | PrimaryMetric::NsPerOp => {
+            format_duration_ns(f64_to_u128(value))
+        }
+    }
+}
+
+fn format_optional_compact_stat(stats: Option<&SummaryStats>) -> String {
+    stats.map_or_else(
+        || "-".to_string(),
+        |stats| format_compact_number(stats.mean),
+    )
+}
+
+fn format_optional_duration_stat(stats: Option<&SummaryStats>) -> String {
+    stats.map_or_else(
+        || "-".to_string(),
+        |stats| format_duration_ns(f64_to_u128(stats.mean)),
+    )
+}
+
+fn format_compact_number(value: f64) -> String {
+    let abs = value.abs();
+    if abs >= 1_000_000.0 {
+        format!("{:.2}M", value / 1_000_000.0)
+    } else if abs >= 1_000.0 {
+        format!("{:.2}K", value / 1_000.0)
+    } else if abs >= 10.0 {
+        format!("{value:.2}")
+    } else if abs >= 0.01 {
+        format!("{value:.4}")
+    } else if abs == 0.0 {
+        "0.00".to_string()
+    } else {
+        format!("{value:.2e}")
+    }
+}
+
+fn format_percent(ratio: f64) -> String {
+    if ratio.is_finite() {
+        format!("{:.1}%", ratio * 100.0)
+    } else {
+        "n/a".to_string()
+    }
+}
+
+fn short_commit(run: &StressRun) -> String {
+    run.environment.git_commit.as_deref().map_or_else(
+        || "unknown".to_string(),
+        |commit| commit.chars().take(7).collect(),
+    )
+}
+
+fn baseline_status(run: &StressRun) -> &'static str {
+    if run
+        .metadata
+        .get("baseline_src")
+        .is_some_and(|source| source != "default")
+        || !run.comparisons.is_empty()
+    {
+        "found"
+    } else {
+        "none"
+    }
+}
+
+fn machine_summary(run: &StressRun) -> String {
+    let cores = run.environment.core_count.map_or_else(
+        || "unknown cores".to_string(),
+        |count| format!("{count} cores"),
+    );
+    format!("{}, {cores}", run.environment.cpu_model)
 }
 
 fn write_summary_line(output: &mut String, summary: &BenchmarkSummary) {
@@ -511,7 +1139,7 @@ fn numeric_parameter_keys(summaries: &[BenchmarkSummary]) -> Vec<String> {
 fn format_metric(value: f64, metric: PrimaryMetric) -> String {
     match metric {
         PrimaryMetric::Throughput => format_throughput(value),
-        PrimaryMetric::LatencyP95 | PrimaryMetric::ElapsedPerOperation => {
+        PrimaryMetric::LatencyP95 | PrimaryMetric::NsPerOp => {
             format_duration_ns(f64_to_u128(value))
         }
     }
@@ -540,7 +1168,7 @@ fn format_duration_ns(nanos: u128) -> String {
     } else if secs >= 0.001 {
         format!("{:.2}ms", secs * 1_000.0)
     } else if secs >= 0.000_001 {
-        format!("{:.2}us", secs * 1_000_000.0)
+        format!("{:.2}µs", secs * 1_000_000.0)
     } else {
         format!("{:.2}ns", secs * 1_000_000_000.0)
     }
@@ -550,8 +1178,9 @@ fn format_duration_ns(nanos: u128) -> String {
 mod tests {
     use super::*;
     use crate::result::{
-        BenchmarkMode, BenchmarkSpec, ComparisonResult, CorrectnessCounters, CorrectnessSummary,
-        EnvironmentInfo, ProfileConfig, Sample, SamplePhase, SummaryStats, SCHEMA_VERSION,
+        BenchmarkBudgets, BenchmarkMode, BenchmarkSpec, BudgetResult, ComparisonResult,
+        CorrectnessCounters, CorrectnessSummary, EnvironmentInfo, ProfileConfig, Sample,
+        SamplePhase, SummaryStats, SCHEMA_VERSION,
     };
 
     fn summary(name: &str, value: f64, quality: QualityClass) -> BenchmarkSummary {
@@ -565,7 +1194,15 @@ mod tests {
             cooldown_samples: 0,
             stats: SummaryStats::from_values(&[value, value * 1.01])
                 .or_else(|| SummaryStats::from_values(&[value])),
+            ns_per_op: None,
+            gross_ns_per_op: None,
+            overhead_ns_per_op: None,
+            allocs_per_op: None,
+            bytes_per_op: None,
             quality,
+            budgets: BenchmarkBudgets::default(),
+            budget_results: Vec::new(),
+            flags: Vec::new(),
             correctness: CorrectnessSummary {
                 passed: true,
                 counters: CorrectnessCounters {
@@ -595,6 +1232,7 @@ mod tests {
                 mode: BenchmarkMode::FixedOperations {
                     operations_per_sample: 1,
                 },
+                budgets: BenchmarkBudgets::default(),
                 parameters: BTreeMap::new(),
                 metadata: BTreeMap::new(),
             }],
@@ -606,6 +1244,17 @@ mod tests {
                 operations_attempted: 1,
                 operations_completed: 1,
                 throughput: 1.0,
+                calibrated_iterations: None,
+                gross_elapsed_ns: None,
+                overhead_ns: None,
+                net_elapsed_ns: None,
+                gross_ns_per_op: None,
+                overhead_ns_per_op: None,
+                net_ns_per_op: None,
+                allocs: None,
+                bytes: None,
+                allocs_per_op: None,
+                bytes_per_op: None,
                 latency_ns: Vec::new(),
                 parameters: BTreeMap::new(),
                 counters: CorrectnessCounters {
@@ -636,6 +1285,77 @@ mod tests {
         assert!(report.contains("fast"));
         assert!(report.contains("Noisy Or Untrustworthy"));
         assert!(report.contains("weak quality=noisy"));
+    }
+
+    #[test]
+    fn formats_console_output_as_compact_bench_table() {
+        let run = run_with_summaries(vec![
+            summary("queue::fast", 1_000_000.0, QualityClass::Authoritative),
+            summary("queue::slow", 10.0, QualityClass::Acceptable),
+        ]);
+
+        let report = format_console_output(&run, &run.summaries, ConsoleMode::Default);
+
+        assert!(report.contains("@cntryl/stress v0.3.0"));
+        assert!(report.contains("queue"));
+        assert!(report.contains("name"));
+        assert!(report.contains("ops/s"));
+        assert!(report.contains("alloc/op"));
+        assert!(report.contains("B/op"));
+        assert!(report.contains("overhead"));
+        assert!(report.contains("samples"));
+        assert!(report.contains("authoritative"));
+        assert!(report.contains("Summary"));
+        assert!(report.contains("Needs attention"));
+        assert!(report.contains("sample-throughput percentiles"));
+    }
+
+    #[test]
+    fn console_attention_orders_budget_before_regression_and_suspicious_micro() {
+        let mut budget = summary("budget", 100.0, QualityClass::Untrustworthy);
+        budget.budget_results = vec![BudgetResult {
+            metric: "max_ns_per_op".to_string(),
+            limit: 50.0,
+            actual: Some(100.0),
+            passed: false,
+            reason: Some("100 exceeds 50".to_string()),
+        }];
+        let mut suspicious = summary("micro", 4.0, QualityClass::Acceptable);
+        suspicious.flags = vec!["suspicious_micro".to_string()];
+        let mut run = run_with_summaries(vec![
+            budget,
+            summary("regressed", 80.0, QualityClass::Acceptable),
+            suspicious,
+        ]);
+        run.comparisons = vec![ComparisonResult {
+            benchmark_id: "regressed".to_string(),
+            current_quality: QualityClass::Acceptable,
+            baseline_quality: Some(QualityClass::Acceptable),
+            primary_metric: PrimaryMetric::Throughput,
+            baseline_value: Some(100.0),
+            current_value: Some(80.0),
+            change_percent: Some(-20.0),
+            threshold: 0.05,
+            confidence_intervals_overlap: Some(false),
+            classification: ComparisonClass::Regression,
+        }];
+
+        let report = format_console_output(&run, &run.summaries, ConsoleMode::Default);
+        let attention = report
+            .split("Needs attention")
+            .nth(1)
+            .expect("attention block");
+
+        assert!(
+            attention.find("budget failed").expect("budget")
+                < attention.find("regression").expect("regression")
+        );
+        assert!(
+            attention.find("regression").expect("regression")
+                < attention
+                    .find("suspicious_micro")
+                    .expect("suspicious micro")
+        );
     }
 
     #[test]

@@ -1,44 +1,44 @@
-use cntryl_stress::{stress_test, StressContext};
-use std::hint::black_box;
+use cntryl_stress::{black_box, stress_test, StressContext};
+use std::collections::BTreeMap;
 
-#[stress_test]
-fn write_1kb_file(ctx: &mut StressContext) {
-    let data = vec![0u8; 1024];
-    ctx.parameter("payload_size", data.len());
+#[stress_test(tier = 1, max_regression_pct = 5, metadata(tier_name = "hot_path"))]
+fn tier1_hot_path_header_parse(ctx: &mut StressContext) {
+    let header = b"content-type:application/json";
+    ctx.parameter("header_len", header.len());
 
-    ctx.measure(|| {
-        let _ = std::fs::write("target/stress_test1", &data);
-    });
-
-    std::fs::remove_file("target/stress_test1").ok();
-}
-
-#[stress_test]
-fn allocate_large_buffer(ctx: &mut StressContext) {
-    let size = 10 * 1024 * 1024; // 10 MB
-    ctx.parameter("payload_size", size);
-
-    ctx.measure(|| {
-        let mut buffer = vec![0u8; size];
-        buffer[0] = 1;
-        buffer[size - 1] = 1;
-        black_box(&buffer);
+    ctx.measure_micro(|| {
+        let separator = header.iter().position(|byte| *byte == b':');
+        black_box(separator)
     });
 }
 
-#[stress_test]
-fn compute_fibonacci(ctx: &mut StressContext) {
+#[stress_test(tier = 2, metadata(tier_name = "subsystem"))]
+fn tier2_subsystem_index_insert(ctx: &mut StressContext) {
+    let mut index = BTreeMap::<u64, u64>::new();
+    ctx.parameter("initial_entries", 256);
+
     ctx.measure(|| {
-        let _ = fibonacci(30);
+        for key in 0_u64..256 {
+            index.insert(key, key.rotate_left(5));
+        }
+        black_box(index.len())
     });
 }
 
-fn fibonacci(n: u32) -> u64 {
-    match n {
-        0 => 0,
-        1 => 1,
-        _ => fibonacci(n - 1) + fibonacci(n - 2),
-    }
+#[stress_test(tier = 3, metadata(tier_name = "system"))]
+fn tier3_system_snapshot_projection(ctx: &mut StressContext) {
+    let events = (0_u64..1024).collect::<Vec<_>>();
+    ctx.parameter("event_count", events.len());
+
+    ctx.measure(|| {
+        let projected = events
+            .iter()
+            .enumerate()
+            .fold(0_u64, |acc, (index, value)| {
+                acc ^ value.wrapping_add(index as u64).rotate_left(11)
+            });
+        black_box(projected)
+    });
 }
 
 cntryl_stress::stress_main!();

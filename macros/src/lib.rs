@@ -10,7 +10,13 @@ use syn::{parse_macro_input, Expr, ExprLit, ItemFn, Lit, Meta, MetaNameValue, To
 /// Common usage stays intentionally small:
 ///
 /// ```rust,ignore
-/// use cntryl_stress::{stress_test, StressContext};
+/// use cntryl_stress::{black_box, stress_test, StressContext};
+///
+/// #[stress_test(tier = 1)]
+/// fn parse_hot_path(ctx: &mut StressContext) {
+///     let header = b"content-type:application/json";
+///     ctx.measure_micro(|| black_box(header.iter().position(|byte| *byte == b':')));
+/// }
 ///
 /// #[stress_test(tier = 2)]
 /// fn write_batch(ctx: &mut StressContext) {
@@ -21,10 +27,15 @@ use syn::{parse_macro_input, Expr, ExprLit, ItemFn, Lit, Meta, MetaNameValue, To
 ///
 /// Supported attributes:
 ///
-/// - `tier = 2` through `N` (defaults to `2`)
-/// - `mode = "fixed_operations"` or `mode = "fixed_duration"`
+/// - `tier = 1` through `N` (defaults to `2`)
+/// - `mode = "micro"`, `mode = "fixed_operations"`, or `mode = "fixed_duration"`
 /// - `name = "custom_name"`
 /// - `ignore`
+/// - `max_ns_per_op = 1000`
+/// - `max_allocs_per_op = 0`
+/// - `max_bytes_per_op = 0`
+/// - `max_regression_pct = 5`
+/// - `max_rsd_pct = 10`
 /// - `metadata(owner = "storage", scenario = "fanout")`
 #[proc_macro_attribute]
 pub fn stress_test(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -36,32 +47,42 @@ pub fn stress_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(attrs) => attrs,
         Err(error) => return error.to_compile_error().into(),
     };
-    if attrs.tier < 2 {
-        return syn::Error::new_spanned(
-            fn_name,
-            "cntryl-stress tiers start at 2; use Criterion for Tier 1 microbenchmarks",
-        )
-        .to_compile_error()
-        .into();
+    if attrs.tier == 0 {
+        return syn::Error::new_spanned(fn_name, "cntryl-stress tiers start at 1")
+            .to_compile_error()
+            .into();
     }
 
     let benchmark_name = attrs.name.unwrap_or_else(|| fn_name_str.clone());
     let is_ignored = attrs.ignore;
     let tier = attrs.tier;
-    let mode = match attrs.mode.as_str() {
+    let mode_name = attrs.mode.unwrap_or_else(|| {
+        if attrs.tier == 1 {
+            "micro".to_string()
+        } else {
+            "fixed_operations".to_string()
+        }
+    });
+    let mode = match mode_name.as_str() {
+        "micro" => quote! { ::cntryl_stress::BenchmarkModeKind::Micro },
         "fixed_duration" => quote! { ::cntryl_stress::BenchmarkModeKind::FixedDuration },
         "fixed_operations" => quote! { ::cntryl_stress::BenchmarkModeKind::FixedOperations },
         other => {
             return syn::Error::new_spanned(
                 fn_name,
                 format!(
-                    "unsupported stress_test mode '{other}'; expected fixed_operations or fixed_duration"
+                    "unsupported stress_test mode '{other}'; expected micro, fixed_operations, or fixed_duration"
                 ),
             )
             .to_compile_error()
             .into();
         }
     };
+    let max_ns_per_op = option_f64_tokens(attrs.budgets.ns_per_op);
+    let max_allocs_per_op = option_f64_tokens(attrs.budgets.allocs_per_op);
+    let max_bytes_per_op = option_f64_tokens(attrs.budgets.bytes_per_op);
+    let max_regression_pct = option_f64_tokens(attrs.budgets.regression_pct);
+    let max_rsd_pct = option_f64_tokens(attrs.budgets.rsd_pct);
     let metadata_keys = attrs.metadata.iter().map(|(key, _)| key);
     let metadata_values = attrs.metadata.iter().map(|(_, value)| value);
     let submit_ident = syn::Ident::new(
@@ -82,6 +103,13 @@ pub fn stress_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             module_path: module_path!(),
             tier: #tier,
             mode: #mode,
+            budgets: ::cntryl_stress::BenchmarkBudgets {
+                max_ns_per_op: #max_ns_per_op,
+                max_allocs_per_op: #max_allocs_per_op,
+                max_bytes_per_op: #max_bytes_per_op,
+                max_regression_pct: #max_regression_pct,
+                max_rsd_pct: #max_rsd_pct,
+            },
             metadata: &[#((#metadata_keys, #metadata_values)),*],
         };
     }
@@ -92,9 +120,19 @@ pub fn stress_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 struct StressAttrs {
     name: Option<String>,
     tier: u32,
-    mode: String,
+    mode: Option<String>,
     ignore: bool,
+    budgets: StressBudgets,
     metadata: Vec<(String, String)>,
+}
+
+#[derive(Debug, Default)]
+struct StressBudgets {
+    ns_per_op: Option<f64>,
+    allocs_per_op: Option<f64>,
+    bytes_per_op: Option<f64>,
+    regression_pct: Option<f64>,
+    rsd_pct: Option<f64>,
 }
 
 impl Default for StressAttrs {
@@ -102,8 +140,9 @@ impl Default for StressAttrs {
         Self {
             name: None,
             tier: 2,
-            mode: "fixed_operations".to_string(),
+            mode: None,
             ignore: false,
+            budgets: StressBudgets::default(),
             metadata: Vec::new(),
         }
     }
@@ -125,7 +164,22 @@ impl StressAttrs {
                     attrs.tier = int_value(&name_value)?;
                 }
                 Meta::NameValue(name_value) if name_value.path.is_ident("mode") => {
-                    attrs.mode = string_value(&name_value)?;
+                    attrs.mode = Some(string_value(&name_value)?);
+                }
+                Meta::NameValue(name_value) if name_value.path.is_ident("max_ns_per_op") => {
+                    attrs.budgets.ns_per_op = Some(float_value(&name_value)?);
+                }
+                Meta::NameValue(name_value) if name_value.path.is_ident("max_allocs_per_op") => {
+                    attrs.budgets.allocs_per_op = Some(float_value(&name_value)?);
+                }
+                Meta::NameValue(name_value) if name_value.path.is_ident("max_bytes_per_op") => {
+                    attrs.budgets.bytes_per_op = Some(float_value(&name_value)?);
+                }
+                Meta::NameValue(name_value) if name_value.path.is_ident("max_regression_pct") => {
+                    attrs.budgets.regression_pct = Some(float_value(&name_value)?);
+                }
+                Meta::NameValue(name_value) if name_value.path.is_ident("max_rsd_pct") => {
+                    attrs.budgets.rsd_pct = Some(float_value(&name_value)?);
                 }
                 Meta::List(list) if list.path.is_ident("metadata") => {
                     attrs.metadata.extend(parse_metadata(list.tokens)?);
@@ -179,6 +233,28 @@ fn int_value(name_value: &MetaNameValue) -> syn::Result<u32> {
             ..
         }) => value.base10_parse(),
         value => Err(syn::Error::new_spanned(value, "expected integer literal")),
+    }
+}
+
+fn float_value(name_value: &MetaNameValue) -> syn::Result<f64> {
+    match &name_value.value {
+        Expr::Lit(ExprLit {
+            lit: Lit::Float(value),
+            ..
+        }) => value.base10_parse(),
+        Expr::Lit(ExprLit {
+            lit: Lit::Int(value),
+            ..
+        }) => value.base10_parse(),
+        value => Err(syn::Error::new_spanned(value, "expected numeric literal")),
+    }
+}
+
+fn option_f64_tokens(value: Option<f64>) -> proc_macro2::TokenStream {
+    if let Some(value) = value {
+        quote! { Some(#value) }
+    } else {
+        quote! { None }
     }
 }
 

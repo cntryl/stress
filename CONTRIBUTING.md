@@ -157,8 +157,8 @@ Use clear, descriptive commit messages:
 This project follows [Semantic Versioning](https://semver.org/):
 
 - **MAJOR** - Breaking API changes
-- **MINOR** - New features (backwards compatible)
-- **PATCH** - Bug fixes (backwards compatible)
+- **MINOR** - New features within the current major line
+- **PATCH** - Bug fixes within the current major line
 
 ## Licensing
 

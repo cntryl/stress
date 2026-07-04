@@ -1,6 +1,6 @@
-//! Stress runner that records raw samples and derives v2 artifacts.
+//! Stress runner that records raw samples and derives current artifacts.
 
-use crate::config::StressRunnerConfig;
+use crate::config::{ConsoleMode, StressRunnerConfig};
 use crate::context::StressContext;
 use crate::report::{ConsoleReporter, JsonReporter, Reporter};
 use crate::result::{
@@ -12,7 +12,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
 
-/// Runner for Tier 2 through Tier N stress benchmarks.
+/// Runner for Tier 1 through Tier N stress benchmarks.
 pub struct StressRunner {
     suite: String,
     config: StressRunnerConfig,
@@ -46,17 +46,12 @@ impl StressRunner {
         metadata: BTreeMap<String, String>,
     ) -> Self {
         let environment = capture_environment(&config);
-        let mut reporters: Vec<Box<dyn Reporter>> =
-            vec![Box::new(JsonReporter::new(config.output_dir.clone()))];
-        if config.verbose {
-            reporters.insert(
-                0,
-                Box::new(
-                    ConsoleReporter::new()
-                        .config_lines(build_suite_config_lines(&config, &metadata)),
-                ),
-            );
-        }
+        let announce_artifacts =
+            matches!(config.console, ConsoleMode::Default | ConsoleMode::Verbose);
+        let mut reporters: Vec<Box<dyn Reporter>> = vec![Box::new(
+            JsonReporter::new(config.output_dir.clone()).announce(announce_artifacts),
+        )];
+        reporters.insert(0, Box::new(ConsoleReporter::new(config.console)));
 
         let runner = Self {
             suite: suite.to_string(),
@@ -108,6 +103,7 @@ impl StressRunner {
             mode: self
                 .config
                 .mode_for_kind(BenchmarkModeKind::FixedOperations),
+            budgets: crate::result::BenchmarkBudgets::default(),
             parameters: BTreeMap::new(),
             metadata: BTreeMap::new(),
         };
@@ -152,7 +148,7 @@ impl StressRunner {
         self.finish_inner(Vec::new())
     }
 
-    /// Finish the run with a v2 baseline artifact.
+    /// Finish the run with a current baseline artifact.
     ///
     /// # Errors
     ///
@@ -253,6 +249,25 @@ impl StressRunner {
         } else {
             0.0
         };
+        let micro = ctx.micro;
+        let gross_elapsed_ns = micro.map(|micro| micro.gross_elapsed.as_nanos());
+        let overhead_ns = micro.map(|micro| micro.overhead.as_nanos());
+        let net_elapsed_ns = micro.map(|micro| micro.net_elapsed.as_nanos());
+        let calibrated_iterations = micro.map(|micro| micro.iterations);
+        let gross_ns_per_op =
+            micro.and_then(|micro| ns_per_op(micro.gross_elapsed.as_nanos(), micro.iterations));
+        let overhead_ns_per_op =
+            micro.and_then(|micro| ns_per_op(micro.overhead.as_nanos(), micro.iterations));
+        let net_ns_per_op =
+            micro.and_then(|micro| ns_per_op(micro.net_elapsed.as_nanos(), micro.iterations));
+        let allocs = micro.and_then(|micro| micro.allocs);
+        let bytes = micro.and_then(|micro| micro.bytes);
+        let allocs_per_op = allocs
+            .zip(calibrated_iterations)
+            .and_then(|(allocs, iterations)| count_per_op(allocs, iterations));
+        let bytes_per_op = bytes
+            .zip(calibrated_iterations)
+            .and_then(|(bytes, iterations)| count_per_op(bytes, iterations));
 
         Sample {
             benchmark_id: spec.id.clone(),
@@ -262,12 +277,37 @@ impl StressRunner {
             operations_attempted,
             operations_completed,
             throughput,
+            calibrated_iterations,
+            gross_elapsed_ns,
+            overhead_ns,
+            net_elapsed_ns,
+            gross_ns_per_op,
+            overhead_ns_per_op,
+            net_ns_per_op,
+            allocs,
+            bytes,
+            allocs_per_op,
+            bytes_per_op,
             latency_ns: ctx.latency_ns,
             parameters,
             counters: ctx.counters,
             environment: self.environment.clone(),
         }
     }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn ns_per_op(elapsed_ns: u128, operations: u64) -> Option<f64> {
+    (operations != 0)
+        .then(|| elapsed_ns as f64 / operations as f64)
+        .filter(|value| value.is_finite())
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn count_per_op(count: u64, operations: u64) -> Option<f64> {
+    (operations != 0)
+        .then(|| count as f64 / operations as f64)
+        .filter(|value| value.is_finite())
 }
 
 fn merge_parameters(
@@ -277,64 +317,6 @@ fn merge_parameters(
     let mut parameters = spec.clone();
     parameters.extend(sample);
     parameters
-}
-
-fn build_suite_config_lines(
-    config: &StressRunnerConfig,
-    metadata: &BTreeMap<String, String>,
-) -> Vec<String> {
-    let mut lines = vec![
-        format!(
-            "Profile: {} ({})",
-            config.profile,
-            metadata
-                .get("profile_src")
-                .map_or("unknown", String::as_str)
-        ),
-        format!(
-            "Samples: {} ({})",
-            config.samples,
-            metadata
-                .get("samples_src")
-                .map_or("unknown", String::as_str)
-        ),
-        format!(
-            "Warmup samples: {} ({})",
-            config.warmup_samples,
-            metadata
-                .get("warmup_samples_src")
-                .map_or("unknown", String::as_str)
-        ),
-        format!(
-            "Cooldown samples: {} ({})",
-            config.cooldown_samples,
-            metadata
-                .get("cooldown_samples_src")
-                .map_or("unknown", String::as_str)
-        ),
-        format!(
-            "Output: {} ({})",
-            config.output_dir.display(),
-            metadata
-                .get("output_dir_src")
-                .map_or("unknown", String::as_str)
-        ),
-        format!("Verbose: {}", config.verbose),
-    ];
-
-    lines.push(format!(
-        "Filter: {} ({})",
-        config.filter.as_deref().unwrap_or("<none>"),
-        metadata.get("filter_src").map_or("unknown", String::as_str)
-    ));
-    lines.push(format!(
-        "Tier: {} ({})",
-        config
-            .tier
-            .map_or_else(|| "<any>".to_string(), |tier| tier.to_string()),
-        metadata.get("tier_src").map_or("unknown", String::as_str)
-    ));
-    lines
 }
 
 fn capture_environment(config: &StressRunnerConfig) -> EnvironmentInfo {
@@ -425,6 +407,8 @@ pub enum RunGate {
     QualityFailed,
     /// Meaningful regression policy failed.
     RegressionFailed,
+    /// At least one configured benchmark budget failed.
+    BudgetFailed,
 }
 
 /// Evaluate a run against its profile policy.
@@ -432,6 +416,9 @@ pub enum RunGate {
 pub fn evaluate_run_gate(run: &StressRun) -> RunGate {
     if !run.correctness_passed() {
         return RunGate::CorrectnessFailed;
+    }
+    if !run.budgets_passed() {
+        return RunGate::BudgetFailed;
     }
     let profile_config = &run.environment.profile_config;
     if profile_config.fail_on_quality && !run.meets_min_quality(profile_config.min_quality) {
@@ -451,7 +438,9 @@ pub fn evaluate_run_gate(run: &StressRun) -> RunGate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::result::{BenchmarkMode, CorrectnessCounters, RunProfile};
+    use crate::result::{
+        BenchmarkBudgets, BenchmarkMode, CorrectnessCounters, PrimaryMetric, RunProfile,
+    };
     use std::time::Duration;
 
     #[test]
@@ -558,6 +547,7 @@ mod tests {
             mode: BenchmarkMode::FixedDuration {
                 sample_duration: Duration::from_millis(1),
             },
+            budgets: crate::result::BenchmarkBudgets::default(),
             parameters: BTreeMap::new(),
             metadata: BTreeMap::new(),
         };
@@ -575,6 +565,37 @@ mod tests {
 
         assert!(run.samples[0].operations_completed > 0);
         assert!(run.samples[0].throughput > 0.0);
+    }
+
+    #[test]
+    fn micro_mode_records_raw_overhead_and_per_operation_fields() {
+        let config = StressRunnerConfig::for_profile(RunProfile::Smoke)
+            .micro_sample_duration(Duration::from_millis(1))
+            .verbose(false);
+        let mut runner = StressRunner::with_config("suite", config.clone());
+        runner.reporters(Vec::new());
+        let spec = BenchmarkSpec {
+            id: "suite/hot_path".to_string(),
+            name: "hot_path".to_string(),
+            tier: 1,
+            mode: config.mode_for_kind(BenchmarkModeKind::Micro),
+            budgets: BenchmarkBudgets::default(),
+            parameters: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+        };
+
+        runner.run_spec(spec, |ctx| {
+            ctx.measure_micro(|| std::hint::black_box(1_u64));
+        });
+        let run = runner.finish();
+        let sample = &run.samples[0];
+        let summary = &run.summaries[0];
+
+        assert!(sample.calibrated_iterations.expect("iterations") > 0);
+        assert!(sample.gross_elapsed_ns.expect("gross") >= sample.net_elapsed_ns.expect("net"));
+        assert!(sample.net_ns_per_op.expect("ns/op") >= 0.0);
+        assert_eq!(summary.primary_metric, PrimaryMetric::NsPerOp);
+        assert!(summary.ns_per_op.is_some());
     }
 
     #[test]

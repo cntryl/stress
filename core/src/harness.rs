@@ -1,7 +1,7 @@
 //! Harness for auto-discovered stress benchmarks.
 
-use crate::config::{parse_bool_env, StressRunnerConfig};
-use crate::result::{BenchmarkModeKind, BenchmarkSpec, RunProfile};
+use crate::config::{parse_bool_env, ConsoleMode, StressRunnerConfig};
+use crate::result::{BenchmarkBudgets, BenchmarkModeKind, BenchmarkSpec, RunProfile};
 use crate::runner::{evaluate_run_gate, RunGate, StressRunner};
 use crate::StressContext;
 use std::collections::BTreeMap;
@@ -18,10 +18,12 @@ pub struct BenchmarkEntry {
     pub ignored: bool,
     /// Module path where the benchmark is defined.
     pub module_path: &'static str,
-    /// Numeric tier. Tier 1 is intentionally out of scope.
+    /// Numeric tier.
     pub tier: u32,
     /// Static benchmark mode kind.
     pub mode: BenchmarkModeKind,
+    /// Static budget gates.
+    pub budgets: BenchmarkBudgets,
     /// Static descriptive metadata.
     pub metadata: &'static [(&'static str, &'static str)],
 }
@@ -42,7 +44,7 @@ struct StressBinaryArgs {
     samples: Option<usize>,
     warmup_samples: Option<usize>,
     cooldown_samples: Option<usize>,
-    verbose: Option<bool>,
+    console: Option<ConsoleMode>,
     include_ignored: Option<bool>,
     list: bool,
     print_config: bool,
@@ -111,10 +113,16 @@ impl StressBinaryArgs {
                     }
                 }
                 "--verbose" | "-v" => {
-                    result.verbose = Some(true);
+                    result.console = Some(ConsoleMode::Verbose);
                 }
                 "--quiet" | "-q" => {
-                    result.verbose = Some(false);
+                    result.console = Some(ConsoleMode::Quiet);
+                }
+                "--console" => {
+                    index += 1;
+                    if let Some(value) = args.get(index).and_then(|value| value.parse().ok()) {
+                        result.console = Some(value);
+                    }
                 }
                 "--include-ignored" => {
                     result.include_ignored = Some(true);
@@ -169,13 +177,14 @@ fn print_help() {
     eprintln!("    --samples <N>                  Measured samples per benchmark");
     eprintln!("    --warmup-samples <N>           Warmup samples");
     eprintln!("    --cooldown-samples <N>         Cooldown samples");
-    eprintln!("    -v, --verbose                  Verbose output");
-    eprintln!("    -q, --quiet                    Quiet output");
+    eprintln!("    --console <MODE>               default, verbose, quiet, json, or markdown");
+    eprintln!("    -v, --verbose                  Shortcut for --console verbose");
+    eprintln!("    -q, --quiet                    Shortcut for --console quiet");
     eprintln!("    --include-ignored              Include ignored benchmarks");
     eprintln!("    --list                         List benchmarks");
     eprintln!("    --print-config                 Print resolved config");
     eprintln!("    --output-dir <PATH>            Artifact output directory");
-    eprintln!("    --baseline <PATH>              v2 baseline artifact");
+    eprintln!("    --baseline <PATH>              Current baseline artifact");
     eprintln!("    --threshold <FLOAT>            Regression threshold");
 }
 
@@ -221,8 +230,8 @@ pub struct StressRunnerOptions {
     pub samples: Option<usize>,
     /// Warmup samples.
     pub warmup_samples: Option<usize>,
-    /// Verbose output.
-    pub verbose: Option<bool>,
+    /// Console output mode.
+    pub console: Option<ConsoleMode>,
     /// Baseline artifact.
     pub baseline: Option<PathBuf>,
     /// Regression threshold.
@@ -278,10 +287,21 @@ impl StressRunnerOptions {
         self
     }
 
-    /// Set verbose output.
+    /// Set console output mode.
+    #[must_use]
+    pub const fn console(mut self, value: ConsoleMode) -> Self {
+        self.console = Some(value);
+        self
+    }
+
+    /// Set verbose or quiet console output.
     #[must_use]
     pub const fn verbose(mut self, value: bool) -> Self {
-        self.verbose = Some(value);
+        self.console = Some(if value {
+            ConsoleMode::Verbose
+        } else {
+            ConsoleMode::Quiet
+        });
         self
     }
 
@@ -313,7 +333,7 @@ pub fn run_with_options(options: StressRunnerOptions) {
         tier: options.tier,
         samples: options.samples,
         warmup_samples: options.warmup_samples,
-        verbose: options.verbose,
+        console: options.console,
         include_ignored: Some(options.include_ignored),
         baseline: options.baseline,
         threshold: options.threshold,
@@ -385,15 +405,11 @@ where
             "cli --cooldown-samples".to_string(),
         );
     }
-    if let Some(verbose) = args.verbose {
-        config.verbose = verbose;
+    if let Some(console) = args.console {
+        config.console = console;
         metadata.insert(
-            "verbose_src".to_string(),
-            if verbose {
-                "cli --verbose".to_string()
-            } else {
-                "cli --quiet".to_string()
-            },
+            "console_src".to_string(),
+            format!("cli --console {console}"),
         );
     }
     if let Some(output_dir) = &args.output_dir {
@@ -460,6 +476,7 @@ fn run_with_resolved_config(resolved: ResolvedStressConfig) {
             name,
             tier: entry.tier,
             mode: config_for_specs.mode_for_kind(entry.mode),
+            budgets: entry.budgets,
             parameters: BTreeMap::new(),
             metadata,
         };
@@ -606,7 +623,7 @@ fn print_resolved_config(suite: &str, resolved: &ResolvedStressConfig) {
             .get("tier_src")
             .map_or("unknown", String::as_str)
     );
-    println!("Verbose: {}", resolved.config.verbose);
+    println!("Console: {}", resolved.config.console);
     println!("Include ignored: {}", resolved.include_ignored);
     println!(
         "Baseline: {} ({})",

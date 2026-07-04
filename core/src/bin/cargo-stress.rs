@@ -59,7 +59,7 @@ automatically at runtime by each binary.
 Example:
     cargo stress                        # Run all stress tests with the trustworthy default gate
     cargo stress --workload 'fsync*'    # Filter by pattern
-    cargo stress --baseline latest.json # Compare against a v2 baseline
+    cargo stress --baseline latest.json # Compare against a stress baseline
     cargo stress --list                 # List available tests
 "
 )]
@@ -128,13 +128,17 @@ struct StressArgs {
     // ========================================================================
     // Output Control
     // ========================================================================
-    /// Verbose output (falls back to `STRESS_VERBOSE`)
+    /// Verbose wrapper output and benchmark console output
     #[arg(long, short = 'v')]
     verbose: bool,
 
     /// Quiet mode (minimal output, only errors)
     #[arg(long, short = 'q')]
     quiet: bool,
+
+    /// Console output mode passed to stress binaries: default, verbose, quiet, json, or markdown
+    #[arg(long)]
+    console: Option<String>,
 
     /// Output directory for artifacts (falls back to `STRESS_OUTPUT_DIR`)
     #[arg(long)]
@@ -143,7 +147,7 @@ struct StressArgs {
     // ========================================================================
     // Regression Detection
     // ========================================================================
-    /// Baseline v2 JSON file for regression comparison (falls back to `STRESS_BASELINE`)
+    /// Baseline JSON file for regression comparison (falls back to `STRESS_BASELINE`)
     #[arg(long)]
     baseline: Option<PathBuf>,
 
@@ -246,6 +250,7 @@ fn create_temp_workspace(files: &[StressFile], project_root: &Path) -> Result<(P
     // Convert path to use forward slashes for TOML compatibility
     let project_root_str = project_root.display().to_string().replace('\\', "/");
     let stress_version = env!("CARGO_PKG_VERSION");
+    let stress_dependency = stress_dependency_spec(&manifest_text, project_root, stress_version);
 
     // Check if this IS the cntryl-stress repo itself
     let is_stress_repo = pkg_name == "cntryl-stress";
@@ -278,7 +283,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-cntryl-stress = "{stress_version}"
+{stress_dependency}
 {pkg_name} = {{ path = "{project_root_str}" }}
 "#
         )
@@ -296,6 +301,41 @@ cntryl-stress = "{stress_version}"
     }
 
     Ok((manifest_path, target_dir))
+}
+
+fn stress_dependency_spec(
+    manifest_text: &str,
+    project_root: &Path,
+    stress_version: &str,
+) -> String {
+    manifest_text
+        .lines()
+        .find_map(|line| local_stress_dependency_path(line, project_root))
+        .map_or_else(
+            || format!(r#"cntryl-stress = "{stress_version}""#),
+            |path| format!(r#"cntryl-stress = {{ path = "{path}" }}"#),
+        )
+}
+
+fn local_stress_dependency_path(line: &str, project_root: &Path) -> Option<String> {
+    let trimmed = line.trim();
+    let (name, rest) = trimmed.split_once('=')?;
+    if name.trim() != "cntryl-stress" || !rest.contains("path") {
+        return None;
+    }
+    let path = extract_inline_toml_string(rest, "path")?;
+    let absolute = project_root.join(path).canonicalize().ok()?;
+    Some(absolute.display().to_string().replace('\\', "/"))
+}
+
+fn extract_inline_toml_string(input: &str, key: &str) -> Option<String> {
+    let start = input.find(key)?;
+    let after_key = &input[start + key.len()..];
+    let equals = after_key.find('=')?;
+    let after_equals = after_key[equals + 1..].trim_start();
+    let quoted = after_equals.strip_prefix('"')?;
+    let end = quoted.find('"')?;
+    Some(quoted[..end].to_string())
 }
 
 // ============================================================================
@@ -334,7 +374,9 @@ fn run_stress(args: &StressArgs) -> Result<()> {
     let verbosity = Verbosity::from_args(args);
 
     // Step 1: Locate project root
-    let manifest_path = find_manifest(args)?;
+    let manifest_path = find_manifest(args)?
+        .canonicalize()
+        .context("Failed to resolve manifest path")?;
     let project_root = manifest_path
         .parent()
         .context("Cargo.toml has no parent directory")?;
@@ -513,7 +555,7 @@ fn discover_stress_files(benches_dir: &Path, args: &StressArgs) -> Result<Vec<St
         }
 
         // Only treat this as a stress file if it declares a stress_main!() entrypoint.
-        // This prevents accidental conflicts with other bench harnesses (e.g. Criterion)
+        // This prevents accidental conflicts with other benchmark harnesses.
         // that also live under benches/.
         let content = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
@@ -626,10 +668,6 @@ fn build_stress_binaries(
             "Cargo build failed with exit code: {:?}",
             output.status.code()
         );
-    }
-
-    if verbosity.is_normal() {
-        println!("   Build complete.");
     }
 
     if verbosity.is_normal() {
@@ -798,6 +836,9 @@ fn build_passthrough_args(cmd: &mut Command, args: &StressArgs) {
     }
     if args.quiet {
         cmd.arg("--quiet");
+    }
+    if let Some(ref console) = args.console {
+        cmd.arg("--console").arg(console);
     }
 
     // Include ignored

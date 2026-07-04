@@ -2,8 +2,52 @@
 
 use crate::result::{BenchmarkMode, BenchmarkModeKind, ProfileConfig, QualityClass, RunProfile};
 use std::collections::HashMap;
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
+
+/// Console output mode for human and machine-readable stdout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConsoleMode {
+    /// Compact grouped decision surface.
+    #[default]
+    Default,
+    /// Full grouped table with every benchmark row.
+    Verbose,
+    /// Summary counts only.
+    Quiet,
+    /// Print the current JSON artifact to stdout.
+    Json,
+    /// Print the Markdown report to stdout.
+    Markdown,
+}
+
+impl fmt::Display for ConsoleMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Default => f.write_str("default"),
+            Self::Verbose => f.write_str("verbose"),
+            Self::Quiet => f.write_str("quiet"),
+            Self::Json => f.write_str("json"),
+            Self::Markdown => f.write_str("markdown"),
+        }
+    }
+}
+
+impl std::str::FromStr for ConsoleMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "default" => Ok(Self::Default),
+            "verbose" => Ok(Self::Verbose),
+            "quiet" => Ok(Self::Quiet),
+            "json" => Ok(Self::Json),
+            "markdown" => Ok(Self::Markdown),
+            other => Err(format!("unknown console mode '{other}'")),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct EnvConfigResolution {
@@ -35,8 +79,8 @@ pub struct StressRunnerConfig {
     pub cooldown_samples: usize,
     /// Output directory for artifacts.
     pub output_dir: PathBuf,
-    /// Print progress/results to stdout.
-    pub verbose: bool,
+    /// Console output mode.
+    pub console: ConsoleMode,
     /// Filter benchmarks by name/module pattern.
     pub filter: Option<String>,
     /// Exact tier filter.
@@ -49,6 +93,8 @@ pub struct StressRunnerConfig {
     pub sample_duration: Duration,
     /// Fixed-operations sample size.
     pub operations_per_sample: u64,
+    /// Target duration for calibrated micro samples.
+    pub micro_sample_duration: Duration,
     /// Minimum quality required by the active profile.
     pub min_quality: QualityClass,
     /// Whether quality below `min_quality` fails the run.
@@ -89,6 +135,7 @@ impl StressRunnerConfig {
                 regression_threshold: 0.05,
                 sample_duration: Duration::from_millis(100),
                 operations_per_sample: 1,
+                micro_sample_duration: Duration::from_millis(50),
                 report_depth: "summary".to_string(),
             },
             RunProfile::Release => ProfileConfig {
@@ -102,6 +149,7 @@ impl StressRunnerConfig {
                 regression_threshold: 0.05,
                 sample_duration: Duration::from_secs(1),
                 operations_per_sample: 1,
+                micro_sample_duration: Duration::from_millis(100),
                 report_depth: "gated".to_string(),
             },
             RunProfile::Lab => ProfileConfig {
@@ -115,6 +163,7 @@ impl StressRunnerConfig {
                 regression_threshold: 0.05,
                 sample_duration: Duration::from_secs(5),
                 operations_per_sample: 1,
+                micro_sample_duration: Duration::from_millis(200),
                 report_depth: "deep".to_string(),
             },
         };
@@ -128,13 +177,14 @@ impl StressRunnerConfig {
             warmup_samples: profile_config.warmup_samples,
             cooldown_samples: profile_config.cooldown_samples,
             output_dir: PathBuf::from("target/stress"),
-            verbose: true,
+            console: ConsoleMode::Default,
             filter: None,
             tier: None,
             git_sha: None,
             timeout: None,
             sample_duration: profile_config.sample_duration,
             operations_per_sample: profile_config.operations_per_sample,
+            micro_sample_duration: profile_config.micro_sample_duration,
             min_quality: profile_config.min_quality,
             fail_on_quality: profile_config.fail_on_quality,
             fail_on_regression: profile_config.fail_on_regression,
@@ -203,6 +253,7 @@ impl StressRunnerConfig {
             regression_threshold: self.threshold,
             sample_duration: self.sample_duration,
             operations_per_sample: self.operations_per_sample,
+            micro_sample_duration: self.micro_sample_duration,
             report_depth: self.report_depth.clone(),
         }
     }
@@ -211,6 +262,9 @@ impl StressRunnerConfig {
     #[must_use]
     pub fn mode_for_kind(&self, kind: BenchmarkModeKind) -> BenchmarkMode {
         match kind {
+            BenchmarkModeKind::Micro => BenchmarkMode::Micro {
+                target_sample_duration: self.micro_sample_duration,
+            },
             BenchmarkModeKind::FixedDuration => BenchmarkMode::FixedDuration {
                 sample_duration: self.sample_duration,
             },
@@ -225,7 +279,7 @@ impl StressRunnerConfig {
     pub fn profile(self, profile: RunProfile) -> Self {
         let mut next = Self::for_profile(profile);
         next.output_dir = self.output_dir;
-        next.verbose = self.verbose;
+        next.console = self.console;
         next.filter = self.filter;
         next.tier = self.tier;
         next.git_sha = self.git_sha;
@@ -261,10 +315,21 @@ impl StressRunnerConfig {
         self
     }
 
-    /// Set console output.
+    /// Set console output mode.
     #[must_use]
-    pub fn verbose(mut self, value: bool) -> Self {
-        self.verbose = value;
+    pub const fn console(mut self, value: ConsoleMode) -> Self {
+        self.console = value;
+        self
+    }
+
+    /// Set verbose or quiet console output.
+    #[must_use]
+    pub const fn verbose(mut self, value: bool) -> Self {
+        self.console = if value {
+            ConsoleMode::Verbose
+        } else {
+            ConsoleMode::Quiet
+        };
         self
     }
 
@@ -324,6 +389,13 @@ impl StressRunnerConfig {
         self
     }
 
+    /// Set calibrated micro sample target duration.
+    #[must_use]
+    pub fn micro_sample_duration(mut self, duration: Duration) -> Self {
+        self.micro_sample_duration = duration;
+        self
+    }
+
     /// Set regression threshold.
     #[must_use]
     pub fn threshold(mut self, value: f64) -> Self {
@@ -342,6 +414,15 @@ where
 }
 
 fn apply_env_overrides<F>(get_var: &F, resolution: &mut EnvConfigResolution)
+where
+    F: Fn(&str) -> Option<String>,
+{
+    apply_sample_env_overrides(get_var, resolution);
+    apply_selection_env_overrides(get_var, resolution);
+    apply_execution_env_overrides(get_var, resolution);
+}
+
+fn apply_sample_env_overrides<F>(get_var: &F, resolution: &mut EnvConfigResolution)
 where
     F: Fn(&str) -> Option<String>,
 {
@@ -369,13 +450,19 @@ where
         |value| value.parse::<usize>().ok(),
         |config, value| config.cooldown_samples = value,
     );
+}
+
+fn apply_selection_env_overrides<F>(get_var: &F, resolution: &mut EnvConfigResolution)
+where
+    F: Fn(&str) -> Option<String>,
+{
     parse_env(
         &get_var,
         resolution,
-        "STRESS_VERBOSE",
-        "verbose",
-        parse_bool_env,
-        |config, value| config.verbose = value,
+        "STRESS_CONSOLE",
+        "console",
+        |value| value.parse::<ConsoleMode>().ok(),
+        |config, value| config.console = value,
     );
     parse_env(
         &get_var,
@@ -404,18 +491,24 @@ where
     parse_env(
         &get_var,
         resolution,
-        "STRESS_TIMEOUT_SECS",
-        "timeout_secs",
-        |value| value.parse::<u64>().ok(),
-        |config, value| config.timeout = Some(Duration::from_secs(value)),
-    );
-    parse_env(
-        &get_var,
-        resolution,
         "STRESS_TIER",
         "tier",
         |value| value.parse::<u32>().ok(),
         |config, value| config.tier = Some(value),
+    );
+}
+
+fn apply_execution_env_overrides<F>(get_var: &F, resolution: &mut EnvConfigResolution)
+where
+    F: Fn(&str) -> Option<String>,
+{
+    parse_env(
+        &get_var,
+        resolution,
+        "STRESS_TIMEOUT_SECS",
+        "timeout_secs",
+        |value| value.parse::<u64>().ok(),
+        |config, value| config.timeout = Some(Duration::from_secs(value)),
     );
     parse_env(
         &get_var,
@@ -432,6 +525,14 @@ where
         "operations_per_sample",
         |value| value.parse::<u64>().ok(),
         |config, value| config.operations_per_sample = value,
+    );
+    parse_env(
+        &get_var,
+        resolution,
+        "STRESS_MICRO_SAMPLE_DURATION_MS",
+        "micro_sample_duration",
+        |value| value.parse::<u64>().ok(),
+        |config, value| config.micro_sample_duration = Duration::from_millis(value),
     );
     parse_env(
         &get_var,
@@ -489,13 +590,14 @@ fn apply_default_sources(metadata: &mut HashMap<String, String>) {
         "warmup_samples_src",
         "cooldown_samples_src",
         "output_dir_src",
-        "verbose_src",
+        "console_src",
         "filter_src",
         "tier_src",
         "git_sha_src",
         "timeout_secs_src",
         "sample_duration_src",
         "operations_per_sample_src",
+        "micro_sample_duration_src",
         "threshold_src",
     ] {
         metadata
@@ -572,10 +674,11 @@ mod tests {
         assert_eq!(cfg.samples, 5);
         assert_eq!(cfg.warmup_samples, 2);
         assert_eq!(cfg.cooldown_samples, 1);
-        assert!(!cfg.verbose);
+        assert_eq!(cfg.console, ConsoleMode::Quiet);
         assert_eq!(cfg.filter, Some("my_bench".to_string()));
         assert_eq!(cfg.tier, Some(3));
         assert_eq!(cfg.operations_per_sample, 10);
+        assert_eq!(cfg.micro_sample_duration, Duration::from_millis(100));
     }
 
     #[test]
@@ -584,7 +687,7 @@ mod tests {
             ("STRESS_PROFILE", "release".to_string()),
             ("STRESS_SAMPLES", "7".to_string()),
             ("STRESS_WARMUP_SAMPLES", "2".to_string()),
-            ("STRESS_VERBOSE", "false".to_string()),
+            ("STRESS_CONSOLE", "quiet".to_string()),
             ("STRESS_TIER", "4".to_string()),
         ]);
 
@@ -593,7 +696,7 @@ mod tests {
         assert_eq!(resolution.config.profile, RunProfile::Release);
         assert_eq!(resolution.config.samples, 7);
         assert_eq!(resolution.config.warmup_samples, 2);
-        assert!(!resolution.config.verbose);
+        assert_eq!(resolution.config.console, ConsoleMode::Quiet);
         assert_eq!(resolution.config.tier, Some(4));
         assert!(resolution.warnings.is_empty());
     }
@@ -602,14 +705,14 @@ mod tests {
     fn malformed_env_values_warn_and_keep_defaults() {
         let env = HashMap::from([
             ("STRESS_SAMPLES", "abc".to_string()),
-            ("STRESS_VERBOSE", "maybe".to_string()),
+            ("STRESS_CONSOLE", "maybe".to_string()),
             ("STRESS_TIMEOUT_SECS", "soon".to_string()),
         ]);
 
         let resolution = StressRunnerConfig::resolve_from_env_with(|key| env.get(key).cloned());
 
         assert_eq!(resolution.config.samples, 10);
-        assert!(resolution.config.verbose);
+        assert_eq!(resolution.config.console, ConsoleMode::Default);
         assert_eq!(resolution.config.timeout, None);
         assert_eq!(resolution.warnings.len(), 3);
     }
@@ -630,6 +733,12 @@ mod tests {
             cfg.mode_for_kind(BenchmarkModeKind::FixedOperations),
             BenchmarkMode::FixedOperations {
                 operations_per_sample: 12
+            }
+        );
+        assert_eq!(
+            cfg.mode_for_kind(BenchmarkModeKind::Micro),
+            BenchmarkMode::Micro {
+                target_sample_duration: Duration::from_millis(100)
             }
         );
     }

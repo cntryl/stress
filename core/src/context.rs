@@ -1,5 +1,6 @@
 //! Benchmark context for timing, workload facts, and correctness counters.
 
+use crate::allocation;
 use crate::result::{BenchmarkMode, CorrectnessCounters};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -17,6 +18,17 @@ pub struct StressContext {
     pub(crate) latency_ns: Vec<u128>,
     pub(crate) counters: CorrectnessCounters,
     pub(crate) operations_hint: Option<u64>,
+    pub(crate) micro: Option<MicroMeasurement>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MicroMeasurement {
+    pub iterations: u64,
+    pub gross_elapsed: Duration,
+    pub overhead: Duration,
+    pub net_elapsed: Duration,
+    pub allocs: Option<u64>,
+    pub bytes: Option<u64>,
 }
 
 impl StressContext {
@@ -29,6 +41,7 @@ impl StressContext {
             latency_ns: Vec::new(),
             counters: CorrectnessCounters::default(),
             operations_hint: None,
+            micro: None,
         }
     }
 
@@ -82,12 +95,20 @@ impl StressContext {
     /// For `fixed_duration`, the closure is called until the sample duration
     /// elapses. For `fixed_operations`, the closure is called
     /// `operations_per_sample` times.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the benchmark records timing more than once.
     #[must_use = "use the operation count for additional validation when needed"]
     pub fn measure_workload<F>(&mut self, mut f: F) -> u64
     where
         F: FnMut(),
     {
         match self.mode.clone() {
+            BenchmarkMode::Micro { .. } => {
+                self.measure_micro(&mut f);
+                self.operations_hint.unwrap_or_default()
+            }
             BenchmarkMode::FixedDuration { sample_duration } => {
                 let start = Instant::now();
                 let mut operations = 0_u64;
@@ -125,6 +146,49 @@ impl StressContext {
         let result = f();
         self.set_duration(start.elapsed());
         self.set_successful_operations_if_unset(1);
+        result
+    }
+
+    /// Time a calibrated microbenchmark sample.
+    ///
+    /// The closure is batched until the gross sample duration reaches the
+    /// profile's micro target window, then an empty-loop overhead batch is
+    /// measured and subtracted from the recorded net duration.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside `mode = "micro"` or when timing was already
+    /// recorded for this sample.
+    pub fn measure_micro<F, R>(&mut self, mut f: F) -> R
+    where
+        F: FnMut() -> R,
+    {
+        let target = match self.mode {
+            BenchmarkMode::Micro {
+                target_sample_duration,
+            } => target_sample_duration,
+            BenchmarkMode::FixedDuration { .. } | BenchmarkMode::FixedOperations { .. } => {
+                panic!("ctx.measure_micro() requires mode = \"micro\"");
+            }
+        };
+
+        let iterations = calibrate_iterations(target, &mut f);
+        let allocation_start = allocation::snapshot();
+        let (gross_elapsed, result) = time_operation_batch(iterations, &mut f);
+        let allocation_delta = allocation_start.map(allocation::delta_since);
+        let overhead = time_empty_batch(iterations);
+        let net_elapsed = gross_elapsed.saturating_sub(overhead);
+
+        self.set_duration(net_elapsed);
+        self.set_successful_operations_if_unset(iterations);
+        self.micro = Some(MicroMeasurement {
+            iterations,
+            gross_elapsed,
+            overhead,
+            net_elapsed,
+            allocs: allocation_delta.map(|delta| delta.allocs),
+            bytes: allocation_delta.map(|delta| delta.bytes),
+        });
         result
     }
 
@@ -180,6 +244,51 @@ impl StressContext {
         self.set_duration(duration);
         self.set_successful_operations_if_unset(1);
     }
+}
+
+fn calibrate_iterations<F, R>(target: Duration, f: &mut F) -> u64
+where
+    F: FnMut() -> R,
+{
+    let mut iterations = 1_u64;
+    loop {
+        let (elapsed, _) = time_operation_batch(iterations, f);
+        if elapsed >= target || iterations >= 1 << 32 {
+            return iterations;
+        }
+
+        let elapsed_ns = elapsed.as_nanos().max(1);
+        let target_ns = target.as_nanos().max(1);
+        let scale = (target_ns / elapsed_ns).clamp(2, 16);
+        iterations = iterations.saturating_mul(u64::try_from(scale).unwrap_or(16));
+        if iterations == 0 {
+            return 1;
+        }
+    }
+}
+
+fn time_operation_batch<F, R>(iterations: u64, f: &mut F) -> (Duration, R)
+where
+    F: FnMut() -> R,
+{
+    let start = Instant::now();
+    let mut result = None;
+    for _ in 0..iterations {
+        result = Some(std::hint::black_box(f()));
+    }
+    let elapsed = start.elapsed();
+    (
+        elapsed,
+        std::hint::black_box(result.expect("micro batches always run at least once")),
+    )
+}
+
+fn time_empty_batch(iterations: u64) -> Duration {
+    let start = Instant::now();
+    for index in 0..iterations {
+        std::hint::black_box(index);
+    }
+    start.elapsed()
 }
 
 /// Fluent recorder for correctness counters.
@@ -259,6 +368,31 @@ mod tests {
         assert_eq!(ctx.counters.attempted, 3);
         assert_eq!(ctx.counters.completed, 3);
         assert!(ctx.duration.expect("duration") > Duration::ZERO);
+    }
+
+    #[test]
+    fn measure_micro_records_calibrated_net_sample() {
+        let mut ctx = StressContext::new(BenchmarkMode::Micro {
+            target_sample_duration: Duration::from_millis(1),
+        });
+
+        let result = ctx.measure_micro(|| std::hint::black_box(7_u64));
+
+        let micro = ctx.micro.expect("micro measurement");
+        assert_eq!(result, 7);
+        assert!(micro.iterations > 0);
+        assert_eq!(ctx.counters.attempted, micro.iterations);
+        assert_eq!(ctx.counters.completed, micro.iterations);
+        assert!(micro.gross_elapsed >= micro.net_elapsed);
+        assert_eq!(ctx.duration, Some(micro.net_elapsed));
+    }
+
+    #[test]
+    #[should_panic(expected = "ctx.measure_micro() requires mode = \"micro\"")]
+    fn measure_micro_requires_micro_mode() {
+        let mut ctx = ctx();
+
+        ctx.measure_micro(|| std::hint::black_box(1_u64));
     }
 
     #[test]

@@ -1,44 +1,105 @@
-use cntryl_stress::{stress_test, StressContext};
-use std::hint::black_box;
+use cntryl_stress::{black_box, stress_test, StressContext};
+use std::collections::VecDeque;
+use std::sync::mpsc;
+use std::time::Duration;
 
-#[stress_test]
-fn write_1kb_file(ctx: &mut StressContext) {
-    let data = vec![0u8; 1024];
-    ctx.parameter("payload_size", data.len());
+cntryl_stress::stress_allocator!();
 
-    ctx.measure(|| {
-        let _ = std::fs::write("target/stress_test", &data);
-    });
+#[stress_test(
+    tier = 1,
+    max_allocs_per_op = 0,
+    max_bytes_per_op = 0,
+    max_regression_pct = 5,
+    max_rsd_pct = 20,
+    metadata(component = "routing", tier_name = "hot_path")
+)]
+fn tier1_hot_path_route_lookup(ctx: &mut StressContext) {
+    let route = b"tenant-a.queue.primary";
+    ctx.parameter("route_len", route.len());
 
-    std::fs::remove_file("target/stress_test").ok();
-}
-
-#[stress_test]
-fn allocate_large_buffer(ctx: &mut StressContext) {
-    let size = 10 * 1024 * 1024; // 10 MB
-    ctx.parameter("payload_size", size);
-
-    ctx.measure(|| {
-        let mut buffer = vec![0u8; size];
-        buffer[0] = 1;
-        buffer[size - 1] = 1;
-        black_box(&buffer);
-    });
-}
-
-#[stress_test]
-fn compute_fibonacci(ctx: &mut StressContext) {
-    ctx.measure(|| {
-        let _ = fibonacci(30);
+    ctx.measure_micro(|| {
+        let mut hash = 0_u64;
+        for byte in route {
+            hash = hash.wrapping_mul(31).wrapping_add(u64::from(*byte));
+        }
+        black_box(hash)
     });
 }
 
-fn fibonacci(n: u32) -> u64 {
-    match n {
-        0 => 0,
-        1 => 1,
-        _ => fibonacci(n - 1) + fibonacci(n - 2),
-    }
+#[stress_test(tier = 2, metadata(component = "queue", tier_name = "subsystem"))]
+fn tier2_subsystem_queue_round_trip(ctx: &mut StressContext) {
+    let mut queue = (0_u64..1024).collect::<VecDeque<_>>();
+    ctx.parameter("queue_depth", queue.len());
+
+    ctx.measure(|| {
+        let value = queue.pop_front().unwrap_or_default();
+        queue.push_back(value.wrapping_add(1));
+        black_box(queue.front().copied())
+    });
+}
+
+#[stress_test(tier = 3, metadata(component = "pipeline", tier_name = "system"))]
+fn tier3_system_ingest_transform_commit(ctx: &mut StressContext) {
+    let records = (0_u64..512).collect::<Vec<_>>();
+    ctx.parameter("record_count", records.len());
+
+    ctx.measure(|| {
+        let transformed = records
+            .iter()
+            .map(|value| value.rotate_left(7) ^ 0x5a5a)
+            .fold(0_u64, u64::wrapping_add);
+        black_box(transformed)
+    });
+}
+
+#[stress_test(tier = 4, metadata(component = "transport", tier_name = "integration"))]
+fn tier4_integration_channel_round_trip(ctx: &mut StressContext) {
+    let (tx, rx) = mpsc::channel::<u64>();
+    ctx.parameter("transport", "mpsc");
+
+    ctx.measure(|| {
+        tx.send(42).expect("send");
+        black_box(rx.recv().expect("recv"))
+    });
+}
+
+#[stress_test(
+    tier = 5,
+    mode = "fixed_duration",
+    metadata(component = "queue", tier_name = "saturation_scaling")
+)]
+fn tier5_saturation_scaling_shards(ctx: &mut StressContext) {
+    let shard_count = 64_u64;
+    ctx.parameter("shard_count", shard_count);
+
+    let iterations = ctx.measure_for(Duration::from_millis(25), || {
+        let mut total = 0_u64;
+        for shard in 0..shard_count {
+            total = total.wrapping_add(shard.rotate_left(3));
+        }
+        black_box(total);
+    });
+    let completed = iterations as u64;
+    let _ = ctx.correctness().attempted(completed).completed(completed);
+}
+
+#[stress_test(
+    tier = 6,
+    mode = "fixed_duration",
+    metadata(component = "runtime", tier_name = "soak_endurance")
+)]
+fn tier6_soak_endurance_state_churn(ctx: &mut StressContext) {
+    ctx.parameter("window", "demo_short");
+
+    let mut state = 1_u64;
+    let iterations = ctx.measure_for(Duration::from_millis(25), || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        black_box(state);
+    });
+    let completed = iterations as u64;
+    let _ = ctx.correctness().attempted(completed).completed(completed);
 }
 
 cntryl_stress::stress_main!();

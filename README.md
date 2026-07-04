@@ -4,7 +4,7 @@
 [![docs.rs](https://docs.rs/cntryl-stress/badge.svg)](https://docs.rs/cntryl-stress)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-Raw-sample-first stress benchmarking for Tier 2 through Tier N performance work. Tier 1 microbenchmarks stay in Criterion.
+Raw-sample-first benchmarking for Tier 1 hot paths through Tier N workload and system performance work.
 
 ## Quick Start
 
@@ -19,7 +19,15 @@ harness = false
 ```
 
 ```rust
-use cntryl_stress::{stress_main, stress_test, StressContext};
+use cntryl_stress::{black_box, stress_main, stress_test, StressContext};
+
+cntryl_stress::stress_allocator!();
+
+#[stress_test(tier = 1, max_allocs_per_op = 0, max_bytes_per_op = 0)]
+fn parse_route_hot_path(ctx: &mut StressContext) {
+    let route = b"tenant-a.queue.primary";
+    ctx.measure_micro(|| black_box(route.iter().position(|byte| *byte == b'.')));
+}
 
 #[stress_test(tier = 2, metadata(component = "storage"))]
 fn write_batch(ctx: &mut StressContext) {
@@ -45,24 +53,37 @@ cargo stress --baseline target/stress/storage_stress/latest.json
 
 ## Model
 
-- `tier = 2..N` describes benchmark scope.
+- `tier = 1..N` describes benchmark scope:
+  - Tier 1: hot path
+  - Tier 2: subsystem
+  - Tier 3: system
+  - Tier 4: integration
+  - Tier 5: saturation/scaling
+  - Tier 6: soak/endurance
 - The default run is the trustworthy release-quality gate: 10 measured samples, 1 warmup sample, quality enforcement, and regression enforcement when a baseline is supplied.
 - `smoke` and `lab` remain explicit diagnostic overrides for callers that need a quick check or deeper exploration.
-- JSON artifacts use `schema_version: "cntryl-stress.v2"`.
+- JSON artifacts use `schema_version: "cntryl-stress.v1"`.
 - Raw `Sample` rows are authoritative; summaries, quality, and comparisons are derived from measured samples only.
 - Warmup and cooldown samples are retained in JSON and excluded from summary statistics and baseline comparison.
-- Criterion remains the right tool for Tier 1 microbenchmarks.
+- Tier 1 defaults to `mode = "micro"`: calibrated batched samples, empty-loop overhead subtraction, `ns/op`, and optional `allocs/op` / `B/op`.
 
 ## Benchmark API
 
 The common case stays small:
 
 ```rust
-#[stress_test(tier = 2)]
-fn parse_document(ctx: &mut StressContext) {
+#[stress_test(tier = 1)]
+fn parse_document_header(ctx: &mut StressContext) {
     let document = load_document();
     ctx.parameter("payload_size", document.len());
-    ctx.measure(|| parse(&document));
+    ctx.measure_micro(|| parse_header(&document));
+}
+
+#[stress_test(tier = 2)]
+fn write_batch(ctx: &mut StressContext) {
+    let batch = build_batch();
+    ctx.parameter("payload_size", batch.len());
+    ctx.measure(|| write(&batch));
 }
 ```
 
@@ -85,6 +106,7 @@ ctx.parameter("client_count", 16);
 ctx.metadata("scenario", "fanout");
 ctx.record_latency(duration);
 ctx.correctness().attempted(n).completed(n).failures(0);
+ctx.measure_micro(|| work());
 ctx.measure(|| work());
 ctx.measure_for(duration, || work());
 ctx.measure_workload(|| work());
@@ -94,13 +116,17 @@ ctx.measure_workload(|| work());
 
 ```rust
 #[stress_test]
+#[stress_test(tier = 1)]
+#[stress_test(tier = 1, mode = "micro")]
 #[stress_test(tier = 4)]
 #[stress_test(tier = 3, mode = "fixed_duration")]
+#[stress_test(tier = 1, max_ns_per_op = 250, max_regression_pct = 5)]
+#[stress_test(max_allocs_per_op = 0, max_bytes_per_op = 0, max_rsd_pct = 10)]
 #[stress_test(name = "custom_name", ignore)]
 #[stress_test(metadata(component = "queue", scenario = "fanout"))]
 ```
 
-Tiers start at 2. The macro rejects `tier = 1`.
+Tiers start at 1. The macro rejects `tier = 0`.
 
 ## Run Policy
 
@@ -118,6 +144,7 @@ Quality classes:
 - `untrustworthy`: too few samples, zero completed ops, invalid timing, or correctness failure
 
 Baseline regressions are meaningful only when the primary metric moves past threshold and 95% confidence intervals do not overlap.
+Benchmark budgets fail the run when exceeded. Micro rows below 5 ns/op are marked `suspicious_micro` unless the benchmark metadata includes `validated_micro = "true"`.
 
 ## Configuration
 
@@ -132,13 +159,14 @@ Command-line arguments override `STRESS_*` environment variables, which override
 | `STRESS_FILTER` | Benchmark name/module filter |
 | `STRESS_TIER` | Exact tier filter |
 | `STRESS_OUTPUT_DIR` | Artifact output directory |
-| `STRESS_VERBOSE` | Console output |
+| `STRESS_CONSOLE` | Console mode: `default`, `verbose`, `quiet`, `json`, or `markdown` |
 | `STRESS_INCLUDE_IGNORED` | Include ignored benchmarks |
-| `STRESS_BASELINE` | v2 baseline artifact |
+| `STRESS_BASELINE` | Baseline stress artifact |
 | `STRESS_THRESHOLD` | Regression threshold |
 | `STRESS_GIT_SHA` | Git SHA override |
 | `STRESS_SAMPLE_DURATION_MS` | Fixed-duration sample budget |
 | `STRESS_OPERATIONS_PER_SAMPLE` | Fixed-operations sample size |
+| `STRESS_MICRO_SAMPLE_DURATION_MS` | Micro sample target duration |
 
 Harness options:
 
@@ -148,6 +176,18 @@ cargo bench --bench storage_stress -- --samples 10 --warmup-samples 1
 cargo bench --bench storage_stress -- --baseline target/stress/storage_stress/latest.json
 cargo bench --bench storage_stress -- --print-config
 ```
+
+Console modes:
+
+```bash
+cargo bench --bench storage_stress -- --console default
+cargo bench --bench storage_stress -- --console verbose
+cargo bench --bench storage_stress -- --console quiet
+cargo bench --bench storage_stress -- --console json
+cargo bench --bench storage_stress -- --console markdown
+```
+
+The default console output is a compact decision surface: grouped benchmark rows, `ns/op` for Tier 1 micro rows, optional allocation and overhead columns, quality labels, baseline deltas, summary counts, and a needs-attention block. Throughput percentile columns are sample-throughput percentiles, not operation latency percentiles.
 
 ## Artifacts
 

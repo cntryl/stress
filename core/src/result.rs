@@ -1,4 +1,4 @@
-//! Raw-sample result types and v2 artifact helpers.
+//! Raw-sample result types and current artifact helpers.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -6,8 +6,8 @@ use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
-/// Authoritative JSON schema version for cntryl-stress v0.3 artifacts.
-pub const SCHEMA_VERSION: &str = "cntryl-stress.v2";
+/// Authoritative JSON schema version for current cntryl-stress artifacts.
+pub const SCHEMA_VERSION: &str = "cntryl-stress.v1";
 
 /// Benchmark run profile. The default profile is the trustworthy release gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -49,6 +49,8 @@ impl std::str::FromStr for RunProfile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum BenchmarkModeKind {
+    /// Calibrated batched microbenchmark samples.
+    Micro,
     /// Execute a fixed number of operations for each sample.
     #[default]
     FixedOperations,
@@ -59,6 +61,7 @@ pub enum BenchmarkModeKind {
 impl fmt::Display for BenchmarkModeKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Micro => f.write_str("micro"),
             Self::FixedOperations => f.write_str("fixed_operations"),
             Self::FixedDuration => f.write_str("fixed_duration"),
         }
@@ -70,6 +73,7 @@ impl std::str::FromStr for BenchmarkModeKind {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
+            "micro" => Ok(Self::Micro),
             "fixed_operations" => Ok(Self::FixedOperations),
             "fixed_duration" => Ok(Self::FixedDuration),
             other => Err(format!("unknown benchmark mode '{other}'")),
@@ -81,6 +85,12 @@ impl std::str::FromStr for BenchmarkModeKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BenchmarkMode {
+    /// Calibrate a batched sample to a target wall-clock duration.
+    Micro {
+        /// Target wall-clock duration for each measured batch.
+        #[serde(with = "duration_serde")]
+        target_sample_duration: Duration,
+    },
     /// Run until `sample_duration` elapses.
     FixedDuration {
         /// Wall-clock duration per sample.
@@ -99,6 +109,7 @@ impl BenchmarkMode {
     #[must_use]
     pub const fn kind(&self) -> BenchmarkModeKind {
         match self {
+            Self::Micro { .. } => BenchmarkModeKind::Micro,
             Self::FixedDuration { .. } => BenchmarkModeKind::FixedDuration,
             Self::FixedOperations { .. } => BenchmarkModeKind::FixedOperations,
         }
@@ -158,8 +169,8 @@ pub enum PrimaryMetric {
     Throughput,
     /// p95 latency in nanoseconds. Lower is better.
     LatencyP95,
-    /// Elapsed nanoseconds per completed operation. Lower is better.
-    ElapsedPerOperation,
+    /// Net nanoseconds per completed operation. Lower is better.
+    NsPerOp,
 }
 
 impl PrimaryMetric {
@@ -168,6 +179,61 @@ impl PrimaryMetric {
     pub const fn higher_is_better(self) -> bool {
         matches!(self, Self::Throughput)
     }
+}
+
+/// Per-benchmark budget gates.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub struct BenchmarkBudgets {
+    /// Maximum net nanoseconds per operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_ns_per_op: Option<f64>,
+    /// Maximum allocations per operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_allocs_per_op: Option<f64>,
+    /// Maximum allocated bytes per operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes_per_op: Option<f64>,
+    /// Maximum lower-is-better regression percentage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_regression_pct: Option<f64>,
+    /// Maximum relative standard deviation percentage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rsd_pct: Option<f64>,
+}
+
+impl BenchmarkBudgets {
+    /// Whether allocation counters are required by this budget.
+    #[must_use]
+    pub const fn requires_allocation_tracking(self) -> bool {
+        self.max_allocs_per_op.is_some() || self.max_bytes_per_op.is_some()
+    }
+
+    /// Whether at least one budget is set.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.max_ns_per_op.is_none()
+            && self.max_allocs_per_op.is_none()
+            && self.max_bytes_per_op.is_none()
+            && self.max_regression_pct.is_none()
+            && self.max_rsd_pct.is_none()
+    }
+}
+
+/// Result for one budget gate on one benchmark summary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BudgetResult {
+    /// Budget metric name.
+    pub metric: String,
+    /// Configured budget limit.
+    pub limit: f64,
+    /// Observed value when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual: Option<f64>,
+    /// Whether the observed value satisfied the budget.
+    pub passed: bool,
+    /// Failure detail when the value was unavailable or over budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Closed 95% confidence interval around the mean.
@@ -358,7 +424,7 @@ pub struct EnvironmentInfo {
 }
 
 impl EnvironmentInfo {
-    /// Construct an explicit unknown environment for imports/tests.
+    /// Construct an explicit unknown environment for fallback paths and tests.
     #[must_use]
     pub fn unknown(profile_config: ProfileConfig) -> Self {
         Self {
@@ -400,6 +466,9 @@ pub struct ProfileConfig {
     pub sample_duration: Duration,
     /// Default fixed-operations sample size.
     pub operations_per_sample: u64,
+    /// Target duration for calibrated micro samples.
+    #[serde(with = "duration_serde")]
+    pub micro_sample_duration: Duration,
     /// Report depth label.
     pub report_depth: String,
 }
@@ -417,6 +486,7 @@ impl Default for ProfileConfig {
             regression_threshold: 0.05,
             sample_duration: Duration::from_secs(1),
             operations_per_sample: 1,
+            micro_sample_duration: Duration::from_millis(100),
             report_depth: "gated".to_string(),
         }
     }
@@ -429,10 +499,13 @@ pub struct BenchmarkSpec {
     pub id: String,
     /// Display name.
     pub name: String,
-    /// Numeric tier. Tier 1 is intentionally out of scope.
+    /// Numeric tier.
     pub tier: u32,
     /// Concrete execution mode.
     pub mode: BenchmarkMode,
+    /// Budget gates for this benchmark.
+    #[serde(default)]
+    pub budgets: BenchmarkBudgets,
     /// Structured sweep/scaling parameters.
     pub parameters: BTreeMap<String, String>,
     /// Descriptive benchmark metadata.
@@ -456,6 +529,39 @@ pub struct Sample {
     pub operations_completed: u64,
     /// Completed operations per second.
     pub throughput: f64,
+    /// Calibrated operation count for micro samples.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibrated_iterations: Option<u64>,
+    /// Gross measured batch duration in nanoseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gross_elapsed_ns: Option<u128>,
+    /// Empty-loop overhead for the batch in nanoseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overhead_ns: Option<u128>,
+    /// Net batch duration after subtracting overhead in nanoseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_elapsed_ns: Option<u128>,
+    /// Gross nanoseconds per operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gross_ns_per_op: Option<f64>,
+    /// Empty-loop overhead nanoseconds per operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overhead_ns_per_op: Option<f64>,
+    /// Net nanoseconds per operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_ns_per_op: Option<f64>,
+    /// Allocations observed in this measured operation batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocs: Option<u64>,
+    /// Allocated bytes observed in this measured operation batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    /// Allocations per operation when allocation tracking is installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocs_per_op: Option<f64>,
+    /// Allocated bytes per operation when allocation tracking is installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_per_op: Option<f64>,
     /// Optional raw latency observations in nanoseconds.
     pub latency_ns: Vec<u128>,
     /// Structured parameters active for this sample.
@@ -469,8 +575,11 @@ pub struct Sample {
 impl Sample {
     /// Whether this sample has valid timing.
     #[must_use]
-    pub const fn has_valid_timing(&self) -> bool {
+    pub fn has_valid_timing(&self) -> bool {
         self.elapsed_ns != 0
+            && self
+                .net_ns_per_op
+                .is_none_or(|value| value.is_finite() && value > 0.0)
     }
 
     /// Whether this sample passed correctness checks.
@@ -510,8 +619,32 @@ pub struct BenchmarkSummary {
     pub cooldown_samples: usize,
     /// Summary statistics from measured samples only.
     pub stats: Option<SummaryStats>,
+    /// Net nanoseconds per operation statistics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ns_per_op: Option<SummaryStats>,
+    /// Gross nanoseconds per operation statistics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gross_ns_per_op: Option<SummaryStats>,
+    /// Empty-loop overhead nanoseconds per operation statistics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overhead_ns_per_op: Option<SummaryStats>,
+    /// Allocations per operation statistics when tracked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocs_per_op: Option<SummaryStats>,
+    /// Allocated bytes per operation statistics when tracked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_per_op: Option<SummaryStats>,
     /// Quality classification.
     pub quality: QualityClass,
+    /// Budget gates copied from the spec.
+    #[serde(default)]
+    pub budgets: BenchmarkBudgets,
+    /// Budget results derived from measured samples.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub budget_results: Vec<BudgetResult>,
+    /// Machine-readable quality and attention flags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flags: Vec<String>,
     /// Correctness summary from measured samples.
     pub correctness: CorrectnessSummary,
     /// Structured parameters.
@@ -526,7 +659,7 @@ impl BenchmarkSummary {
     pub fn primary_value(&self) -> Option<f64> {
         let stats = self.stats.as_ref()?;
         match self.primary_metric {
-            PrimaryMetric::Throughput | PrimaryMetric::ElapsedPerOperation => Some(stats.mean),
+            PrimaryMetric::Throughput | PrimaryMetric::NsPerOp => Some(stats.mean),
             PrimaryMetric::LatencyP95 => Some(stats.p95),
         }
     }
@@ -571,10 +704,10 @@ pub struct ComparisonResult {
     pub classification: ComparisonClass,
 }
 
-/// Complete v2 run artifact.
+/// Complete current run artifact.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StressRun {
-    /// Schema version. Always `cntryl-stress.v2` for new artifacts.
+    /// Schema version. Always `cntryl-stress.v1` for new artifacts.
     pub schema_version: String,
     /// cntryl-stress version.
     pub tool_version: String,
@@ -601,7 +734,7 @@ pub struct StressRun {
 }
 
 impl StressRun {
-    /// Load a v2 artifact.
+    /// Load a current artifact.
     ///
     /// # Errors
     ///
@@ -612,11 +745,11 @@ impl StressRun {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
-    /// Parse a v2 artifact.
+    /// Parse a current artifact.
     ///
     /// # Errors
     ///
-    /// Returns a serde error when JSON is invalid or cannot be imported.
+    /// Returns a serde error when JSON is invalid or uses a different schema.
     pub fn from_json_str(content: &str) -> Result<Self, serde_json::Error> {
         let run: Self = serde_json::from_str(content)?;
         if run.schema_version == SCHEMA_VERSION {
@@ -653,6 +786,17 @@ impl StressRun {
             .filter(|comparison| comparison.classification == ComparisonClass::Regression)
             .collect()
     }
+
+    /// Whether every measured summary passed configured budgets.
+    #[must_use]
+    pub fn budgets_passed(&self) -> bool {
+        self.summaries.iter().all(|summary| {
+            summary
+                .budget_results
+                .iter()
+                .all(|budget_result| budget_result.passed)
+        })
+    }
 }
 
 /// Summarize one benchmark from raw samples.
@@ -672,13 +816,41 @@ pub fn summarize_benchmark(spec: &BenchmarkSpec, samples: &[Sample]) -> Benchmar
         .count();
     let correctness = summarize_correctness(&measured);
     let primary_metric = infer_primary_metric(spec, &measured);
+    let ns_per_op = SummaryStats::from_values(&per_op_values(&measured, |sample| {
+        sample.net_ns_per_op.or_else(|| elapsed_ns_per_op(sample))
+    }));
+    let gross_ns_per_op =
+        SummaryStats::from_values(&per_op_values(&measured, |sample| sample.gross_ns_per_op));
+    let overhead_ns_per_op = SummaryStats::from_values(&per_op_values(&measured, |sample| {
+        sample.overhead_ns_per_op
+    }));
+    let allocs_per_op =
+        SummaryStats::from_values(&per_op_values(&measured, |sample| sample.allocs_per_op));
+    let bytes_per_op =
+        SummaryStats::from_values(&per_op_values(&measured, |sample| sample.bytes_per_op));
     let values = primary_values(primary_metric, &measured);
     let stats = SummaryStats::from_values(&values);
+    let budget_results = evaluate_budgets(
+        spec.budgets,
+        stats.as_ref(),
+        ns_per_op.as_ref(),
+        allocs_per_op.as_ref(),
+        bytes_per_op.as_ref(),
+    );
+    let flags = summary_flags(
+        spec,
+        &measured,
+        ns_per_op.as_ref(),
+        overhead_ns_per_op.as_ref(),
+        &budget_results,
+    );
     let quality = classify_quality(
         measured.len(),
         stats.as_ref(),
         correctness.passed,
         &measured,
+        &flags,
+        &budget_results,
     );
 
     BenchmarkSummary {
@@ -690,7 +862,15 @@ pub fn summarize_benchmark(spec: &BenchmarkSpec, samples: &[Sample]) -> Benchmar
         warmup_samples,
         cooldown_samples,
         stats,
+        ns_per_op,
+        gross_ns_per_op,
+        overhead_ns_per_op,
+        allocs_per_op,
+        bytes_per_op,
         quality,
+        budgets: spec.budgets,
+        budget_results,
+        flags,
         correctness,
         parameters: merged_parameters(spec, &measured),
         metadata: spec.metadata.clone(),
@@ -730,6 +910,10 @@ fn compare_one_summary(
     baseline: Option<&BenchmarkSummary>,
     threshold: f64,
 ) -> ComparisonResult {
+    let threshold = current
+        .budgets
+        .max_regression_pct
+        .map_or(threshold, |pct| pct / 100.0);
     let Some(baseline) = baseline else {
         return ComparisonResult {
             benchmark_id: current.benchmark_id.clone(),
@@ -744,7 +928,6 @@ fn compare_one_summary(
             classification: ComparisonClass::MissingBaseline,
         };
     };
-
     let baseline_value = baseline.primary_value();
     let current_value = current.primary_value();
     let change_percent = baseline_value
@@ -855,6 +1038,9 @@ fn summarize_correctness(samples: &[&Sample]) -> CorrectnessSummary {
 }
 
 fn infer_primary_metric(spec: &BenchmarkSpec, samples: &[&Sample]) -> PrimaryMetric {
+    if spec.mode.kind() == BenchmarkModeKind::Micro {
+        return PrimaryMetric::NsPerOp;
+    }
     if spec
         .metadata
         .get("primary_metric")
@@ -869,7 +1055,7 @@ fn infer_primary_metric(spec: &BenchmarkSpec, samples: &[&Sample]) -> PrimaryMet
     {
         PrimaryMetric::Throughput
     } else {
-        PrimaryMetric::ElapsedPerOperation
+        PrimaryMetric::NsPerOp
     }
 }
 
@@ -881,17 +1067,150 @@ fn primary_values(metric: PrimaryMetric, samples: &[&Sample]) -> Vec<f64> {
             .iter()
             .flat_map(|sample| sample.latency_ns.iter().map(|latency| *latency as f64))
             .collect(),
-        PrimaryMetric::ElapsedPerOperation => samples
+        PrimaryMetric::NsPerOp => samples
             .iter()
-            .filter_map(|sample| {
-                if sample.operations_completed == 0 {
-                    None
-                } else {
-                    Some(sample.elapsed_ns as f64 / sample.operations_completed as f64)
-                }
-            })
+            .filter_map(|sample| sample.net_ns_per_op.or_else(|| elapsed_ns_per_op(sample)))
             .collect(),
     }
+}
+
+fn per_op_values<F>(samples: &[&Sample], mut value_for: F) -> Vec<f64>
+where
+    F: FnMut(&Sample) -> Option<f64>,
+{
+    samples
+        .iter()
+        .filter_map(|sample| value_for(sample))
+        .filter(|value| value.is_finite())
+        .collect()
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn elapsed_ns_per_op(sample: &Sample) -> Option<f64> {
+    (sample.operations_completed != 0)
+        .then(|| sample.elapsed_ns as f64 / sample.operations_completed as f64)
+        .filter(|value| value.is_finite())
+}
+
+fn evaluate_budgets(
+    budgets: BenchmarkBudgets,
+    primary_stats: Option<&SummaryStats>,
+    ns_per_op: Option<&SummaryStats>,
+    allocs_per_op: Option<&SummaryStats>,
+    bytes_per_op: Option<&SummaryStats>,
+) -> Vec<BudgetResult> {
+    let mut results = Vec::new();
+    push_max_budget(
+        &mut results,
+        "max_ns_per_op",
+        budgets.max_ns_per_op,
+        ns_per_op.map(|stats| stats.mean),
+    );
+    push_max_budget(
+        &mut results,
+        "max_allocs_per_op",
+        budgets.max_allocs_per_op,
+        allocs_per_op.map(|stats| stats.mean),
+    );
+    push_max_budget(
+        &mut results,
+        "max_bytes_per_op",
+        budgets.max_bytes_per_op,
+        bytes_per_op.map(|stats| stats.mean),
+    );
+    push_max_budget(
+        &mut results,
+        "max_rsd_pct",
+        budgets.max_rsd_pct,
+        primary_stats.map(|stats| stats.relative_std_dev * 100.0),
+    );
+    results
+}
+
+fn push_max_budget(
+    results: &mut Vec<BudgetResult>,
+    metric: &'static str,
+    limit: Option<f64>,
+    actual: Option<f64>,
+) {
+    let Some(limit) = limit else {
+        return;
+    };
+    let passed = actual.is_some_and(|actual| actual <= limit);
+    results.push(BudgetResult {
+        metric: metric.to_string(),
+        limit,
+        actual,
+        passed,
+        reason: (!passed).then(|| match actual {
+            Some(actual) => format!("{actual:.4} exceeds {limit:.4}"),
+            None => "required measurement is unavailable".to_string(),
+        }),
+    });
+}
+
+fn summary_flags(
+    spec: &BenchmarkSpec,
+    samples: &[&Sample],
+    ns_per_op: Option<&SummaryStats>,
+    overhead_ns_per_op: Option<&SummaryStats>,
+    budget_results: &[BudgetResult],
+) -> Vec<String> {
+    let mut flags = Vec::new();
+    if samples.iter().any(|sample| !sample.has_valid_timing()) {
+        flags.push("invalid_timing".to_string());
+    }
+    if samples
+        .iter()
+        .any(|sample| sample.operations_completed == 0)
+    {
+        flags.push("zero_completed_ops".to_string());
+    }
+    if has_overhead_dominant_sample(samples, overhead_ns_per_op) {
+        flags.push("overhead_dominant".to_string());
+    }
+    if spec.budgets.requires_allocation_tracking()
+        && samples
+            .iter()
+            .any(|sample| sample.allocs_per_op.is_none() || sample.bytes_per_op.is_none())
+    {
+        flags.push("allocation_tracking_required".to_string());
+    }
+    if budget_results.iter().any(|result| !result.passed) {
+        flags.push("budget_failed".to_string());
+    }
+    if spec.mode.kind() == BenchmarkModeKind::Micro
+        && !micro_is_validated(spec)
+        && ns_per_op.is_some_and(|stats| stats.mean < 5.0)
+    {
+        flags.push("suspicious_micro".to_string());
+    }
+    flags
+}
+
+fn has_overhead_dominant_sample(
+    samples: &[&Sample],
+    overhead_stats: Option<&SummaryStats>,
+) -> bool {
+    samples.iter().any(|sample| {
+        sample
+            .overhead_ns_per_op
+            .zip(sample.net_ns_per_op)
+            .is_some_and(|(overhead, net)| overhead >= net)
+    }) || overhead_stats.is_some_and(|stats| stats.mean > 0.0)
+        && samples.iter().any(|sample| {
+            sample
+                .overhead_ns_per_op
+                .zip(sample.gross_ns_per_op)
+                .is_some_and(|(overhead, gross)| gross > 0.0 && overhead / gross >= 0.5)
+        })
+}
+
+fn micro_is_validated(spec: &BenchmarkSpec) -> bool {
+    spec.metadata
+        .get("validated_micro")
+        .or_else(|| spec.metadata.get("micro_validated"))
+        .is_some_and(|value| value == "true")
 }
 
 fn classify_quality(
@@ -899,9 +1218,22 @@ fn classify_quality(
     stats: Option<&SummaryStats>,
     correctness_passed: bool,
     samples: &[&Sample],
+    flags: &[String],
+    budget_results: &[BudgetResult],
 ) -> QualityClass {
     if !correctness_passed
         || measured_samples < 2
+        || budget_results.iter().any(|result| !result.passed)
+        || flags.iter().any(|flag| {
+            matches!(
+                flag.as_str(),
+                "invalid_timing"
+                    | "zero_completed_ops"
+                    | "overhead_dominant"
+                    | "allocation_tracking_required"
+                    | "budget_failed"
+            )
+        })
         || samples.iter().any(|sample| {
             !sample.has_valid_timing()
                 || sample.operations_completed == 0
@@ -979,6 +1311,21 @@ mod tests {
             mode: BenchmarkMode::FixedOperations {
                 operations_per_sample: 1,
             },
+            budgets: BenchmarkBudgets::default(),
+            parameters: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    fn micro_spec(id: &str) -> BenchmarkSpec {
+        BenchmarkSpec {
+            id: id.to_string(),
+            name: id.to_string(),
+            tier: 1,
+            mode: BenchmarkMode::Micro {
+                target_sample_duration: Duration::from_millis(100),
+            },
+            budgets: BenchmarkBudgets::default(),
             parameters: BTreeMap::new(),
             metadata: BTreeMap::new(),
         }
@@ -1000,6 +1347,17 @@ mod tests {
             operations_attempted: completed,
             operations_completed: completed,
             throughput,
+            calibrated_iterations: None,
+            gross_elapsed_ns: None,
+            overhead_ns: None,
+            net_elapsed_ns: None,
+            gross_ns_per_op: None,
+            overhead_ns_per_op: None,
+            net_ns_per_op: None,
+            allocs: None,
+            bytes: None,
+            allocs_per_op: None,
+            bytes_per_op: None,
             latency_ns: Vec::new(),
             parameters: BTreeMap::new(),
             counters: CorrectnessCounters {
@@ -1009,6 +1367,24 @@ mod tests {
             },
             environment: test_env(),
         }
+    }
+
+    fn micro_sample(id: &str, sample_number: usize, net_ns_per_op: u32) -> Sample {
+        let mut sample = sample(
+            id,
+            SamplePhase::Measured,
+            sample_number,
+            u128::from(net_ns_per_op),
+        );
+        let net_ns_per_op = f64::from(net_ns_per_op);
+        sample.calibrated_iterations = Some(100);
+        sample.gross_elapsed_ns = Some(1_200);
+        sample.overhead_ns = Some(200);
+        sample.net_elapsed_ns = Some(1_000);
+        sample.gross_ns_per_op = Some(12.0);
+        sample.overhead_ns_per_op = Some(2.0);
+        sample.net_ns_per_op = Some(net_ns_per_op);
+        sample
     }
 
     #[test]
@@ -1062,6 +1438,58 @@ mod tests {
         assert_close(summary.stats.as_ref().expect("stats").p50, 101.0);
         assert_close(summary.stats.as_ref().expect("stats").p95, 190.0);
         assert_close(summary.stats.as_ref().expect("stats").p99, 198.0);
+    }
+
+    #[test]
+    fn micro_summary_uses_net_ns_per_op_and_flags_suspicious_rows() {
+        let spec = micro_spec("hot_path");
+        let samples = (0..5)
+            .map(|i| micro_sample("hot_path", i, 4))
+            .collect::<Vec<_>>();
+
+        let summary = summarize_benchmark(&spec, &samples);
+
+        assert_eq!(summary.primary_metric, PrimaryMetric::NsPerOp);
+        assert_close(summary.primary_value().expect("value"), 4.0);
+        assert_eq!(summary.quality, QualityClass::Acceptable);
+        assert!(summary.flags.contains(&"suspicious_micro".to_string()));
+        assert_close(summary.overhead_ns_per_op.expect("overhead").mean, 2.0);
+    }
+
+    #[test]
+    fn failed_absolute_budget_makes_summary_untrustworthy() {
+        let mut spec = micro_spec("budgeted");
+        spec.budgets.max_ns_per_op = Some(10.0);
+        let samples = (0..5)
+            .map(|i| micro_sample("budgeted", i, 20))
+            .collect::<Vec<_>>();
+
+        let summary = summarize_benchmark(&spec, &samples);
+
+        assert_eq!(summary.quality, QualityClass::Untrustworthy);
+        assert!(summary.flags.contains(&"budget_failed".to_string()));
+        assert_eq!(summary.budget_results.len(), 1);
+        assert!(!summary.budget_results[0].passed);
+    }
+
+    #[test]
+    fn allocation_budgets_require_allocation_tracking() {
+        let mut spec = micro_spec("alloc_budget");
+        spec.budgets.max_allocs_per_op = Some(0.0);
+        let samples = (0..5)
+            .map(|i| micro_sample("alloc_budget", i, 20))
+            .collect::<Vec<_>>();
+
+        let summary = summarize_benchmark(&spec, &samples);
+
+        assert_eq!(summary.quality, QualityClass::Untrustworthy);
+        assert!(summary
+            .flags
+            .contains(&"allocation_tracking_required".to_string()));
+        assert!(summary
+            .budget_results
+            .iter()
+            .any(|result| !result.passed && result.metric == "max_allocs_per_op"));
     }
 
     #[test]
@@ -1165,6 +1593,48 @@ mod tests {
     }
 
     #[test]
+    fn comparison_uses_summary_regression_budget_threshold() {
+        let mut baseline = summarize_benchmark(
+            &micro_spec("hot_path"),
+            &(0..10)
+                .map(|i| micro_sample("hot_path", i, 100))
+                .collect::<Vec<_>>(),
+        );
+        let mut current_spec = micro_spec("hot_path");
+        current_spec.budgets.max_regression_pct = Some(1.0);
+        let mut current = summarize_benchmark(
+            &current_spec,
+            &(0..10)
+                .map(|i| micro_sample("hot_path", i, 102))
+                .collect::<Vec<_>>(),
+        );
+        baseline
+            .stats
+            .as_mut()
+            .expect("stats")
+            .confidence_interval_95 = ConfidenceInterval {
+            lower: 99.0,
+            upper: 100.0,
+        };
+        current
+            .stats
+            .as_mut()
+            .expect("stats")
+            .confidence_interval_95 = ConfidenceInterval {
+            lower: 102.0,
+            upper: 103.0,
+        };
+
+        let comparison = compare_summaries(&[current], &[baseline], 0.05)
+            .into_iter()
+            .next()
+            .expect("comparison");
+
+        assert!((comparison.threshold - 0.01).abs() < f64::EPSILON);
+        assert_eq!(comparison.classification, ComparisonClass::Regression);
+    }
+
+    #[test]
     fn comparison_detects_meaningful_improvement() {
         let mut baseline = summarize_benchmark(
             &spec("bench"),
@@ -1202,7 +1672,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_json_contains_schema_version() {
+    fn json_contains_schema_version() {
         let profile_config = ProfileConfig::default();
         let run = StressRun {
             schema_version: SCHEMA_VERSION.to_string(),
@@ -1223,13 +1693,6 @@ mod tests {
 
         assert_eq!(json["schema_version"], SCHEMA_VERSION);
         assert_eq!(json["samples"].as_array().expect("samples").len(), 0);
-    }
-
-    #[test]
-    fn old_aggregate_json_is_not_accepted() {
-        let old = r#"{"suite": "old", "results": []}"#;
-
-        assert!(StressRun::from_json_str(old).is_err());
     }
 
     #[test]
