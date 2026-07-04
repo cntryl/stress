@@ -207,6 +207,8 @@ pub fn run_from_env_and_args() {
         eprintln!("Warning: {warning}");
     }
 
+    exit_on_invalid_config(&resolved.config);
+
     if resolved.print_config {
         print_resolved_config(&get_suite_name(), &resolved);
         return;
@@ -350,7 +352,10 @@ fn resolve_from_binary_args_with<F>(args: &StressBinaryArgs, get_var: F) -> Reso
 where
     F: Fn(&str) -> Option<String>,
 {
-    let env_resolution = StressRunnerConfig::resolve_from_env_with(&get_var);
+    let env_resolution = StressRunnerConfig::resolve_from_env_with_profile_override(
+        &get_var,
+        args.profile.map(|profile| (profile, "cli --profile")),
+    );
     let mut config = env_resolution.config;
     let mut metadata = env_resolution
         .metadata
@@ -379,10 +384,6 @@ where
         source_for(&get_var, "STRESS_BASELINE"),
     );
 
-    if let Some(profile) = args.profile {
-        config = config.profile(profile);
-        metadata.insert("profile_src".to_string(), "cli --profile".to_string());
-    }
     if let Some(tier) = args.tier {
         config.tier = Some(tier);
         metadata.insert("tier_src".to_string(), "cli --tier".to_string());
@@ -447,15 +448,23 @@ where
     }
 }
 
+fn exit_on_invalid_config(config: &StressRunnerConfig) {
+    let errors = config.validation_errors();
+    if errors.is_empty() {
+        return;
+    }
+
+    eprintln!("Invalid stress config: {}", errors.join("; "));
+    std::process::exit(1);
+}
+
 fn run_with_resolved_config(resolved: ResolvedStressConfig) {
+    exit_on_invalid_config(&resolved.config);
+
     let benchmarks = selected_benchmarks(&resolved);
     if benchmarks.is_empty() {
-        if resolved.workload.is_some() {
-            eprintln!("No benchmarks matched the workload pattern");
-        } else {
-            eprintln!("No benchmarks registered. Add #[stress_test] to benchmark functions.");
-        }
-        return;
+        eprintln!("{}", empty_selection_error(&resolved));
+        std::process::exit(1);
     }
 
     let suite_name = get_suite_name();
@@ -501,6 +510,14 @@ fn run_with_resolved_config(resolved: ResolvedStressConfig) {
             eprintln!("Stress run failed to load baseline: {error}");
             std::process::exit(1);
         }
+    }
+}
+
+fn empty_selection_error(resolved: &ResolvedStressConfig) -> &'static str {
+    if resolved.workload.is_some() {
+        "No benchmarks matched the workload pattern"
+    } else {
+        "No benchmarks registered. Add #[stress_test] to benchmark functions."
     }
 }
 
@@ -636,7 +653,14 @@ fn print_resolved_config(suite: &str, resolved: &ResolvedStressConfig) {
             .get("baseline_src")
             .map_or("unknown", String::as_str)
     );
-    println!("Threshold: {}", resolved.config.threshold);
+    println!(
+        "Threshold: {} ({})",
+        resolved.config.threshold,
+        resolved
+            .metadata
+            .get("threshold_src")
+            .map_or("unknown", String::as_str)
+    );
 }
 
 fn source_for<F>(get_var: &F, env_key: &'static str) -> String
@@ -760,6 +784,52 @@ mod tests {
         assert_eq!(
             resolved.metadata.get("samples_src"),
             Some(&"cli --samples".to_string())
+        );
+    }
+
+    #[test]
+    fn cli_profile_is_base_before_env_overrides() {
+        let args = StressBinaryArgs {
+            profile: Some(RunProfile::Lab),
+            ..StressBinaryArgs::default()
+        };
+        let env = BTreeMap::from([
+            ("STRESS_PROFILE", "release".to_string()),
+            ("STRESS_SAMPLES", "3".to_string()),
+            ("STRESS_THRESHOLD", "0.20".to_string()),
+        ]);
+
+        let resolved = resolve_from_binary_args_with(&args, |key| env.get(key).cloned());
+
+        assert_eq!(resolved.config.profile, RunProfile::Lab);
+        assert_eq!(resolved.config.samples, 3);
+        assert!((resolved.config.threshold - 0.20).abs() < f64::EPSILON);
+        assert_eq!(
+            resolved.metadata.get("profile_src"),
+            Some(&"cli --profile".to_string())
+        );
+        assert_eq!(
+            resolved.metadata.get("samples_src"),
+            Some(&"env STRESS_SAMPLES".to_string())
+        );
+        assert_eq!(
+            resolved.metadata.get("threshold_src"),
+            Some(&"env STRESS_THRESHOLD".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_workload_selection_has_fatal_error_message() {
+        let args = StressBinaryArgs {
+            workload: Some("definitely_no_such_benchmark".to_string()),
+            ..StressBinaryArgs::default()
+        };
+        let resolved = resolve_from_binary_args_with(&args, |_| None);
+
+        assert!(selected_benchmarks(&resolved).is_empty());
+        assert_eq!(
+            empty_selection_error(&resolved),
+            "No benchmarks matched the workload pattern"
         );
     }
 }

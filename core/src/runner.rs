@@ -27,24 +27,46 @@ pub struct StressRunner {
 
 impl StressRunner {
     /// Create a runner from `STRESS_*` environment configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the resolved config has zero measured samples or zero
+    /// fixed-operations sample size.
     #[must_use]
     pub fn new(suite: &str) -> Self {
         Self::with_config(suite, StressRunnerConfig::from_env())
     }
 
     /// Create a runner with explicit config.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the config has zero measured samples or zero fixed-operations
+    /// sample size.
     #[must_use]
     pub fn with_config(suite: &str, config: StressRunnerConfig) -> Self {
         Self::with_config_and_metadata(suite, config, BTreeMap::new())
     }
 
     /// Create a runner with explicit config and run metadata.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the config has zero measured samples or zero fixed-operations
+    /// sample size.
     #[must_use]
     pub fn with_config_and_metadata(
         suite: &str,
         config: StressRunnerConfig,
         metadata: BTreeMap<String, String>,
     ) -> Self {
+        let validation_errors = config.validation_errors();
+        assert!(
+            validation_errors.is_empty(),
+            "invalid stress config: {}",
+            validation_errors.join("; ")
+        );
+
         let environment = capture_environment(&config);
         let announce_artifacts =
             matches!(config.console, ConsoleMode::Default | ConsoleMode::Verbose);
@@ -260,14 +282,11 @@ impl StressRunner {
             micro.and_then(|micro| ns_per_op(micro.overhead.as_nanos(), micro.iterations));
         let net_ns_per_op =
             micro.and_then(|micro| ns_per_op(micro.net_elapsed.as_nanos(), micro.iterations));
-        let allocs = micro.and_then(|micro| micro.allocs);
-        let bytes = micro.and_then(|micro| micro.bytes);
-        let allocs_per_op = allocs
-            .zip(calibrated_iterations)
-            .and_then(|(allocs, iterations)| count_per_op(allocs, iterations));
-        let bytes_per_op = bytes
-            .zip(calibrated_iterations)
-            .and_then(|(bytes, iterations)| count_per_op(bytes, iterations));
+        let allocation = ctx.allocation;
+        let allocs = allocation.map(|allocation| allocation.allocs);
+        let bytes = allocation.map(|allocation| allocation.bytes);
+        let allocs_per_op = allocs.and_then(|allocs| count_per_op(allocs, operations_completed));
+        let bytes_per_op = bytes.and_then(|bytes| count_per_op(bytes, operations_completed));
 
         Sample {
             benchmark_id: spec.id.clone(),
@@ -596,6 +615,82 @@ mod tests {
         assert!(sample.net_ns_per_op.expect("ns/op") >= 0.0);
         assert_eq!(summary.primary_metric, PrimaryMetric::NsPerOp);
         assert!(summary.ns_per_op.is_some());
+    }
+
+    fn run_allocating_fixed_operation(budgets: BenchmarkBudgets) -> StressRun {
+        let config = StressRunnerConfig::for_profile(RunProfile::Smoke)
+            .samples(2)
+            .operations_per_sample(2)
+            .verbose(false);
+        let mut runner = StressRunner::with_config("suite", config.clone());
+        runner.reporters(Vec::new());
+        let spec = BenchmarkSpec {
+            id: "suite/allocating".to_string(),
+            name: "allocating".to_string(),
+            tier: 2,
+            mode: config.mode_for_kind(BenchmarkModeKind::FixedOperations),
+            budgets,
+            parameters: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+        };
+
+        runner.run_spec(spec, |ctx| {
+            let _ = ctx.measure_workload(|| {
+                let data = vec![1_u8; 16];
+                std::hint::black_box(data);
+            });
+        });
+        runner.finish()
+    }
+
+    #[test]
+    fn fixed_operation_samples_record_allocation_stats() {
+        let run = run_allocating_fixed_operation(BenchmarkBudgets::default());
+        let measured = run
+            .samples
+            .iter()
+            .filter(|sample| sample.phase == SamplePhase::Measured)
+            .collect::<Vec<_>>();
+
+        assert_eq!(measured.len(), 2);
+        for sample in measured {
+            assert!(sample.allocs.expect("allocs") >= 2);
+            assert!(sample.bytes.expect("bytes") >= 32);
+            assert!(sample.allocs_per_op.expect("allocs/op") > 0.0);
+            assert!(sample.bytes_per_op.expect("bytes/op") > 0.0);
+        }
+        assert!(run.summaries[0].allocs_per_op.is_some());
+        assert!(run.summaries[0].bytes_per_op.is_some());
+    }
+
+    #[test]
+    fn non_micro_allocation_budgets_use_measured_stats() {
+        let passing = run_allocating_fixed_operation(BenchmarkBudgets {
+            max_allocs_per_op: Some(10_000.0),
+            max_bytes_per_op: Some(100_000.0),
+            ..BenchmarkBudgets::default()
+        });
+        assert!(passing.summaries[0]
+            .budget_results
+            .iter()
+            .all(|result| result.passed));
+        assert_eq!(evaluate_run_gate(&passing), RunGate::Passed);
+
+        let failing = run_allocating_fixed_operation(BenchmarkBudgets {
+            max_allocs_per_op: Some(0.0),
+            max_bytes_per_op: Some(0.0),
+            ..BenchmarkBudgets::default()
+        });
+        assert!(failing.summaries[0]
+            .budget_results
+            .iter()
+            .any(|result| !result.passed
+                && result.actual.is_some()
+                && result
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("exceeds"))));
+        assert_eq!(evaluate_run_gate(&failing), RunGate::BudgetFailed);
     }
 
     #[test]

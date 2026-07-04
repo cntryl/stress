@@ -211,19 +211,25 @@ impl StressRunnerConfig {
     where
         F: Fn(&str) -> Option<String>,
     {
-        let mut resolution = EnvConfigResolution::new(Self::for_profile(resolve_profile(
-            &get_var,
-            "STRESS_PROFILE",
-        )));
-        if get_var("STRESS_PROFILE").is_some_and(|value| value.parse::<RunProfile>().is_err()) {
-            resolution
-                .warnings
-                .push("invalid STRESS_PROFILE, using release".to_string());
+        Self::resolve_from_env_with_profile_override(get_var, None)
+    }
+
+    pub(crate) fn resolve_from_env_with_profile_override<F>(
+        get_var: F,
+        profile_override: Option<(RunProfile, &'static str)>,
+    ) -> EnvConfigResolution
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let (profile, profile_source, profile_warning) =
+            resolve_profile(&get_var, "STRESS_PROFILE", profile_override);
+        let mut resolution = EnvConfigResolution::new(Self::for_profile(profile));
+        if let Some(warning) = profile_warning {
+            resolution.warnings.push(warning);
         }
-        resolution.metadata.insert(
-            "profile_src".to_string(),
-            source_for(&get_var, "STRESS_PROFILE"),
-        );
+        resolution
+            .metadata
+            .insert("profile_src".to_string(), profile_source);
         apply_env_overrides(&get_var, &mut resolution);
 
         if resolution.config.git_sha.is_none() {
@@ -237,6 +243,19 @@ impl StressRunnerConfig {
 
         apply_default_sources(&mut resolution.metadata);
         resolution
+    }
+
+    /// Return validation errors that would make a run perform no useful work.
+    #[must_use]
+    pub fn validation_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.samples == 0 {
+            errors.push("samples must be greater than 0".to_string());
+        }
+        if self.operations_per_sample == 0 {
+            errors.push("operations_per_sample must be greater than 0".to_string());
+        }
+        errors
     }
 
     /// Return the profile config embedded in artifacts.
@@ -404,13 +423,29 @@ impl StressRunnerConfig {
     }
 }
 
-fn resolve_profile<F>(get_var: &F, env_key: &'static str) -> RunProfile
+fn resolve_profile<F>(
+    get_var: &F,
+    env_key: &'static str,
+    override_profile: Option<(RunProfile, &'static str)>,
+) -> (RunProfile, String, Option<String>)
 where
     F: Fn(&str) -> Option<String>,
 {
-    get_var(env_key)
-        .and_then(|value| value.parse::<RunProfile>().ok())
-        .unwrap_or_default()
+    if let Some((profile, source)) = override_profile {
+        return (profile, source.to_string(), None);
+    }
+
+    match get_var(env_key) {
+        Some(value) => match value.parse::<RunProfile>() {
+            Ok(profile) => (profile, format!("env {env_key}"), None),
+            Err(_) => (
+                RunProfile::default(),
+                "default".to_string(),
+                Some("invalid STRESS_PROFILE, using release".to_string()),
+            ),
+        },
+        None => (RunProfile::default(), "default".to_string(), None),
+    }
 }
 
 fn apply_env_overrides<F>(get_var: &F, resolution: &mut EnvConfigResolution)
@@ -572,17 +607,6 @@ fn parse_env<F, T, P, A>(
     }
 }
 
-fn source_for<F>(get_var: &F, env_key: &'static str) -> String
-where
-    F: Fn(&str) -> Option<String>,
-{
-    if get_var(env_key).is_some() {
-        format!("env {env_key}")
-    } else {
-        "default".to_string()
-    }
-}
-
 fn apply_default_sources(metadata: &mut HashMap<String, String>) {
     for key in [
         "profile_src",
@@ -715,6 +739,39 @@ mod tests {
         assert_eq!(resolution.config.console, ConsoleMode::Default);
         assert_eq!(resolution.config.timeout, None);
         assert_eq!(resolution.warnings.len(), 3);
+    }
+
+    #[test]
+    fn invalid_profile_source_metadata_matches_default_value() {
+        let env = HashMap::from([("STRESS_PROFILE", "unknown".to_string())]);
+
+        let resolution = StressRunnerConfig::resolve_from_env_with(|key| env.get(key).cloned());
+
+        assert_eq!(resolution.config.profile, RunProfile::Release);
+        assert_eq!(
+            resolution.metadata.get("profile_src"),
+            Some(&"default".to_string())
+        );
+        assert_eq!(
+            resolution.warnings,
+            vec!["invalid STRESS_PROFILE, using release".to_string()]
+        );
+    }
+
+    #[test]
+    fn validation_rejects_no_work_sample_counts() {
+        let mut cfg = StressRunnerConfig::new();
+
+        cfg.samples = 0;
+        cfg.operations_per_sample = 0;
+
+        assert_eq!(
+            cfg.validation_errors(),
+            vec![
+                "samples must be greater than 0".to_string(),
+                "operations_per_sample must be greater than 0".to_string()
+            ]
+        );
     }
 
     #[test]

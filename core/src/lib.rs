@@ -41,6 +41,18 @@ mod report;
 mod result;
 mod runner;
 
+#[cfg(test)]
+#[global_allocator]
+static CNTRYL_STRESS_TEST_ALLOCATOR: allocation::StressAllocator =
+    allocation::StressAllocator::new();
+
+#[cfg(test)]
+#[allow(non_upper_case_globals)]
+#[linkme::distributed_slice(allocation::STRESS_ALLOCATOR_INSTALLATIONS)]
+#[linkme(crate = linkme)]
+static CNTRYL_STRESS_TEST_ALLOCATOR_INSTALLATION: fn() =
+    allocation::stress_allocator_installed_marker;
+
 pub use allocation::StressAllocator;
 pub use config::{ConsoleMode, StressRunnerConfig};
 pub use context::{CorrectnessRecorder, StressContext};

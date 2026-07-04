@@ -19,6 +19,7 @@ pub struct StressContext {
     pub(crate) counters: CorrectnessCounters,
     pub(crate) operations_hint: Option<u64>,
     pub(crate) micro: Option<MicroMeasurement>,
+    pub(crate) allocation: Option<AllocationMeasurement>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -27,8 +28,12 @@ pub(crate) struct MicroMeasurement {
     pub gross_elapsed: Duration,
     pub overhead: Duration,
     pub net_elapsed: Duration,
-    pub allocs: Option<u64>,
-    pub bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AllocationMeasurement {
+    pub allocs: u64,
+    pub bytes: u64,
 }
 
 impl StressContext {
@@ -42,6 +47,7 @@ impl StressContext {
             counters: CorrectnessCounters::default(),
             operations_hint: None,
             micro: None,
+            allocation: None,
         }
     }
 
@@ -90,6 +96,21 @@ impl StressContext {
         }
     }
 
+    fn set_allocation_measurement(&mut self, delta: Option<allocation::AllocationDelta>) {
+        self.allocation = delta.map(|delta| AllocationMeasurement {
+            allocs: delta.allocs,
+            bytes: delta.bytes,
+        });
+    }
+
+    fn require_non_micro_timing_helper(&self, method: &str) {
+        if matches!(self.mode, BenchmarkMode::Micro { .. }) {
+            panic!(
+                "ctx.{method}() cannot be used with mode = \"micro\"; use ctx.measure_micro() or ctx.measure_workload()"
+            );
+        }
+    }
+
     /// Time exactly one sample according to the active [`BenchmarkMode`].
     ///
     /// For `fixed_duration`, the closure is called until the sample duration
@@ -110,6 +131,7 @@ impl StressContext {
                 self.operations_hint.unwrap_or_default()
             }
             BenchmarkMode::FixedDuration { sample_duration } => {
+                let allocation_start = allocation::snapshot();
                 let start = Instant::now();
                 let mut operations = 0_u64;
                 loop {
@@ -119,18 +141,25 @@ impl StressContext {
                         break;
                     }
                 }
-                self.set_duration(start.elapsed());
+                let duration = start.elapsed();
+                let allocation_delta = allocation_start.map(allocation::delta_since);
+                self.set_duration(duration);
+                self.set_allocation_measurement(allocation_delta);
                 self.set_successful_operations_if_unset(operations);
                 operations
             }
             BenchmarkMode::FixedOperations {
                 operations_per_sample,
             } => {
+                let allocation_start = allocation::snapshot();
                 let start = Instant::now();
                 for _ in 0..operations_per_sample {
                     f();
                 }
-                self.set_duration(start.elapsed());
+                let duration = start.elapsed();
+                let allocation_delta = allocation_start.map(allocation::delta_since);
+                self.set_duration(duration);
+                self.set_allocation_measurement(allocation_delta);
                 self.set_successful_operations_if_unset(operations_per_sample);
                 operations_per_sample
             }
@@ -142,9 +171,14 @@ impl StressContext {
     where
         F: FnOnce() -> R,
     {
+        self.require_non_micro_timing_helper("measure");
+        let allocation_start = allocation::snapshot();
         let start = Instant::now();
         let result = f();
-        self.set_duration(start.elapsed());
+        let duration = start.elapsed();
+        let allocation_delta = allocation_start.map(allocation::delta_since);
+        self.set_duration(duration);
+        self.set_allocation_measurement(allocation_delta);
         self.set_successful_operations_if_unset(1);
         result
     }
@@ -178,16 +212,19 @@ impl StressContext {
         let allocation_delta = allocation_start.map(allocation::delta_since);
         let overhead = time_empty_batch(iterations);
         let net_elapsed = gross_elapsed.saturating_sub(overhead);
+        let allocation_measurement = allocation_delta.map(|delta| AllocationMeasurement {
+            allocs: delta.allocs,
+            bytes: delta.bytes,
+        });
 
         self.set_duration(net_elapsed);
         self.set_successful_operations_if_unset(iterations);
+        self.allocation = allocation_measurement;
         self.micro = Some(MicroMeasurement {
             iterations,
             gross_elapsed,
             overhead,
             net_elapsed,
-            allocs: allocation_delta.map(|delta| delta.allocs),
-            bytes: allocation_delta.map(|delta| delta.bytes),
         });
         result
     }
@@ -198,6 +235,8 @@ impl StressContext {
     where
         F: FnMut(),
     {
+        self.require_non_micro_timing_helper("measure_for");
+        let allocation_start = allocation::snapshot();
         let start = Instant::now();
         let mut iterations = 0_usize;
 
@@ -210,7 +249,10 @@ impl StressContext {
             }
         }
 
-        self.set_duration(start.elapsed());
+        let elapsed = start.elapsed();
+        let allocation_delta = allocation_start.map(allocation::delta_since);
+        self.set_duration(elapsed);
+        self.set_allocation_measurement(allocation_delta);
         self.set_successful_operations_if_unset(iterations as u64);
         iterations
     }
@@ -220,9 +262,14 @@ impl StressContext {
     where
         F: FnOnce(&T) -> R,
     {
+        self.require_non_micro_timing_helper("measure_ref");
+        let allocation_start = allocation::snapshot();
         let start = Instant::now();
         let result = f(target);
-        self.set_duration(start.elapsed());
+        let duration = start.elapsed();
+        let allocation_delta = allocation_start.map(allocation::delta_since);
+        self.set_duration(duration);
+        self.set_allocation_measurement(allocation_delta);
         self.set_successful_operations_if_unset(1);
         result
     }
@@ -232,15 +279,21 @@ impl StressContext {
     where
         F: FnOnce(&mut T) -> R,
     {
+        self.require_non_micro_timing_helper("measure_mut");
+        let allocation_start = allocation::snapshot();
         let start = Instant::now();
         let result = f(target);
-        self.set_duration(start.elapsed());
+        let duration = start.elapsed();
+        let allocation_delta = allocation_start.map(allocation::delta_since);
+        self.set_duration(duration);
+        self.set_allocation_measurement(allocation_delta);
         self.set_successful_operations_if_unset(1);
         result
     }
 
     /// Manually record a duration for externally timed systems under test.
     pub fn record_duration(&mut self, duration: Duration) {
+        self.require_non_micro_timing_helper("record_duration");
         self.set_duration(duration);
         self.set_successful_operations_if_unset(1);
     }
@@ -393,6 +446,67 @@ mod tests {
         let mut ctx = ctx();
 
         ctx.measure_micro(|| std::hint::black_box(1_u64));
+    }
+
+    fn micro_ctx() -> StressContext {
+        StressContext::new(BenchmarkMode::Micro {
+            target_sample_duration: Duration::from_millis(1),
+        })
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "ctx.measure() cannot be used with mode = \"micro\"; use ctx.measure_micro() or ctx.measure_workload()"
+    )]
+    fn measure_requires_non_micro_mode() {
+        let mut ctx = micro_ctx();
+
+        ctx.measure(|| std::hint::black_box(1_u64));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "ctx.measure_for() cannot be used with mode = \"micro\"; use ctx.measure_micro() or ctx.measure_workload()"
+    )]
+    fn measure_for_requires_non_micro_mode() {
+        let mut ctx = micro_ctx();
+
+        let _ = ctx.measure_for(Duration::from_millis(1), || {
+            std::hint::black_box(1_u64);
+        });
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "ctx.measure_ref() cannot be used with mode = \"micro\"; use ctx.measure_micro() or ctx.measure_workload()"
+    )]
+    fn measure_ref_requires_non_micro_mode() {
+        let mut ctx = micro_ctx();
+
+        ctx.measure_ref(&1_u64, |value| std::hint::black_box(*value));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "ctx.measure_mut() cannot be used with mode = \"micro\"; use ctx.measure_micro() or ctx.measure_workload()"
+    )]
+    fn measure_mut_requires_non_micro_mode() {
+        let mut ctx = micro_ctx();
+        let mut value = 1_u64;
+
+        ctx.measure_mut(&mut value, |value| {
+            *value = value.saturating_add(1);
+        });
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "ctx.record_duration() cannot be used with mode = \"micro\"; use ctx.measure_micro() or ctx.measure_workload()"
+    )]
+    fn record_duration_requires_non_micro_mode() {
+        let mut ctx = micro_ctx();
+
+        ctx.record_duration(Duration::from_nanos(1));
     }
 
     #[test]

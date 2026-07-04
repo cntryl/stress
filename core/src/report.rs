@@ -299,6 +299,25 @@ pub(crate) fn format_markdown_report(run: &StressRun) -> String {
         format_duration_ns(run.total_elapsed_ns)
     );
     let _ = writeln!(output);
+    let _ = writeln!(output, "## Summary");
+    let _ = writeln!(output);
+    let _ = writeln!(output, "```text");
+    output.push_str(&format_summary_blocks(run));
+    let _ = writeln!(output, "```");
+    let _ = writeln!(output);
+    let _ = writeln!(output, "## Needs attention");
+    let _ = writeln!(output);
+    let attention = attention_items(run);
+    if attention.is_empty() {
+        let _ = writeln!(output, "- none");
+    } else {
+        for item in attention {
+            let _ = writeln!(output, "- {item}");
+        }
+    }
+    let _ = writeln!(output);
+    let _ = writeln!(output, "## Benchmarks");
+    let _ = writeln!(output);
     let _ = writeln!(
         output,
         "| Benchmark | Tier | Metric | Value | Quality | Samples |"
@@ -496,17 +515,22 @@ fn metric_label(metric: PrimaryMetric) -> &'static str {
 
 fn format_summary_blocks(run: &StressRun) -> String {
     let mut output = String::new();
-    let failed = failed_correctness_count(&run.summaries);
-    let regressions = comparison_count(run, ComparisonClass::Regression);
+    let correctness_failed = failed_correctness_count(&run.summaries);
+    let budget_failures = budget_failure_count(&run.summaries);
+    let quality_failures = quality_gate_failures(run).len();
+    let regressions = regression_gate_count(run);
     let improvements = comparison_count(run, ComparisonClass::Improvement);
     let _ = writeln!(output, "Summary");
     let _ = writeln!(output, "  benchmarks:      {}", run.summaries.len());
+    let _ = writeln!(output, "  gate:            {}", gate_status(run));
     let _ = writeln!(
         output,
-        "  passed:          {}",
-        run.summaries.len().saturating_sub(failed)
+        "  correctness_ok:  {}",
+        run.summaries.len().saturating_sub(correctness_failed)
     );
-    let _ = writeln!(output, "  failed:          {failed}");
+    let _ = writeln!(output, "  correctness_bad: {correctness_failed}");
+    let _ = writeln!(output, "  budget_failed:   {budget_failures}");
+    let _ = writeln!(output, "  quality_failed:  {quality_failures}");
     let _ = writeln!(output, "  regressions:     {regressions}");
     let _ = writeln!(output, "  improvements:    {improvements}");
     let counts = quality_counts(&run.summaries);
@@ -553,6 +577,7 @@ fn attention_items(run: &StressRun) -> Vec<String> {
     let mut seen = BTreeSet::new();
     push_correctness_attention(&mut items, &mut seen, &run.summaries);
     push_budget_attention(&mut items, &mut seen, &run.summaries);
+    push_quality_gate_attention(&mut items, &mut seen, run);
     push_comparison_attention(
         &mut items,
         &mut seen,
@@ -636,7 +661,9 @@ fn push_comparison_attention(
     let mut rows = summaries
         .iter()
         .filter_map(|summary| comparisons.get(summary.benchmark_id.as_str()).copied())
-        .filter(|comparison| comparison_is_trustworthy(comparison))
+        .filter(|comparison| {
+            class == ComparisonClass::Regression || comparison_is_trustworthy(comparison)
+        })
         .filter(|comparison| comparison.classification == class)
         .collect::<Vec<_>>();
     rows.sort_by(|left, right| {
@@ -657,6 +684,24 @@ fn push_comparison_attention(
                 "{icon} {} {}",
                 comparison.benchmark_id,
                 format_delta_cell(comparison)
+            ));
+        }
+    }
+}
+
+fn push_quality_gate_attention(
+    items: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+    run: &StressRun,
+) {
+    for summary in quality_gate_failures(run) {
+        if seen.insert(summary.benchmark_id.clone()) {
+            items.push(format!(
+                "! {} quality gate failed: quality={} below min={} {}",
+                summary.name,
+                summary.quality,
+                run.environment.profile_config.min_quality,
+                quality_note("quality", summary)
             ));
         }
     }
@@ -865,12 +910,70 @@ fn failed_correctness_count(summaries: &[BenchmarkSummary]) -> usize {
         .count()
 }
 
+fn budget_failure_count(summaries: &[BenchmarkSummary]) -> usize {
+    summaries
+        .iter()
+        .filter(|summary| summary.budget_results.iter().any(|result| !result.passed))
+        .count()
+}
+
+fn quality_gate_failures(run: &StressRun) -> Vec<&BenchmarkSummary> {
+    let profile_config = &run.environment.profile_config;
+    if !profile_config.fail_on_quality {
+        return Vec::new();
+    }
+    run.summaries
+        .iter()
+        .filter(|summary| quality_rank(summary.quality) < quality_rank(profile_config.min_quality))
+        .collect()
+}
+
+fn regression_gate_count(run: &StressRun) -> usize {
+    if !run.environment.profile_config.fail_on_regression {
+        return 0;
+    }
+    run.comparisons
+        .iter()
+        .filter(|comparison| comparison.classification == ComparisonClass::Regression)
+        .count()
+}
+
 fn comparison_count(run: &StressRun, class: ComparisonClass) -> usize {
     run.comparisons
         .iter()
         .filter(|comparison| comparison_is_trustworthy(comparison))
         .filter(|comparison| comparison.classification == class)
         .count()
+}
+
+fn gate_status(run: &StressRun) -> String {
+    if failed_correctness_count(&run.summaries) != 0 {
+        return "failed correctness".to_string();
+    }
+    if budget_failure_count(&run.summaries) != 0 {
+        return "failed budget".to_string();
+    }
+    let quality_failures = quality_gate_failures(run).len();
+    if quality_failures != 0 {
+        return format!(
+            "failed quality ({quality_failures} below {})",
+            run.environment.profile_config.min_quality
+        );
+    }
+    let regressions = regression_gate_count(run);
+    if regressions != 0 {
+        return format!("failed regression ({regressions})");
+    }
+    "passed".to_string()
+}
+
+const fn quality_rank(quality: QualityClass) -> u8 {
+    match quality {
+        QualityClass::Untrustworthy => 0,
+        QualityClass::Noisy => 1,
+        QualityClass::Acceptable => 2,
+        QualityClass::Authoritative => 3,
+    }
 }
 
 fn is_trustworthy(summary: &BenchmarkSummary) -> bool {
@@ -1308,6 +1411,84 @@ mod tests {
         assert!(report.contains("Summary"));
         assert!(report.contains("Needs attention"));
         assert!(report.contains("sample-throughput percentiles"));
+    }
+
+    #[test]
+    fn console_explains_quality_gate_failures() {
+        let run = run_with_summaries(
+            (0..6)
+                .map(|index| summary(&format!("queue::row_{index}"), 100.0, QualityClass::Noisy))
+                .collect(),
+        );
+
+        let report = format_console_output(&run, &run.summaries, ConsoleMode::Default);
+
+        assert!(report.contains("gate:            failed quality (6 below acceptable)"));
+        assert!(report.contains("correctness_ok:  6"));
+        assert!(report.contains("correctness_bad: 0"));
+        assert!(report.contains("quality_failed:  6"));
+        assert!(report.contains("quality gate failed"));
+        assert!(!report.contains("Needs attention\n  none"));
+    }
+
+    #[test]
+    fn markdown_explains_quality_gate_failures() {
+        let run = run_with_summaries(
+            (0..6)
+                .map(|index| summary(&format!("queue::row_{index}"), 100.0, QualityClass::Noisy))
+                .collect(),
+        );
+
+        let report = format_markdown_report(&run);
+
+        assert!(report.contains("## Summary"));
+        assert!(report.contains("gate:            failed quality (6 below acceptable)"));
+        assert!(report.contains("quality_failed:  6"));
+        assert!(report.contains("## Needs attention"));
+        assert!(report.contains("quality gate failed"));
+    }
+
+    #[test]
+    fn markdown_explains_budget_failures() {
+        let mut budget = summary("budget", 100.0, QualityClass::Untrustworthy);
+        budget.budget_results = vec![BudgetResult {
+            metric: "max_allocs_per_op".to_string(),
+            limit: 0.0,
+            actual: Some(1.0),
+            passed: false,
+            reason: Some("1.0000 exceeds 0.0000".to_string()),
+        }];
+        let run = run_with_summaries(vec![budget]);
+
+        let report = format_markdown_report(&run);
+
+        assert!(report.contains("gate:            failed budget"));
+        assert!(report.contains("budget_failed:   1"));
+        assert!(report.contains("budget failed: max_allocs_per_op 1.0000 exceeds 0.0000"));
+    }
+
+    #[test]
+    fn markdown_explains_regression_failures() {
+        let mut run =
+            run_with_summaries(vec![summary("regressed", 80.0, QualityClass::Acceptable)]);
+        run.comparisons = vec![ComparisonResult {
+            benchmark_id: "regressed".to_string(),
+            current_quality: QualityClass::Acceptable,
+            baseline_quality: Some(QualityClass::Acceptable),
+            primary_metric: PrimaryMetric::Throughput,
+            baseline_value: Some(100.0),
+            current_value: Some(80.0),
+            change_percent: Some(-20.0),
+            threshold: 0.05,
+            confidence_intervals_overlap: Some(false),
+            classification: ComparisonClass::Regression,
+        }];
+
+        let report = format_markdown_report(&run);
+
+        assert!(report.contains("gate:            failed regression (1)"));
+        assert!(report.contains("regressions:     1"));
+        assert!(report.contains("- ↓ regressed -20.0% regression"));
     }
 
     #[test]
