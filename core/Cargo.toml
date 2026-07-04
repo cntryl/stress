@@ -2,7 +2,7 @@
 name = "cntryl-stress"
 version = "0.3.0"
 edition = "2021"
-description = "Raw-sample-first stress benchmarking framework for Tier 1 through Tier N performance work"
+description = "Raw-sample-first stress benchmarking framework for Tier 1 through Tier 6 performance work"
 license = "Apache-2.0"
 repository = "https://github.com/cntryl/stress"
 keywords = ["benchmark", "stress", "testing", "performance"]

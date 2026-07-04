@@ -9,6 +9,9 @@ use std::time::Duration;
 /// Authoritative JSON schema version for current cntryl-stress artifacts.
 pub const SCHEMA_VERSION: &str = "cntryl-stress.v1";
 
+/// Highest defined benchmark tier.
+pub const MAX_TIER: u32 = 6;
+
 /// Benchmark run profile. The default profile is the deeper exploratory lab run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -78,6 +81,55 @@ impl std::str::FromStr for BenchmarkModeKind {
             "fixed_duration" => Ok(Self::FixedDuration),
             other => Err(format!("unknown benchmark mode '{other}'")),
         }
+    }
+}
+
+impl BenchmarkModeKind {
+    /// Return the mode family implied by a tier.
+    #[must_use]
+    pub const fn for_tier(tier: u32) -> Option<Self> {
+        match tier {
+            1 => Some(Self::Micro),
+            2 => Some(Self::FixedOperations),
+            3..=MAX_TIER => Some(Self::FixedDuration),
+            _ => None,
+        }
+    }
+
+    /// Validate that this mode family matches the tier-derived mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tier is undefined or the mode does not match
+    /// the tier-derived mode.
+    pub fn validate_for_tier(self, tier: u32) -> Result<(), String> {
+        let Some(expected) = Self::for_tier(tier) else {
+            return Err(format!("tier must be between 1 and {MAX_TIER}"));
+        };
+        if self == expected {
+            Ok(())
+        } else {
+            Err(tier_mode_mismatch_message(tier, expected, self))
+        }
+    }
+}
+
+fn tier_mode_mismatch_message(
+    tier: u32,
+    expected: BenchmarkModeKind,
+    actual: BenchmarkModeKind,
+) -> String {
+    format!(
+        "Tier {tier} uses {expected}; remove mode or use {} for {actual}.",
+        tier_hint_for_mode(actual)
+    )
+}
+
+const fn tier_hint_for_mode(mode: BenchmarkModeKind) -> &'static str {
+    match mode {
+        BenchmarkModeKind::Micro => "tier = 1",
+        BenchmarkModeKind::FixedOperations => "tier = 2",
+        BenchmarkModeKind::FixedDuration => "tier = 3",
     }
 }
 
@@ -1185,6 +1237,14 @@ fn summary_flags(
     {
         flags.push("suspicious_micro".to_string());
     }
+    if (3..=MAX_TIER).contains(&spec.tier)
+        && !samples.is_empty()
+        && samples
+            .iter()
+            .all(|sample| sample.operations_completed == 1)
+    {
+        flags.push("tier_throughput_single_op".to_string());
+    }
     flags
 }
 
@@ -1331,6 +1391,20 @@ mod tests {
         }
     }
 
+    fn tier3_spec(id: &str) -> BenchmarkSpec {
+        BenchmarkSpec {
+            id: id.to_string(),
+            name: id.to_string(),
+            tier: 3,
+            mode: BenchmarkMode::FixedDuration {
+                sample_duration: Duration::from_millis(100),
+            },
+            budgets: BenchmarkBudgets::default(),
+            parameters: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+        }
+    }
+
     #[allow(clippy::cast_precision_loss)]
     fn sample(id: &str, phase: SamplePhase, sample_number: usize, elapsed_ns: u128) -> Sample {
         let completed = 1;
@@ -1454,6 +1528,56 @@ mod tests {
         assert_eq!(summary.quality, QualityClass::Acceptable);
         assert!(summary.flags.contains(&"suspicious_micro".to_string()));
         assert_close(summary.overhead_ns_per_op.expect("overhead").mean, 2.0);
+    }
+
+    #[test]
+    fn benchmark_mode_kind_is_derived_from_tier() {
+        assert_eq!(
+            BenchmarkModeKind::for_tier(1),
+            Some(BenchmarkModeKind::Micro)
+        );
+        assert_eq!(
+            BenchmarkModeKind::for_tier(2),
+            Some(BenchmarkModeKind::FixedOperations)
+        );
+        for tier in 3..=MAX_TIER {
+            assert_eq!(
+                BenchmarkModeKind::for_tier(tier),
+                Some(BenchmarkModeKind::FixedDuration)
+            );
+        }
+        assert_eq!(BenchmarkModeKind::for_tier(0), None);
+        assert_eq!(BenchmarkModeKind::for_tier(MAX_TIER + 1), None);
+    }
+
+    #[test]
+    fn benchmark_mode_kind_rejects_tier_mismatches_with_guidance() {
+        assert_eq!(
+            BenchmarkModeKind::FixedOperations.validate_for_tier(3),
+            Err(
+                "Tier 3 uses fixed_duration; remove mode or use tier = 2 for fixed_operations."
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            BenchmarkModeKind::FixedDuration.validate_for_tier(1),
+            Err("Tier 1 uses micro; remove mode or use tier = 3 for fixed_duration.".to_string())
+        );
+    }
+
+    #[test]
+    fn tier3_to_tier6_single_operation_samples_are_flagged() {
+        let spec = tier3_spec("system");
+        let samples = (0..5)
+            .map(|i| sample("system", SamplePhase::Measured, i, 100 + i as u128))
+            .collect::<Vec<_>>();
+
+        let summary = summarize_benchmark(&spec, &samples);
+
+        assert_eq!(summary.quality, QualityClass::Acceptable);
+        assert!(summary
+            .flags
+            .contains(&"tier_throughput_single_op".to_string()));
     }
 
     #[test]

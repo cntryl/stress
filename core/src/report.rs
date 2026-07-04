@@ -578,12 +578,19 @@ fn attention_items(run: &StressRun) -> Vec<String> {
     push_correctness_attention(&mut items, &mut seen, &run.summaries);
     push_budget_attention(&mut items, &mut seen, &run.summaries);
     push_quality_gate_attention(&mut items, &mut seen, run);
+    push_noisy_attention(&mut items, &mut seen, &run.summaries);
     push_comparison_attention(
         &mut items,
         &mut seen,
         &run.summaries,
         &comparisons,
         ComparisonClass::Regression,
+    );
+    push_flag_attention(
+        &mut items,
+        &mut seen,
+        &run.summaries,
+        "tier_throughput_single_op",
     );
     push_flag_attention(&mut items, &mut seen, &run.summaries, "suspicious_micro");
     push_untrustworthy_attention(&mut items, &mut seen, &run.summaries);
@@ -628,7 +635,11 @@ fn push_flag_attention(
         .filter(|summary| summary.flags.iter().any(|item| item == flag))
     {
         if seen.insert(summary.benchmark_id.clone()) {
-            items.push(format!("! {} {flag}", summary.name));
+            items.push(format!(
+                "! {} {}",
+                summary.name,
+                flag_note(summary, flag).unwrap_or_else(|| flag.to_string())
+            ));
         }
     }
 }
@@ -701,7 +712,39 @@ fn push_quality_gate_attention(
                 summary.name,
                 summary.quality,
                 run.environment.profile_config.min_quality,
-                quality_note("quality", summary)
+                row_notes(summary)
+            ));
+        }
+    }
+}
+
+fn push_noisy_attention(
+    items: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+    summaries: &[BenchmarkSummary],
+) {
+    let mut rows = summaries
+        .iter()
+        .filter(|summary| summary.quality == QualityClass::Noisy)
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .stats
+            .as_ref()
+            .map_or(0.0, |stats| stats.relative_std_dev)
+            .total_cmp(
+                &left
+                    .stats
+                    .as_ref()
+                    .map_or(0.0, |stats| stats.relative_std_dev),
+            )
+    });
+    for summary in rows {
+        if seen.insert(summary.benchmark_id.clone()) {
+            items.push(format!(
+                "! {} {}",
+                summary.name,
+                quality_note("noisy", summary)
             ));
         }
     }
@@ -823,7 +866,12 @@ fn row_notes(summary: &BenchmarkSummary) -> String {
         return budget_note(summary);
     }
     if !summary.flags.is_empty() {
-        return summary.flags.join(", ");
+        return summary
+            .flags
+            .iter()
+            .map(|flag| flag_note(summary, flag).unwrap_or_else(|| flag.clone()))
+            .collect::<Vec<_>>()
+            .join("; ");
     }
     match summary.quality {
         QualityClass::Authoritative | QualityClass::Acceptable => String::new(),
@@ -840,11 +888,26 @@ fn budget_note(summary: &BenchmarkSummary) -> String {
         .map(|result| {
             result.reason.as_ref().map_or_else(
                 || format!("{} failed", result.metric),
-                |reason| format!("{} {reason}", result.metric),
+                |reason| {
+                    let mut note = format!("{} {reason}", result.metric);
+                    if allocation_budget_unavailable(result) {
+                        note.push_str(
+                            "; allocation budgets require cntryl_stress::stress_allocator!()",
+                        );
+                    }
+                    note
+                },
             )
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn allocation_budget_unavailable(result: &crate::result::BudgetResult) -> bool {
+    matches!(
+        result.metric.as_str(),
+        "max_allocs_per_op" | "max_bytes_per_op"
+    ) && result.actual.is_none()
 }
 
 fn quality_note(label: &str, summary: &BenchmarkSummary) -> String {
@@ -855,7 +918,104 @@ fn quality_note(label: &str, summary: &BenchmarkSummary) -> String {
     if let Some(stats) = &summary.stats {
         parts.push(format!("rsd={}", format_percent(stats.relative_std_dev)));
     }
+    if let Some(advice) = quality_advice(summary) {
+        parts.push(format!("fix: {advice}"));
+    }
     parts.join(", ")
+}
+
+fn quality_advice(summary: &BenchmarkSummary) -> Option<String> {
+    if summary.measured_samples < 5 {
+        return Some(format!(
+            "collect more measured samples; avoid one-sample release gates; {}",
+            tier_recipe(summary)
+        ));
+    }
+    if summary
+        .stats
+        .as_ref()
+        .is_some_and(|stats| stats.relative_std_dev > 0.10)
+    {
+        return Some(format!(
+            "use deterministic fixtures and move setup outside measurement; {}",
+            tier_recipe(summary)
+        ));
+    }
+    (summary.quality == QualityClass::Noisy).then(|| {
+        format!(
+            "use deterministic fixtures and move setup outside measurement; {}",
+            tier_recipe(summary)
+        )
+    })
+}
+
+fn flag_note(summary: &BenchmarkSummary, flag: &str) -> Option<String> {
+    match flag {
+        "invalid_timing" => Some(
+            format!(
+                "invalid_timing: recorded zero or invalid timing; measure exactly one non-empty workload; {}",
+                tier_recipe(summary)
+            ),
+        ),
+        "zero_completed_ops" => Some(
+            format!(
+                "zero_completed_ops: completed operations were zero; record logical work with {}; {}",
+                operation_count_recipe(summary),
+                tier_recipe(summary)
+            ),
+        ),
+        "overhead_dominant" => Some(
+            format!(
+                "overhead_dominant: timing overhead dominates the measured work; {}; {}",
+                overhead_recipe(summary),
+                tier_recipe(summary)
+            ),
+        ),
+        "allocation_tracking_required" => Some(
+            "allocation_tracking_required: allocation budgets require cntryl_stress::stress_allocator!() in the benchmark crate"
+                .to_string(),
+        ),
+        "budget_failed" => Some("budget_failed: configured budget failed".to_string()),
+        "suspicious_micro" => Some(format!(
+            "suspicious_micro: {} is below 5ns/op without validation; Tier 1 should use ctx.measure_micro(...) for the hot path and set metadata(validated_micro = \"true\") only after independent validation",
+            summary.name
+        )),
+        "tier_throughput_single_op" => Some(
+            "tier_throughput_single_op: only one completed op per sample; if this was batch work, use ctx.measure_batch(...) or ctx.record_external(...); if it is one subsystem operation, use Tier 2"
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+fn tier_recipe(summary: &BenchmarkSummary) -> &'static str {
+    match summary.tier {
+        1 => "Tier 1 recipe: ctx.measure_micro(...) on the hot path only",
+        2 => {
+            "Tier 2 recipe: ctx.measure(...) for one subsystem operation, or ctx.measure_counted(...) when that call completes a batch"
+        }
+        3 => "Tier 3 recipe: #[stress_test(tier = 3)] with ctx.measure_batch(n, ...) for system throughput",
+        4 => "Tier 4 recipe: #[stress_test(tier = 4)] with ctx.measure_batch(n, ...) or ctx.record_external(duration, n) for integration throughput",
+        5 => "Tier 5 recipe: #[stress_test(tier = 5)] with scale parameters and ctx.measure_batch(n, ...)",
+        6 => "Tier 6 recipe: #[stress_test(tier = 6)] with ctx.measure_batch(n, ...) or ctx.record_external(duration, n) over the soak window",
+        _ => "undefined tier: cntryl-stress defines tiers 1 through 6; choose the closest defined tier before authoring the benchmark",
+    }
+}
+
+fn operation_count_recipe(summary: &BenchmarkSummary) -> &'static str {
+    match summary.tier {
+        1 => "ctx.measure_micro(...) for calibrated hot-path iterations",
+        2 => "ctx.measure_counted(|| completed_work()) or ctx.operations(n) after ctx.measure(...) returns completed batch work",
+        _ => "ctx.measure_batch(n, ...) or ctx.record_external(duration, n)",
+    }
+}
+
+fn overhead_recipe(summary: &BenchmarkSummary) -> &'static str {
+    match summary.tier {
+        1 => "batch more hot-path work or mark validated_micro only after independent validation",
+        2 => "use ctx.measure_counted(...) for batch-returning subsystem calls or move tiny hot paths to Tier 1",
+        _ => "increase logical work per iteration with ctx.measure_batch(n, ...)",
+    }
 }
 
 fn correctness_note(correctness: &CorrectnessSummary) -> String {
@@ -1467,6 +1627,48 @@ mod tests {
         assert!(report.contains("gate:            failed budget"));
         assert!(report.contains("budget_failed:   1"));
         assert!(report.contains("budget failed: max_allocs_per_op 1.0000 exceeds 0.0000"));
+    }
+
+    #[test]
+    fn markdown_explains_tier_driven_recipe_misconfigurations() {
+        let mut noisy = summary("tier3_noisy", 100.0, QualityClass::Noisy);
+        noisy.tier = 3;
+        let mut single_op = summary("tier3_single_op", 100.0, QualityClass::Acceptable);
+        single_op.tier = 3;
+        single_op.flags = vec!["tier_throughput_single_op".to_string()];
+        let mut zero = summary("tier4_zero", 100.0, QualityClass::Untrustworthy);
+        zero.tier = 4;
+        zero.flags = vec!["zero_completed_ops".to_string()];
+        let mut overhead = summary("tier1_overhead", 4.0, QualityClass::Untrustworthy);
+        overhead.tier = 1;
+        overhead.flags = vec!["overhead_dominant".to_string()];
+        let mut suspicious = summary("tier1_suspicious", 4.0, QualityClass::Acceptable);
+        suspicious.tier = 1;
+        suspicious.flags = vec!["suspicious_micro".to_string()];
+        let mut allocation = summary("tier2_allocation", 100.0, QualityClass::Untrustworthy);
+        allocation.tier = 2;
+        allocation.budget_results = vec![BudgetResult {
+            metric: "max_allocs_per_op".to_string(),
+            limit: 0.0,
+            actual: None,
+            passed: false,
+            reason: Some("required measurement is unavailable".to_string()),
+        }];
+        let run = run_with_summaries(vec![
+            noisy, single_op, zero, overhead, suspicious, allocation,
+        ]);
+
+        let report = format_markdown_report(&run);
+
+        assert!(report.contains("Tier 3 recipe: #[stress_test(tier = 3)] with ctx.measure_batch"));
+        assert!(report.contains("tier_throughput_single_op: only one completed op per sample"));
+        assert!(report.contains("if it is one subsystem operation, use Tier 2"));
+        assert!(report.contains("zero_completed_ops: completed operations were zero"));
+        assert!(report.contains("ctx.record_external(duration, n)"));
+        assert!(report.contains("overhead_dominant: timing overhead dominates"));
+        assert!(report.contains("Tier 1 recipe: ctx.measure_micro"));
+        assert!(report.contains("suspicious_micro: tier1_suspicious is below 5ns/op"));
+        assert!(report.contains("cntryl_stress::stress_allocator!()"));
     }
 
     #[test]

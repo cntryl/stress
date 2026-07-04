@@ -5,6 +5,8 @@ use quote::quote;
 use syn::parse::Parser;
 use syn::{parse_macro_input, Expr, ExprLit, ItemFn, Lit, Meta, MetaNameValue, Token};
 
+const MAX_TIER: u32 = 6;
+
 /// Mark a function as a stress benchmark.
 ///
 /// Common usage stays intentionally small:
@@ -27,8 +29,8 @@ use syn::{parse_macro_input, Expr, ExprLit, ItemFn, Lit, Meta, MetaNameValue, To
 ///
 /// Supported attributes:
 ///
-/// - `tier = 1` through `N` (defaults to `2`)
-/// - `mode = "micro"`, `mode = "fixed_operations"`, or `mode = "fixed_duration"`
+/// - `tier = 1` through `6` (defaults to `2`)
+/// - `mode = "micro"`, `mode = "fixed_operations"`, or `mode = "fixed_duration"` when it matches the tier-derived mode
 /// - `name = "custom_name"`
 /// - `ignore`
 /// - `max_ns_per_op = 1000`
@@ -47,8 +49,8 @@ pub fn stress_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(attrs) => attrs,
         Err(error) => return error.to_compile_error().into(),
     };
-    if attrs.tier == 0 {
-        return syn::Error::new_spanned(fn_name, "cntryl-stress tiers start at 1")
+    if let Some(error) = tier_error(attrs.tier) {
+        return syn::Error::new_spanned(fn_name, error)
             .to_compile_error()
             .into();
     }
@@ -56,28 +58,36 @@ pub fn stress_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let benchmark_name = attrs.name.unwrap_or_else(|| fn_name_str.clone());
     let is_ignored = attrs.ignore;
     let tier = attrs.tier;
-    let mode_name = attrs.mode.unwrap_or_else(|| {
-        if attrs.tier == 1 {
-            "micro".to_string()
-        } else {
-            "fixed_operations".to_string()
-        }
-    });
-    let mode = match mode_name.as_str() {
-        "micro" => quote! { ::cntryl_stress::BenchmarkModeKind::Micro },
-        "fixed_duration" => quote! { ::cntryl_stress::BenchmarkModeKind::FixedDuration },
-        "fixed_operations" => quote! { ::cntryl_stress::BenchmarkModeKind::FixedOperations },
-        other => {
-            return syn::Error::new_spanned(
-                fn_name,
-                format!(
-                    "unsupported stress_test mode '{other}'; expected micro, fixed_operations, or fixed_duration"
-                ),
-            )
+    let Some(derived_mode) = mode_for_tier(tier) else {
+        return syn::Error::new_spanned(fn_name, "cntryl-stress tiers are 1 through 6")
             .to_compile_error()
             .into();
-        }
     };
+    let mode_kind = match attrs.mode.as_deref() {
+        Some(mode_name) => {
+            let Some(mode_kind) = parse_mode_kind(mode_name) else {
+                return syn::Error::new_spanned(
+                    fn_name,
+                    format!(
+                        "unsupported stress_test mode '{mode_name}'; expected micro, fixed_operations, or fixed_duration"
+                    ),
+                )
+                .to_compile_error()
+                .into();
+            };
+            if mode_kind != derived_mode {
+                return syn::Error::new_spanned(
+                    fn_name,
+                    tier_mode_mismatch_message(tier, derived_mode, mode_kind),
+                )
+                .to_compile_error()
+                .into();
+            }
+            mode_kind
+        }
+        None => derived_mode,
+    };
+    let mode = mode_kind.tokens();
     let max_ns_per_op = option_f64_tokens(attrs.budgets.ns_per_op);
     let max_allocs_per_op = option_f64_tokens(attrs.budgets.allocs_per_op);
     let max_bytes_per_op = option_f64_tokens(attrs.budgets.bytes_per_op);
@@ -258,6 +268,78 @@ fn option_f64_tokens(value: Option<f64>) -> proc_macro2::TokenStream {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModeKind {
+    Micro,
+    FixedOperations,
+    FixedDuration,
+}
+
+impl ModeKind {
+    fn tokens(self) -> proc_macro2::TokenStream {
+        match self {
+            Self::Micro => quote! { ::cntryl_stress::BenchmarkModeKind::Micro },
+            Self::FixedOperations => {
+                quote! { ::cntryl_stress::BenchmarkModeKind::FixedOperations }
+            }
+            Self::FixedDuration => quote! { ::cntryl_stress::BenchmarkModeKind::FixedDuration },
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Micro => "micro",
+            Self::FixedOperations => "fixed_operations",
+            Self::FixedDuration => "fixed_duration",
+        }
+    }
+}
+
+fn parse_mode_kind(value: &str) -> Option<ModeKind> {
+    match value {
+        "micro" => Some(ModeKind::Micro),
+        "fixed_operations" => Some(ModeKind::FixedOperations),
+        "fixed_duration" => Some(ModeKind::FixedDuration),
+        _ => None,
+    }
+}
+
+const fn mode_for_tier(tier: u32) -> Option<ModeKind> {
+    match tier {
+        1 => Some(ModeKind::Micro),
+        2 => Some(ModeKind::FixedOperations),
+        3..=MAX_TIER => Some(ModeKind::FixedDuration),
+        _ => None,
+    }
+}
+
+fn tier_mode_mismatch_message(tier: u32, expected: ModeKind, actual: ModeKind) -> String {
+    format!(
+        "Tier {tier} uses {}; remove mode or use {} for {}.",
+        expected.as_str(),
+        tier_hint_for_mode(actual),
+        actual.as_str()
+    )
+}
+
+const fn tier_hint_for_mode(mode: ModeKind) -> &'static str {
+    match mode {
+        ModeKind::Micro => "tier = 1",
+        ModeKind::FixedOperations => "tier = 2",
+        ModeKind::FixedDuration => "tier = 3",
+    }
+}
+
+fn tier_error(tier: u32) -> Option<String> {
+    if tier == 0 {
+        Some("cntryl-stress tiers start at 1".to_string())
+    } else if tier > MAX_TIER {
+        Some(format!("cntryl-stress tiers are 1 through {MAX_TIER}"))
+    } else {
+        None
+    }
+}
+
 /// Generate a `main` function for stress benchmark binaries.
 #[proc_macro]
 pub fn stress_main(_input: TokenStream) -> TokenStream {
@@ -267,4 +349,44 @@ pub fn stress_main(_input: TokenStream) -> TokenStream {
         }
     }
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tier_validation_rejects_undefined_tiers() {
+        assert_eq!(
+            tier_error(0).as_deref(),
+            Some("cntryl-stress tiers start at 1")
+        );
+        assert_eq!(
+            tier_error(MAX_TIER + 1).as_deref(),
+            Some("cntryl-stress tiers are 1 through 6")
+        );
+        assert!(tier_error(1).is_none());
+        assert!(tier_error(MAX_TIER).is_none());
+    }
+
+    #[test]
+    fn mode_defaults_are_derived_from_tier() {
+        assert_eq!(mode_for_tier(1), Some(ModeKind::Micro));
+        assert_eq!(mode_for_tier(2), Some(ModeKind::FixedOperations));
+        for tier in 3..=MAX_TIER {
+            assert_eq!(mode_for_tier(tier), Some(ModeKind::FixedDuration));
+        }
+    }
+
+    #[test]
+    fn mode_mismatch_guidance_points_to_matching_tier() {
+        assert_eq!(
+            tier_mode_mismatch_message(3, ModeKind::FixedDuration, ModeKind::FixedOperations),
+            "Tier 3 uses fixed_duration; remove mode or use tier = 2 for fixed_operations."
+        );
+        assert_eq!(
+            tier_mode_mismatch_message(1, ModeKind::Micro, ModeKind::FixedDuration),
+            "Tier 1 uses micro; remove mode or use tier = 3 for fixed_duration."
+        );
+    }
 }

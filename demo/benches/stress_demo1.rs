@@ -30,15 +30,16 @@ fn tier3_system_snapshot_projection(ctx: &mut StressContext) {
     let events = (0_u64..1024).collect::<Vec<_>>();
     ctx.parameter("event_count", events.len());
 
-    ctx.measure(|| {
+    let completed = ctx.measure_batch(events.len() as u64, || {
         let projected = events
             .iter()
             .enumerate()
             .fold(0_u64, |acc, (index, value)| {
                 acc ^ value.wrapping_add(index as u64).rotate_left(11)
             });
-        black_box(projected)
+        black_box(projected);
     });
+    black_box(completed);
 }
 
 cntryl_stress::stress_main!();

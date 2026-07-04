@@ -1,6 +1,8 @@
 //! Configuration and profile resolution for stress runs.
 
-use crate::result::{BenchmarkMode, BenchmarkModeKind, ProfileConfig, QualityClass, RunProfile};
+use crate::result::{
+    BenchmarkMode, BenchmarkModeKind, ProfileConfig, QualityClass, RunProfile, MAX_TIER,
+};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
@@ -255,6 +257,9 @@ impl StressRunnerConfig {
         if self.operations_per_sample == 0 {
             errors.push("operations_per_sample must be greater than 0".to_string());
         }
+        if self.tier.is_some_and(|tier| tier == 0 || tier > MAX_TIER) {
+            errors.push(format!("tier must be between 1 and {MAX_TIER}"));
+        }
         errors
     }
 
@@ -291,6 +296,12 @@ impl StressRunnerConfig {
                 operations_per_sample: self.operations_per_sample,
             },
         }
+    }
+
+    /// Build the concrete mode implied by a tier.
+    #[must_use]
+    pub fn mode_for_tier(&self, tier: u32) -> Option<BenchmarkMode> {
+        BenchmarkModeKind::for_tier(tier).map(|kind| self.mode_for_kind(kind))
     }
 
     /// Set profile and profile-derived defaults.
@@ -707,6 +718,16 @@ mod tests {
     }
 
     #[test]
+    fn validation_rejects_undefined_tier_filter() {
+        let cfg = StressRunnerConfig::new().tier(MAX_TIER + 1);
+
+        assert_eq!(
+            cfg.validation_errors(),
+            vec!["tier must be between 1 and 6".to_string()]
+        );
+    }
+
+    #[test]
     fn stress_env_values_override_profile_defaults() {
         let env = HashMap::from([
             ("STRESS_PROFILE", "release".to_string()),
@@ -799,5 +820,36 @@ mod tests {
                 target_sample_duration: Duration::from_millis(200)
             }
         );
+    }
+
+    #[test]
+    fn mode_for_tier_uses_tier_derived_modes() {
+        let cfg = StressRunnerConfig::new()
+            .sample_duration(Duration::from_millis(250))
+            .operations_per_sample(12)
+            .micro_sample_duration(Duration::from_millis(25));
+
+        assert_eq!(
+            cfg.mode_for_tier(1),
+            Some(BenchmarkMode::Micro {
+                target_sample_duration: Duration::from_millis(25)
+            })
+        );
+        assert_eq!(
+            cfg.mode_for_tier(2),
+            Some(BenchmarkMode::FixedOperations {
+                operations_per_sample: 12
+            })
+        );
+        for tier in 3..=MAX_TIER {
+            assert_eq!(
+                cfg.mode_for_tier(tier),
+                Some(BenchmarkMode::FixedDuration {
+                    sample_duration: Duration::from_millis(250)
+                })
+            );
+        }
+        assert_eq!(cfg.mode_for_tier(0), None);
+        assert_eq!(cfg.mode_for_tier(MAX_TIER + 1), None);
     }
 }

@@ -4,7 +4,7 @@
 [![docs.rs](https://docs.rs/cntryl-stress/badge.svg)](https://docs.rs/cntryl-stress)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-Raw-sample-first benchmarking for Tier 1 hot paths through Tier N workload and system performance work.
+Raw-sample-first benchmarking for Tier 1 hot paths through Tier 6 workload and system performance work.
 
 ## Quick Start
 
@@ -59,7 +59,7 @@ cargo stress --baseline target/stress/storage_stress/latest.json
 
 ## Model
 
-- `tier = 1..N` describes benchmark scope:
+- `tier = 1..6` describes benchmark scope:
   - Tier 1: hot path
   - Tier 2: subsystem
   - Tier 3: system
@@ -72,7 +72,21 @@ cargo stress --baseline target/stress/storage_stress/latest.json
 - JSON artifacts use `schema_version: "cntryl-stress.v1"`.
 - Raw `Sample` rows are authoritative; summaries, quality, and comparisons are derived from measured samples only.
 - Warmup and cooldown samples are retained in JSON and excluded from summary statistics and baseline comparison.
-- Tier 1 defaults to `mode = "micro"`: calibrated batched samples, empty-loop overhead subtraction, `ns/op`, and optional `allocs/op` / `B/op`.
+- Tier drives benchmark mode: Tier 1 uses `micro`, Tier 2 uses `fixed_operations`, and Tiers 3-6 use `fixed_duration`.
+- `mode = "..."` is optional compatibility syntax and must match the tier-derived mode.
+
+## Tier Recipes
+
+Pick the tier first, then use the matching timing shape. The detailed copy-paste guide is in [docs/bench-recipes.md](docs/bench-recipes.md).
+
+| Tier | Scope | Recipe |
+|------|-------|--------|
+| 1 | Hot path | `ctx.measure_micro(|| hot_path())` |
+| 2 | Subsystem operation | `ctx.measure(|| one_operation())` or `ctx.measure_counted(|| completed_batch())` |
+| 3 | System throughput | `#[stress_test(tier = 3)]` plus `ctx.measure_batch(n, || batch())` |
+| 4 | Integration throughput | Fixed-duration `ctx.measure_batch(n, ...)` or `ctx.record_external(duration, n)` |
+| 5 | Saturation/scaling | Fixed-duration `ctx.measure_batch(n, ...)` with scale parameters |
+| 6 | Soak/endurance | Fixed-duration `ctx.measure_batch(n, ...)` or `ctx.record_external(duration, n)` over the soak window |
 
 ## Benchmark API
 
@@ -94,15 +108,38 @@ fn write_batch(ctx: &mut StressContext) {
 }
 ```
 
-Use correctness counters when one sample represents many operations:
+Use `measure_counted` when one Tier 2 subsystem call returns logical work completed:
 
 ```rust
-#[stress_test(tier = 3, mode = "fixed_duration")]
-fn fanout(ctx: &mut StressContext) {
-    ctx.parameter("client_count", 16);
+#[stress_test(tier = 2)]
+fn flush_ready_entries(ctx: &mut StressContext) {
+    let _completed = ctx.measure_counted(|| flush_ready_entries_once());
+}
+```
 
-    let completed = ctx.measure_workload(|| send_one_request());
-    let _ = ctx.correctness().attempted(completed).completed(completed);
+Use `measure_batch` when each framework iteration performs many logical operations:
+
+```rust
+#[stress_test(tier = 3)]
+fn fanout(ctx: &mut StressContext) {
+    let clients = 16_u64;
+    ctx.parameter("client_count", clients);
+
+    let _completed = ctx.measure_batch(clients, || {
+        for client in 0..clients {
+            send_one_request(client);
+        }
+    });
+}
+```
+
+Use `record_external` when another harness owns timing:
+
+```rust
+#[stress_test(tier = 4)]
+fn external_round_trip(ctx: &mut StressContext) {
+    let report = run_external_harness();
+    ctx.record_external(report.duration, report.completed_operations);
 }
 ```
 
@@ -113,10 +150,13 @@ ctx.parameter("client_count", 16);
 ctx.metadata("scenario", "fanout");
 ctx.record_latency(duration);
 ctx.correctness().attempted(n).completed(n).failures(0);
+ctx.operations(n);
 ctx.measure_micro(|| work());
 ctx.measure(|| work());
-ctx.measure_for(duration, || work());
+ctx.measure_counted(|| work_count());
+ctx.measure_batch(n, || work());
 ctx.measure_workload(|| work());
+ctx.record_external(duration, n);
 ```
 
 ## Attributes
@@ -125,23 +165,23 @@ ctx.measure_workload(|| work());
 #[stress_test]
 #[stress_test(tier = 1)]
 #[stress_test(tier = 1, mode = "micro")]
+#[stress_test(tier = 2, mode = "fixed_operations")]
 #[stress_test(tier = 4)]
-#[stress_test(tier = 3, mode = "fixed_duration")]
 #[stress_test(tier = 1, max_ns_per_op = 250, max_regression_pct = 5)]
 #[stress_test(max_allocs_per_op = 0, max_bytes_per_op = 0, max_rsd_pct = 10)]
 #[stress_test(name = "custom_name", ignore)]
 #[stress_test(metadata(component = "queue", scenario = "fanout"))]
 ```
 
-Tiers start at 1. The macro rejects `tier = 0`.
+Tiers are defined as 1 through 6. The macro rejects `tier = 0`, `tier > 6`, and any explicit `mode` that does not match the tier.
 
 ## Run Policy
 
 | Profile | Default Samples | Gate Behavior |
 |---------|-----------------|---------------|
-| `release` (default) | 10 measured, 1 warmup | Fails correctness, quality below acceptable, and meaningful regressions |
+| `lab` (default) | 30 measured, 2 warmup, 1 cooldown | Fails correctness; reports noisy rows without failing quality |
+| `release` | 10 measured, 1 warmup | Fails correctness, quality below acceptable, and meaningful regressions |
 | `smoke` | 1 measured, 0 warmup | Explicit diagnostic override; correctness-focused, no quality/regression failure |
-| `lab` | 30 measured, 2 warmup, 1 cooldown | Fails correctness; reports noisy rows without failing quality |
 
 Quality classes:
 
@@ -164,7 +204,7 @@ Command-line arguments override `STRESS_*` environment variables, which override
 | `STRESS_WARMUP_SAMPLES` | Warmup samples |
 | `STRESS_COOLDOWN_SAMPLES` | Cooldown samples |
 | `STRESS_FILTER` | Benchmark name/module filter |
-| `STRESS_TIER` | Exact tier filter |
+| `STRESS_TIER` | Exact tier filter, 1 through 6 |
 | `STRESS_OUTPUT_DIR` | Artifact output directory |
 | `STRESS_CONSOLE` | Console mode: `default`, `verbose`, `quiet`, `json`, or `markdown` |
 | `STRESS_INCLUDE_IGNORED` | Include ignored benchmarks |

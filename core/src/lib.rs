@@ -1,6 +1,6 @@
 //! # cntryl-stress
 //!
-//! A raw-sample-first stress benchmarking framework for Tier 1 through Tier N
+//! A raw-sample-first stress benchmarking framework for Tier 1 through Tier 6
 //! performance work.
 //!
 //! Tier labels:
@@ -61,7 +61,7 @@ pub use result::{
     BenchmarkBudgets, BenchmarkMode, BenchmarkModeKind, BenchmarkSpec, BenchmarkSummary,
     BudgetResult, ComparisonClass, ComparisonResult, ConfidenceInterval, CorrectnessCounters,
     CorrectnessSummary, EnvironmentInfo, PrimaryMetric, ProfileConfig, QualityClass, RunProfile,
-    Sample, SamplePhase, StressRun, SummaryStats, SCHEMA_VERSION,
+    Sample, SamplePhase, StressRun, SummaryStats, MAX_TIER, SCHEMA_VERSION,
 };
 pub use runner::{evaluate_run_gate, RunGate, StressRunner};
 pub use std::hint::black_box;

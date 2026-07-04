@@ -5,14 +5,14 @@ use crate::context::StressContext;
 use crate::report::{ConsoleReporter, JsonReporter, Reporter};
 use crate::result::{
     compare_summaries, summarize_benchmark, BenchmarkModeKind, BenchmarkSpec, ComparisonClass,
-    EnvironmentInfo, Sample, SamplePhase, StressRun, SCHEMA_VERSION,
+    EnvironmentInfo, Sample, SamplePhase, StressRun, MAX_TIER, SCHEMA_VERSION,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
 
-/// Runner for Tier 1 through Tier N stress benchmarks.
+/// Runner for Tier 1 through Tier 6 stress benchmarks.
 pub struct StressRunner {
     suite: String,
     config: StressRunnerConfig,
@@ -133,10 +133,26 @@ impl StressRunner {
     }
 
     /// Run a benchmark using a complete spec.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `spec.tier` is outside the defined range of 1 through 6.
     pub fn run_spec<F>(&mut self, mut spec: BenchmarkSpec, f: F)
     where
         F: Fn(&mut StressContext),
     {
+        assert!(
+            (1..=MAX_TIER).contains(&spec.tier),
+            "Benchmark '{}' has invalid tier {}; tiers are 1 through {MAX_TIER}",
+            spec.name,
+            spec.tier
+        );
+        if let Err(error) = spec.mode.kind().validate_for_tier(spec.tier) {
+            panic!(
+                "Benchmark '{}' has invalid tier/mode combination: {error}",
+                spec.name
+            );
+        }
         if !self.should_run(&spec) {
             return;
         }
@@ -252,11 +268,11 @@ impl StressRunner {
     where
         F: Fn(&mut StressContext),
     {
-        let mut ctx = StressContext::new(spec.mode.clone());
+        let mut ctx = StressContext::new(spec.tier, spec.mode.clone());
         f(&mut ctx);
         let duration = ctx.duration.unwrap_or_else(|| {
             panic!(
-                "Benchmark '{}' did not record a duration. Call ctx.measure(), ctx.measure_for(), ctx.measure_workload(), or ctx.record_duration() exactly once.",
+                "Benchmark '{}' did not record a duration. Call the tier-appropriate timing helper exactly once.",
                 spec.name
             )
         });
@@ -458,7 +474,8 @@ pub fn evaluate_run_gate(run: &StressRun) -> RunGate {
 mod tests {
     use super::*;
     use crate::result::{
-        BenchmarkBudgets, BenchmarkMode, CorrectnessCounters, PrimaryMetric, RunProfile,
+        BenchmarkBudgets, BenchmarkMode, BenchmarkModeKind, CorrectnessCounters, PrimaryMetric,
+        RunProfile,
     };
     use std::time::Duration;
 
@@ -502,6 +519,54 @@ mod tests {
 
         let run = runner.finish();
         assert!(run.summaries.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "tiers are 1 through 6")]
+    fn run_spec_rejects_undefined_tiers() {
+        let config = StressRunnerConfig::new().verbose(false);
+        let mut runner = StressRunner::with_config("suite", config);
+        runner.reporters(Vec::new());
+        let spec = BenchmarkSpec {
+            id: "suite/undefined".to_string(),
+            name: "undefined".to_string(),
+            tier: MAX_TIER + 1,
+            mode: BenchmarkMode::FixedOperations {
+                operations_per_sample: 1,
+            },
+            budgets: crate::result::BenchmarkBudgets::default(),
+            parameters: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+        };
+
+        runner.run_spec(spec, |ctx| {
+            ctx.measure(|| {});
+        });
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "Tier 3 uses fixed_duration; remove mode or use tier = 2 for fixed_operations."
+    )]
+    fn run_spec_rejects_tier_mode_mismatches() {
+        let config = StressRunnerConfig::new().verbose(false);
+        let mut runner = StressRunner::with_config("suite", config);
+        runner.reporters(Vec::new());
+        let spec = BenchmarkSpec {
+            id: "suite/mismatch".to_string(),
+            name: "mismatch".to_string(),
+            tier: 3,
+            mode: BenchmarkMode::FixedOperations {
+                operations_per_sample: 1,
+            },
+            budgets: crate::result::BenchmarkBudgets::default(),
+            parameters: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+        };
+
+        runner.run_spec(spec, |ctx| {
+            let _ = ctx.measure_workload(|| {});
+        });
     }
 
     #[test]
@@ -563,7 +628,7 @@ mod tests {
         let spec = BenchmarkSpec {
             id: "suite/throughput".to_string(),
             name: "throughput".to_string(),
-            tier: 2,
+            tier: 3,
             mode: BenchmarkMode::FixedDuration {
                 sample_duration: Duration::from_millis(1),
             },
@@ -585,6 +650,62 @@ mod tests {
 
         assert!(run.samples[0].operations_completed > 0);
         assert!(run.samples[0].throughput > 0.0);
+    }
+
+    #[test]
+    fn tier2_counted_recipe_records_logical_operation_totals() {
+        let config = StressRunnerConfig::for_profile(RunProfile::Smoke).verbose(false);
+        let mut runner = StressRunner::with_config("suite", config.clone());
+        runner.reporters(Vec::new());
+        let spec = BenchmarkSpec {
+            id: "suite/counted".to_string(),
+            name: "counted".to_string(),
+            tier: 2,
+            mode: config.mode_for_kind(BenchmarkModeKind::FixedOperations),
+            budgets: BenchmarkBudgets::default(),
+            parameters: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+        };
+
+        runner.run_spec(spec, |ctx| {
+            let completed = ctx.measure_counted(|| {
+                for _ in 0..3 {
+                    std::hint::black_box(1_u64);
+                }
+                768
+            });
+            assert_eq!(completed, 768);
+        });
+        let run = runner.finish();
+        let sample = &run.samples[0];
+
+        assert_eq!(sample.operations_attempted, 768);
+        assert_eq!(sample.operations_completed, 768);
+        assert_eq!(sample.counters.attempted, 768);
+        assert_eq!(sample.counters.completed, 768);
+        assert!(sample.throughput > 0.0);
+    }
+
+    #[test]
+    fn externally_timed_recipe_records_logical_throughput_without_allocation_stats() {
+        let config = StressRunnerConfig::for_profile(RunProfile::Smoke).verbose(false);
+        let mut runner = StressRunner::with_config("suite", config);
+        runner.reporters(Vec::new());
+
+        runner.run("external", |ctx| {
+            ctx.record_external(Duration::from_millis(10), 500);
+        });
+        let run = runner.finish();
+        let sample = &run.samples[0];
+
+        assert_eq!(sample.elapsed_ns, 10_000_000);
+        assert_eq!(sample.operations_attempted, 500);
+        assert_eq!(sample.operations_completed, 500);
+        assert!((sample.throughput - 50_000.0).abs() < f64::EPSILON);
+        assert!(sample.allocs.is_none());
+        assert!(sample.bytes.is_none());
+        assert!(sample.allocs_per_op.is_none());
+        assert!(sample.bytes_per_op.is_none());
     }
 
     #[test]
