@@ -2,7 +2,7 @@
 name = "cntryl-stress"
 version = "0.3.0"
 edition = "2021"
-description = "Raw-sample-first stress benchmarking framework for Tier 2 through Tier N performance work"
+description = "Raw-sample-first stress benchmarking framework for Tier 1 through Tier N performance work"
 license = "Apache-2.0"
 repository = "https://github.com/cntryl/stress"
 keywords = ["benchmark", "stress", "testing", "performance"]
@@ -10,12 +10,13 @@ categories = ["development-tools::profiling", "development-tools::testing"]
 
 [features]
 default = []
+cli = ["dep:anyhow", "dep:clap"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-clap = { version = "4", features = ["derive"] }
-anyhow = "1"
+clap = { version = "4", features = ["derive"], optional = true }
+anyhow = { version = "1", optional = true }
 linkme = "0.3"
 cntryl-stress-macros = { version = "0.3", path = "../macros" }
 
@@ -25,3 +26,4 @@ tempfile = "3"
 [[bin]]
 name = "cargo-stress"
 path = "src/bin/cargo-stress.rs"
+required-features = ["cli"]

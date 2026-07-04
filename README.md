@@ -47,6 +47,12 @@ stress_main!();
 ```bash
 cargo bench --bench storage_stress
 cargo bench --bench storage_stress -- --workload '*fanout*'
+```
+
+The optional `cargo stress` wrapper is feature-gated so ordinary benchmark builds do not compile its CLI dependency graph:
+
+```bash
+cargo install cntryl-stress --features cli
 cargo stress
 cargo stress --baseline target/stress/storage_stress/latest.json
 ```
