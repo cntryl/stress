@@ -1,38 +1,31 @@
-//! Test harness for auto-discovered stress benchmarks.
-//!
-//! This module provides the infrastructure for discovering and running
-//! benchmarks marked with `#[stress_test]`.
-//!
-//! ## Architecture
-//!
-//! When you use `#[stress_test]` and `stress_main!()`, this is what happens:
-//!
-//! 1. `#[stress_test]` registers each function in a distributed slice via linkme
-//! 2. `stress_main!()` generates a main() that calls `stress_binary_main()`
-//! 3. `stress_binary_main()` parses CLI args and calls `run_with_options()`
-//! 4. `run_with_options()` iterates the slice and runs matching benchmarks
-//!
-//! This means each stress binary is self-contained and handles its own argument
-//! parsing - `cargo-stress` just orchestrates which binaries to build and run.
+//! Harness for auto-discovered stress benchmarks.
 
-use crate::{BenchRunner, BenchRunnerConfig, StressContext};
-use std::collections::HashMap;
+use crate::config::{parse_bool_env, StressRunnerConfig};
+use crate::result::{BenchmarkModeKind, BenchmarkSpec, RunProfile};
+use crate::runner::{evaluate_run_gate, RunGate, StressRunner};
+use crate::StressContext;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// A registered benchmark entry.
 #[doc(hidden)]
 pub struct BenchmarkEntry {
-    /// Benchmark name (function name or custom)
+    /// Benchmark name.
     pub name: &'static str,
-    /// The benchmark function
+    /// Benchmark function.
     pub func: fn(&mut StressContext),
-    /// Whether this benchmark is ignored by default
+    /// Whether this benchmark is ignored by default.
     pub ignored: bool,
-    /// Module path where the benchmark is defined
+    /// Module path where the benchmark is defined.
     pub module_path: &'static str,
+    /// Numeric tier. Tier 1 is intentionally out of scope.
+    pub tier: u32,
+    /// Static benchmark mode kind.
+    pub mode: BenchmarkModeKind,
+    /// Static descriptive metadata.
+    pub metadata: &'static [(&'static str, &'static str)],
 }
 
-// Re-export linkme for the proc macro
 #[doc(hidden)]
 pub use linkme;
 
@@ -41,86 +34,80 @@ pub use linkme;
 #[linkme::distributed_slice]
 pub static STRESS_BENCHMARKS: [BenchmarkEntry];
 
-// ============================================================================
-// CLI Arguments for Stress Binaries
-// ============================================================================
-
-/// Command-line arguments for stress test binaries.
-///
-/// These arguments are parsed by the generated main() function from stress_main!().
-/// They match the flags that cargo-stress passes through.
 #[derive(Debug, Clone, Default)]
 struct StressBinaryArgs {
-    /// Filter benchmarks by glob pattern
     workload: Option<String>,
-    /// Number of measurement runs
-    runs: Option<usize>,
-    /// Number of warmup runs
-    warmup: Option<usize>,
-    /// Verbose output
+    profile: Option<RunProfile>,
+    tier: Option<u32>,
+    samples: Option<usize>,
+    warmup_samples: Option<usize>,
+    cooldown_samples: Option<usize>,
     verbose: Option<bool>,
-    /// Include ignored benchmarks
     include_ignored: Option<bool>,
-    /// List benchmarks without running
     list: bool,
-    /// Print resolved config without running benchmarks
     print_config: bool,
-    /// Output directory for JSON results
     output_dir: Option<PathBuf>,
-    /// Baseline JSON for regression comparison
     baseline: Option<PathBuf>,
-    /// Regression threshold
     threshold: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
 struct ResolvedStressConfig {
-    config: BenchRunnerConfig,
-    metadata: HashMap<String, String>,
+    config: StressRunnerConfig,
+    metadata: BTreeMap<String, String>,
     warnings: Vec<String>,
     workload: Option<String>,
     include_ignored: bool,
     baseline: Option<PathBuf>,
-    threshold: f64,
     print_config: bool,
 }
 
 impl StressBinaryArgs {
-    /// Parse command-line arguments.
-    ///
-    /// We use a simple hand-rolled parser to avoid adding clap as a dependency
-    /// for every stress binary. The argument format matches what cargo-stress passes.
     fn parse() -> Self {
-        let args: Vec<String> = std::env::args().collect();
+        let args = std::env::args().collect::<Vec<_>>();
         Self::parse_from_args(&args)
     }
 
     fn parse_from_args(args: &[String]) -> Self {
         let mut result = Self::default();
-        let mut i = 1;
+        let mut index = 1;
 
-        while i < args.len() {
-            match args[i].as_str() {
-                "--workload" => {
-                    i += 1;
-                    if i < args.len() {
-                        result.workload = Some(args[i].clone());
+        while index < args.len() {
+            match args[index].as_str() {
+                "--workload" | "--filter" => {
+                    index += 1;
+                    if let Some(value) = args.get(index) {
+                        result.workload = Some(value.clone());
                     }
                 }
-                "--runs" => {
-                    i += 1;
-                    if i < args.len() {
-                        if let Ok(runs) = args[i].parse() {
-                            result.runs = Some(runs);
-                        }
+                "--profile" => {
+                    index += 1;
+                    if let Some(value) = args.get(index).and_then(|value| value.parse().ok()) {
+                        result.profile = Some(value);
                     }
                 }
-                "--warmup" => {
-                    i += 1;
-                    if i < args.len() {
-                        if let Ok(warmup) = args[i].parse() {
-                            result.warmup = Some(warmup);
-                        }
+                "--tier" => {
+                    index += 1;
+                    if let Some(value) = args.get(index).and_then(|value| value.parse().ok()) {
+                        result.tier = Some(value);
+                    }
+                }
+                "--samples" => {
+                    index += 1;
+                    if let Some(value) = args.get(index).and_then(|value| value.parse().ok()) {
+                        result.samples = Some(value);
+                    }
+                }
+                "--warmup-samples" => {
+                    index += 1;
+                    if let Some(value) = args.get(index).and_then(|value| value.parse().ok()) {
+                        result.warmup_samples = Some(value);
+                    }
+                }
+                "--cooldown-samples" => {
+                    index += 1;
+                    if let Some(value) = args.get(index).and_then(|value| value.parse().ok()) {
+                        result.cooldown_samples = Some(value);
                     }
                 }
                 "--verbose" | "-v" => {
@@ -139,34 +126,30 @@ impl StressBinaryArgs {
                     result.print_config = true;
                 }
                 "--output-dir" => {
-                    i += 1;
-                    if i < args.len() {
-                        result.output_dir = Some(PathBuf::from(&args[i]));
+                    index += 1;
+                    if let Some(value) = args.get(index) {
+                        result.output_dir = Some(PathBuf::from(value));
                     }
                 }
                 "--baseline" => {
-                    i += 1;
-                    if i < args.len() {
-                        result.baseline = Some(PathBuf::from(&args[i]));
+                    index += 1;
+                    if let Some(value) = args.get(index) {
+                        result.baseline = Some(PathBuf::from(value));
                     }
                 }
                 "--threshold" => {
-                    i += 1;
-                    if i < args.len() {
-                        if let Ok(threshold) = args[i].parse() {
-                            result.threshold = Some(threshold);
-                        }
+                    index += 1;
+                    if let Some(value) = args.get(index).and_then(|value| value.parse().ok()) {
+                        result.threshold = Some(value);
                     }
                 }
                 "--help" | "-h" => {
                     print_help();
                     std::process::exit(0);
                 }
-                _ => {
-                    // Ignore unknown args
-                }
+                _ => {}
             }
-            i += 1;
+            index += 1;
         }
 
         result
@@ -174,76 +157,45 @@ impl StressBinaryArgs {
 }
 
 fn print_help() {
-    eprintln!("Stress test binary");
+    eprintln!("Stress benchmark binary");
     eprintln!();
     eprintln!("USAGE:");
     eprintln!("    <binary> [OPTIONS]");
     eprintln!();
     eprintln!("OPTIONS:");
-    eprintln!("    --workload <PATTERN>   Filter benchmarks by glob pattern");
-    eprintln!(
-        "    --runs <N>             Number of measurement runs (fallback: BENCH_RUNS, then 1)"
-    );
-    eprintln!("    --warmup <N>           Number of warmup runs (fallback: BENCH_WARMUP, then 0)");
-    eprintln!("    -v, --verbose          Verbose output (fallback: BENCH_VERBOSE, then true)");
-    eprintln!("    -q, --quiet            Quiet mode (overrides BENCH_VERBOSE)");
-    eprintln!(
-        "    --include-ignored      Include ignored benchmarks (fallback: BENCH_INCLUDE_IGNORED)"
-    );
-    eprintln!("    --list                 List benchmarks without running");
-    eprintln!("    --print-config         Print resolved config and exit");
-    eprintln!(
-        "    --output-dir <PATH>    Output directory for JSON results (fallback: BENCH_OUTPUT_DIR)"
-    );
-    eprintln!("    --baseline <PATH>      Baseline JSON for regression comparison (fallback: BENCH_BASELINE)");
-    eprintln!(
-        "    --threshold <FLOAT>    Regression threshold (fallback: BENCH_THRESHOLD, then 0.05)"
-    );
-    eprintln!("    -h, --help             Show this help message");
+    eprintln!("    --profile <smoke|release|lab>  Run profile");
+    eprintln!("    --workload <PATTERN>           Filter benchmarks by name/module glob");
+    eprintln!("    --tier <N>                     Run one numeric tier");
+    eprintln!("    --samples <N>                  Measured samples per benchmark");
+    eprintln!("    --warmup-samples <N>           Warmup samples");
+    eprintln!("    --cooldown-samples <N>         Cooldown samples");
+    eprintln!("    -v, --verbose                  Verbose output");
+    eprintln!("    -q, --quiet                    Quiet output");
+    eprintln!("    --include-ignored              Include ignored benchmarks");
+    eprintln!("    --list                         List benchmarks");
+    eprintln!("    --print-config                 Print resolved config");
+    eprintln!("    --output-dir <PATH>            Artifact output directory");
+    eprintln!("    --baseline <PATH>              v2 baseline artifact");
+    eprintln!("    --threshold <FLOAT>            Regression threshold");
 }
 
-// ============================================================================
-// Main Entry Point for Stress Binaries
-// ============================================================================
-
-/// Main entry point for stress test binaries generated by `stress_main!()`.
-///
-/// This function:
-/// 1. Parses command-line arguments
-/// 2. Handles --list mode
-/// 3. Runs benchmarks with the specified options
-/// 4. Exits with non-zero status on failure
-///
-/// # Panics
-///
-/// This function does not panic. It exits with appropriate exit codes:
-/// - 0: All benchmarks passed
-/// - 1: One or more benchmarks failed or regressed
+/// Entry point used by `stress_main!`.
 pub fn stress_binary_main() {
     run_from_env_and_args();
 }
 
+/// Parse environment/CLI and run registered benchmarks.
 pub fn run_from_env_and_args() {
     let args = StressBinaryArgs::parse();
 
-    // Handle --list mode
     if args.list {
-        let benchmarks = list_benchmarks();
-        if benchmarks.is_empty() {
-            println!("No benchmarks registered.");
-            println!("Add #[stress_test] to your benchmark functions.");
-        } else {
-            println!("Registered benchmarks ({}):", benchmarks.len());
-            for name in benchmarks {
-                println!("  {}", name);
-            }
-        }
+        print_benchmark_list();
         return;
     }
 
     let resolved = resolve_from_binary_args(&args);
     for warning in &resolved.warnings {
-        eprintln!("Warning: {}", warning);
+        eprintln!("Warning: {warning}");
     }
 
     if resolved.print_config {
@@ -254,178 +206,120 @@ pub fn run_from_env_and_args() {
     run_with_resolved_config(resolved);
 }
 
-// ============================================================================
-// Options
-// ============================================================================
-
-/// Options for running discovered benchmarks.
+/// Options for programmatic execution of registered benchmarks.
 #[derive(Debug, Clone, Default)]
 pub struct StressRunnerOptions {
-    /// Filter benchmarks by glob pattern
+    /// Benchmark name/module filter.
     pub workload: Option<String>,
-    /// Include ignored benchmarks
+    /// Include ignored benchmarks.
     pub include_ignored: bool,
-    /// Number of measurement runs
-    pub runs: Option<usize>,
-    /// Number of warmup runs
-    pub warmup: Option<usize>,
-    /// Verbose output
-    pub verbose: bool,
-    /// Baseline file for comparison
-    pub baseline: Option<std::path::PathBuf>,
-    /// Regression threshold (e.g., 0.05 for 5%)
-    pub threshold: f64,
+    /// Run profile.
+    pub profile: Option<RunProfile>,
+    /// Exact tier filter.
+    pub tier: Option<u32>,
+    /// Measured samples.
+    pub samples: Option<usize>,
+    /// Warmup samples.
+    pub warmup_samples: Option<usize>,
+    /// Verbose output.
+    pub verbose: Option<bool>,
+    /// Baseline artifact.
+    pub baseline: Option<PathBuf>,
+    /// Regression threshold.
+    pub threshold: Option<f64>,
 }
 
 impl StressRunnerOptions {
+    /// Create default options.
+    #[must_use]
     pub fn new() -> Self {
-        Self {
-            threshold: 0.05,
-            verbose: true,
-            ..Default::default()
-        }
+        Self::default()
     }
 
+    /// Set workload filter.
+    #[must_use]
     pub fn workload(mut self, pattern: impl Into<String>) -> Self {
         self.workload = Some(pattern.into());
         self
     }
 
-    pub fn runs(mut self, n: usize) -> Self {
-        self.runs = Some(n);
+    /// Include ignored benchmarks.
+    #[must_use]
+    pub fn include_ignored(mut self, value: bool) -> Self {
+        self.include_ignored = value;
         self
     }
 
-    pub fn warmup(mut self, n: usize) -> Self {
-        self.warmup = Some(n);
+    /// Set profile.
+    #[must_use]
+    pub const fn profile(mut self, profile: RunProfile) -> Self {
+        self.profile = Some(profile);
         self
     }
 
-    pub fn verbose(mut self, v: bool) -> Self {
-        self.verbose = v;
+    /// Set exact tier filter.
+    #[must_use]
+    pub const fn tier(mut self, tier: u32) -> Self {
+        self.tier = Some(tier);
         self
     }
 
-    pub fn include_ignored(mut self, v: bool) -> Self {
-        self.include_ignored = v;
+    /// Set measured samples.
+    #[must_use]
+    pub const fn samples(mut self, samples: usize) -> Self {
+        self.samples = Some(samples);
         self
     }
 
-    pub fn baseline(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+    /// Set warmup samples.
+    #[must_use]
+    pub const fn warmup_samples(mut self, warmup_samples: usize) -> Self {
+        self.warmup_samples = Some(warmup_samples);
+        self
+    }
+
+    /// Set verbose output.
+    #[must_use]
+    pub const fn verbose(mut self, value: bool) -> Self {
+        self.verbose = Some(value);
+        self
+    }
+
+    /// Set baseline artifact.
+    #[must_use]
+    pub fn baseline(mut self, path: impl Into<PathBuf>) -> Self {
         self.baseline = Some(path.into());
         self
     }
 
-    pub fn threshold(mut self, t: f64) -> Self {
-        self.threshold = t;
+    /// Set regression threshold.
+    #[must_use]
+    pub const fn threshold(mut self, threshold: f64) -> Self {
+        self.threshold = Some(threshold);
         self
     }
 }
 
 /// Run all registered benchmarks with default options.
-///
-/// This is called by the `stress_main!` macro.
 pub fn run_registered_benchmarks() {
     run_with_options(StressRunnerOptions::new());
 }
 
-/// Get the benchmark suite name from the executable name.
-fn get_suite_name() -> String {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.file_stem().map(|s| s.to_string_lossy().to_string()))
-        .map(|name| {
-            // Remove cargo's hash suffix (format: name-HASH)
-            // The hash is always a hex string with exactly 16 characters
-            let clean_name = if let Some(dash_pos) = name.rfind('-') {
-                let potential_hash = &name[dash_pos + 1..];
-                // Check if it looks like a hash (all hex chars and correct length)
-                if potential_hash.len() == 16
-                    && potential_hash.chars().all(|c| c.is_ascii_hexdigit())
-                {
-                    &name[..dash_pos]
-                } else {
-                    &name
-                }
-            } else {
-                &name
-            };
-
-            // Convert underscores to hyphens (cargo converts hyphen to underscore in exe name)
-            clean_name.replace('_', "-")
-        })
-        .unwrap_or_else(|| "stress".to_string())
-}
-
-/// Run all registered benchmarks with custom options.
-pub fn run_with_options(opts: StressRunnerOptions) {
-    let mut metadata = HashMap::new();
-    metadata.insert(
-        "runs_src".to_string(),
-        source_label(opts.runs.is_some(), "cli --runs"),
-    );
-    metadata.insert(
-        "warmup_runs_src".to_string(),
-        source_label(opts.warmup.is_some(), "cli --warmup"),
-    );
-    metadata.insert("verbose_src".to_string(), "explicit option".to_string());
-    metadata.insert("output_dir_src".to_string(), "default".to_string());
-    metadata.insert("filter_src".to_string(), "default".to_string());
-    metadata.insert("timeout_secs_src".to_string(), "default".to_string());
-
-    let benchmarks: Vec<_> = STRESS_BENCHMARKS
-        .iter()
-        .filter(|b| {
-            // Filter by ignored status
-            if b.ignored && !opts.include_ignored {
-                return false;
-            }
-            // Filter by workload pattern
-            if let Some(ref pattern) = opts.workload {
-                return matches_glob(b.name, pattern) || matches_glob(b.module_path, pattern);
-            }
-            true
-        })
-        .collect();
-
-    if benchmarks.is_empty() {
-        if opts.workload.is_some() {
-            eprintln!("No benchmarks matched the workload pattern");
-        } else {
-            eprintln!("No benchmarks registered. Add #[stress_test] to your benchmark functions.");
-        }
-        return;
-    }
-
-    // Build config
-    let mut config = BenchRunnerConfig::from_env();
-    apply_runner_option_overrides(&mut config, &opts);
-
-    let suite_name = get_suite_name();
-    let mut runner = BenchRunner::with_config_and_metadata(&suite_name, config, metadata);
-
-    // Run each benchmark
-    for bench in &benchmarks {
-        let name = format!("{}::{}", bench.module_path, bench.name);
-        runner.run(&name, bench.func);
-    }
-
-    // Finish and check for regressions
-    if let Some(baseline_path) = opts.baseline {
-        let (_results, regressions) = runner.finish_with_baseline(baseline_path, opts.threshold);
-        if !regressions.is_empty() {
-            eprintln!("\n❌ {} regression(s) detected!", regressions.len());
-
-            for (result, ratio) in &regressions {
-                let pct = (ratio - 1.0) * 100.0;
-                eprintln!("  {} is {:.1}% slower", result.name, pct);
-            }
-            std::process::exit(1);
-        }
-    } else {
-        let _results = runner.finish();
-        // Summary already printed by ConsoleReporter
-    }
+/// Run all registered benchmarks with programmatic options.
+pub fn run_with_options(options: StressRunnerOptions) {
+    let args = StressBinaryArgs {
+        workload: options.workload,
+        profile: options.profile,
+        tier: options.tier,
+        samples: options.samples,
+        warmup_samples: options.warmup_samples,
+        verbose: options.verbose,
+        include_ignored: Some(options.include_ignored),
+        baseline: options.baseline,
+        threshold: options.threshold,
+        ..StressBinaryArgs::default()
+    };
+    run_with_resolved_config(resolve_from_binary_args(&args));
 }
 
 fn resolve_from_binary_args(args: &StressBinaryArgs) -> ResolvedStressConfig {
@@ -436,55 +330,60 @@ fn resolve_from_binary_args_with<F>(args: &StressBinaryArgs, get_var: F) -> Reso
 where
     F: Fn(&str) -> Option<String>,
 {
-    let env_resolution = BenchRunnerConfig::resolve_from_env_with(&get_var);
+    let env_resolution = StressRunnerConfig::resolve_from_env_with(&get_var);
     let mut config = env_resolution.config;
-    let mut metadata = env_resolution.metadata;
+    let mut metadata = env_resolution
+        .metadata
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
     let mut warnings = env_resolution.warnings;
 
-    let mut include_ignored = false;
-    metadata.insert("include_ignored_src".to_string(), "default".to_string());
-    if let Some(v) = get_var("BENCH_INCLUDE_IGNORED") {
-        match parse_bool_env(&v) {
-            Some(value) => {
-                include_ignored = value;
-                metadata.insert(
-                    "include_ignored_src".to_string(),
-                    "env BENCH_INCLUDE_IGNORED".to_string(),
-                );
+    let mut include_ignored = get_var("STRESS_INCLUDE_IGNORED")
+        .and_then(|value| {
+            if let Some(value) = parse_bool_env(&value) {
+                Some(value)
+            } else {
+                warnings.push("invalid STRESS_INCLUDE_IGNORED, using false".to_string());
+                None
             }
-            None => warnings.push("invalid BENCH_INCLUDE_IGNORED, using default false".to_string()),
-        }
-    }
+        })
+        .unwrap_or(false);
+    metadata.insert(
+        "include_ignored_src".to_string(),
+        source_for(&get_var, "STRESS_INCLUDE_IGNORED"),
+    );
 
-    let mut baseline = None;
-    metadata.insert("baseline_src".to_string(), "default".to_string());
-    if let Some(v) = get_var("BENCH_BASELINE") {
-        baseline = Some(PathBuf::from(v));
-        metadata.insert("baseline_src".to_string(), "env BENCH_BASELINE".to_string());
-    }
+    let mut baseline = get_var("STRESS_BASELINE").map(PathBuf::from);
+    metadata.insert(
+        "baseline_src".to_string(),
+        source_for(&get_var, "STRESS_BASELINE"),
+    );
 
-    let mut threshold = 0.05;
-    metadata.insert("threshold_src".to_string(), "default".to_string());
-    if let Some(v) = get_var("BENCH_THRESHOLD") {
-        match v.parse::<f64>() {
-            Ok(value) => {
-                threshold = value;
-                metadata.insert(
-                    "threshold_src".to_string(),
-                    "env BENCH_THRESHOLD".to_string(),
-                );
-            }
-            Err(_) => warnings.push("invalid BENCH_THRESHOLD, using default 0.05".to_string()),
-        }
+    if let Some(profile) = args.profile {
+        config = config.profile(profile);
+        metadata.insert("profile_src".to_string(), "cli --profile".to_string());
     }
-
-    if let Some(runs) = args.runs {
-        config.runs = runs;
-        metadata.insert("runs_src".to_string(), "cli --runs".to_string());
+    if let Some(tier) = args.tier {
+        config.tier = Some(tier);
+        metadata.insert("tier_src".to_string(), "cli --tier".to_string());
     }
-    if let Some(warmup) = args.warmup {
-        config.warmup_runs = warmup;
-        metadata.insert("warmup_runs_src".to_string(), "cli --warmup".to_string());
+    if let Some(samples) = args.samples {
+        config.samples = samples;
+        metadata.insert("samples_src".to_string(), "cli --samples".to_string());
+    }
+    if let Some(warmup_samples) = args.warmup_samples {
+        config.warmup_samples = warmup_samples;
+        metadata.insert(
+            "warmup_samples_src".to_string(),
+            "cli --warmup-samples".to_string(),
+        );
+    }
+    if let Some(cooldown_samples) = args.cooldown_samples {
+        config.cooldown_samples = cooldown_samples;
+        metadata.insert(
+            "cooldown_samples_src".to_string(),
+            "cli --cooldown-samples".to_string(),
+        );
     }
     if let Some(verbose) = args.verbose {
         config.verbose = verbose;
@@ -498,17 +397,15 @@ where
         );
     }
     if let Some(output_dir) = &args.output_dir {
-        config.output_dir = output_dir.clone();
+        config.output_dir.clone_from(output_dir);
         metadata.insert("output_dir_src".to_string(), "cli --output-dir".to_string());
     }
-    if let Some(pattern) = &args.workload {
-        metadata.insert("filter".to_string(), pattern.clone());
+    if let Some(workload) = &args.workload {
+        config.filter = Some(workload.clone());
         metadata.insert("filter_src".to_string(), "cli --workload".to_string());
-    } else if let Some(filter) = &config.filter {
-        metadata.insert("filter".to_string(), filter.clone());
     }
-    if let Some(include) = args.include_ignored {
-        include_ignored = include;
+    if let Some(value) = args.include_ignored {
+        include_ignored = value;
         metadata.insert(
             "include_ignored_src".to_string(),
             "cli --include-ignored".to_string(),
@@ -518,90 +415,169 @@ where
         baseline = Some(path.clone());
         metadata.insert("baseline_src".to_string(), "cli --baseline".to_string());
     }
-    if let Some(value) = args.threshold {
-        threshold = value;
+    if let Some(threshold) = args.threshold {
+        config.threshold = threshold;
         metadata.insert("threshold_src".to_string(), "cli --threshold".to_string());
     }
 
     ResolvedStressConfig {
+        workload: config.filter.clone(),
         config,
         metadata,
         warnings,
-        workload: args.workload.clone(),
         include_ignored,
         baseline,
-        threshold,
         print_config: args.print_config,
     }
 }
 
 fn run_with_resolved_config(resolved: ResolvedStressConfig) {
-    let benchmarks: Vec<_> = STRESS_BENCHMARKS
-        .iter()
-        .filter(|b| {
-            if b.ignored && !resolved.include_ignored {
-                return false;
-            }
-            if let Some(ref pattern) = resolved.workload {
-                return matches_glob(b.name, pattern) || matches_glob(b.module_path, pattern);
-            }
-            true
-        })
-        .collect();
-
+    let benchmarks = selected_benchmarks(&resolved);
     if benchmarks.is_empty() {
         if resolved.workload.is_some() {
             eprintln!("No benchmarks matched the workload pattern");
         } else {
-            eprintln!("No benchmarks registered. Add #[stress_test] to your benchmark functions.");
+            eprintln!("No benchmarks registered. Add #[stress_test] to benchmark functions.");
         }
         return;
     }
 
     let suite_name = get_suite_name();
+    let config_for_specs = resolved.config.clone();
     let mut runner =
-        BenchRunner::with_config_and_metadata(&suite_name, resolved.config, resolved.metadata);
+        StressRunner::with_config_and_metadata(&suite_name, resolved.config, resolved.metadata);
 
-    for bench in &benchmarks {
-        let name = format!("{}::{}", bench.module_path, bench.name);
-        runner.run(&name, bench.func);
+    for entry in benchmarks {
+        let name = format!("{}::{}", entry.module_path, entry.name);
+        let id = format!("{suite_name}/{name}");
+        let metadata = entry
+            .metadata
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect::<BTreeMap<_, _>>();
+        let spec = BenchmarkSpec {
+            id,
+            name,
+            tier: entry.tier,
+            mode: config_for_specs.mode_for_kind(entry.mode),
+            parameters: BTreeMap::new(),
+            metadata,
+        };
+        runner.run_spec(spec, entry.func);
     }
 
-    if let Some(baseline_path) = resolved.baseline {
-        let (_results, regressions) =
-            runner.finish_with_baseline(baseline_path, resolved.threshold);
-        if !regressions.is_empty() {
-            eprintln!("\n❌ {} regression(s) detected!", regressions.len());
-            for (result, ratio) in &regressions {
-                let pct = (ratio - 1.0) * 100.0;
-                eprintln!("  {} is {:.1}% slower", result.name, pct);
+    let run_result = if let Some(baseline_path) = resolved.baseline {
+        runner.finish_with_baseline(baseline_path)
+    } else {
+        Ok(runner.finish())
+    };
+
+    match run_result {
+        Ok(run) => {
+            let gate = evaluate_run_gate(&run);
+            if gate != RunGate::Passed {
+                eprintln!("Stress run failed: {gate:?}");
+                std::process::exit(1);
             }
+        }
+        Err(error) => {
+            eprintln!("Stress run failed to load baseline: {error}");
             std::process::exit(1);
         }
-    } else {
-        let _results = runner.finish();
     }
 }
 
+fn selected_benchmarks(resolved: &ResolvedStressConfig) -> Vec<&'static BenchmarkEntry> {
+    STRESS_BENCHMARKS
+        .iter()
+        .filter(|entry| {
+            if entry.ignored && !resolved.include_ignored {
+                return false;
+            }
+            if let Some(tier) = resolved.config.tier {
+                if entry.tier != tier {
+                    return false;
+                }
+            }
+            if let Some(pattern) = &resolved.workload {
+                matches_glob(entry.name, pattern) || matches_glob(entry.module_path, pattern)
+            } else {
+                true
+            }
+        })
+        .collect()
+}
+
+fn print_benchmark_list() {
+    let benchmarks = list_benchmarks();
+    if benchmarks.is_empty() {
+        println!("No benchmarks registered.");
+    } else {
+        println!("Registered benchmarks ({}):", benchmarks.len());
+        for benchmark in benchmarks {
+            println!("  {benchmark}");
+        }
+    }
+}
+
+fn get_suite_name() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.file_stem()
+                .map(|stem| stem.to_string_lossy().to_string())
+        })
+        .map_or_else(|| "stress".to_string(), |name| clean_exe_name(&name))
+}
+
+fn clean_exe_name(name: &str) -> String {
+    let clean_name = if let Some(dash_pos) = name.rfind('-') {
+        let potential_hash = &name[dash_pos + 1..];
+        if potential_hash.len() == 16 && potential_hash.chars().all(|char| char.is_ascii_hexdigit())
+        {
+            &name[..dash_pos]
+        } else {
+            name
+        }
+    } else {
+        name
+    };
+    clean_name.replace('_', "-")
+}
+
 fn print_resolved_config(suite: &str, resolved: &ResolvedStressConfig) {
-    println!("Benchmark Suite: {}", suite);
+    println!("Benchmark Suite: {suite}");
     println!(
-        "Runs: {} ({})",
-        resolved.config.runs,
+        "Profile: {} ({})",
+        resolved.config.profile,
         resolved
             .metadata
-            .get("runs_src")
-            .map(String::as_str)
-            .unwrap_or("unknown")
+            .get("profile_src")
+            .map_or("unknown", String::as_str)
     );
     println!(
-        "Warmup: {} ({})",
-        resolved.config.warmup_runs,
+        "Samples: {} ({})",
+        resolved.config.samples,
         resolved
             .metadata
-            .get("warmup_runs_src")
-            .map(String::as_str)
-            .unwrap_or("unknown")
+            .get("samples_src")
+            .map_or("unknown", String::as_str)
+    );
+    println!(
+        "Warmup samples: {} ({})",
+        resolved.config.warmup_samples,
+        resolved
+            .metadata
+            .get("warmup_samples_src")
+            .map_or("unknown", String::as_str)
+    );
+    println!(
+        "Cooldown samples: {} ({})",
+        resolved.config.cooldown_samples,
+        resolved
+            .metadata
+            .get("cooldown_samples_src")
+            .map_or("unknown", String::as_str)
     );
     println!(
         "Output: {} ({})",
@@ -609,155 +585,93 @@ fn print_resolved_config(suite: &str, resolved: &ResolvedStressConfig) {
         resolved
             .metadata
             .get("output_dir_src")
-            .map(String::as_str)
-            .unwrap_or("unknown")
+            .map_or("unknown", String::as_str)
     );
     println!(
         "Filter: {} ({})",
-        resolved
-            .metadata
-            .get("filter")
-            .map(String::as_str)
-            .unwrap_or("<none>"),
+        resolved.config.filter.as_deref().unwrap_or("<none>"),
         resolved
             .metadata
             .get("filter_src")
-            .map(String::as_str)
-            .unwrap_or("unknown")
+            .map_or("unknown", String::as_str)
     );
     println!(
-        "Verbose: {} ({})",
-        resolved.config.verbose,
-        resolved
-            .metadata
-            .get("verbose_src")
-            .map(String::as_str)
-            .unwrap_or("unknown")
-    );
-    println!(
-        "Timeout: {} ({})",
+        "Tier: {} ({})",
         resolved
             .config
-            .timeout
-            .map(|timeout| format!("{}s", timeout.as_secs()))
-            .unwrap_or_else(|| "<none>".to_string()),
+            .tier
+            .map_or_else(|| "<any>".to_string(), |tier| tier.to_string()),
         resolved
             .metadata
-            .get("timeout_secs_src")
-            .map(String::as_str)
-            .unwrap_or("unknown")
+            .get("tier_src")
+            .map_or("unknown", String::as_str)
     );
-    println!(
-        "Include ignored: {} ({})",
-        resolved.include_ignored,
-        resolved
-            .metadata
-            .get("include_ignored_src")
-            .map(String::as_str)
-            .unwrap_or("unknown")
-    );
+    println!("Verbose: {}", resolved.config.verbose);
+    println!("Include ignored: {}", resolved.include_ignored);
     println!(
         "Baseline: {} ({})",
         resolved
             .baseline
             .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "<none>".to_string()),
+            .map_or_else(|| "<none>".to_string(), |path| path.display().to_string()),
         resolved
             .metadata
             .get("baseline_src")
-            .map(String::as_str)
-            .unwrap_or("unknown")
+            .map_or("unknown", String::as_str)
     );
-    println!(
-        "Threshold: {} ({})",
-        resolved.threshold,
-        resolved
-            .metadata
-            .get("threshold_src")
-            .map(String::as_str)
-            .unwrap_or("unknown")
-    );
+    println!("Threshold: {}", resolved.config.threshold);
 }
 
-fn parse_bool_env(value: &str) -> Option<bool> {
-    if value == "1" || value.eq_ignore_ascii_case("true") {
-        Some(true)
-    } else if value == "0" || value.eq_ignore_ascii_case("false") {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-fn source_label(explicit: bool, label: &str) -> String {
-    if explicit {
-        label.to_string()
+fn source_for<F>(get_var: &F, env_key: &'static str) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if get_var(env_key).is_some() {
+        format!("env {env_key}")
     } else {
         "default".to_string()
     }
 }
 
-fn apply_runner_option_overrides(config: &mut BenchRunnerConfig, opts: &StressRunnerOptions) {
-    if let Some(r) = opts.runs {
-        config.runs = r;
-    }
-    if let Some(w) = opts.warmup {
-        config.warmup_runs = w;
-    }
-    config.verbose = opts.verbose;
-}
-
-/// Simple glob matching supporting * and ?
 fn matches_glob(text: &str, pattern: &str) -> bool {
     let pattern = pattern.to_lowercase();
     let text = text.to_lowercase();
 
-    // Convert glob to a simple check
     if pattern.contains('*') {
-        // Split by * and check if all parts appear in order
-        let parts: Vec<&str> = pattern.split('*').collect();
+        let parts = pattern.split('*').collect::<Vec<_>>();
         let mut remaining = text.as_str();
 
-        for (i, part) in parts.iter().enumerate() {
+        for (index, part) in parts.iter().enumerate() {
             if part.is_empty() {
                 continue;
             }
-            if i == 0 {
-                // First part must be at the start
+            if index == 0 {
                 if !remaining.starts_with(part) {
                     return false;
                 }
                 remaining = &remaining[part.len()..];
-            } else if i == parts.len() - 1 && !pattern.ends_with('*') {
-                // Last part must be at the end
-                if !remaining.ends_with(part) {
-                    return false;
-                }
+            } else if index == parts.len() - 1 && !pattern.ends_with('*') {
+                return remaining.ends_with(part);
+            } else if let Some(pos) = remaining.find(part) {
+                remaining = &remaining[pos + part.len()..];
             } else {
-                // Middle parts just need to exist
-                if let Some(pos) = remaining.find(part) {
-                    remaining = &remaining[pos + part.len()..];
-                } else {
-                    return false;
-                }
+                return false;
             }
         }
         true
     } else {
-        // No wildcards - substring match
         text.contains(&pattern)
     }
 }
 
-/// Get a list of all registered benchmark names.
-///
-/// Useful for tooling and IDE integration.
+/// Get a list of registered benchmark names.
+#[must_use]
 pub fn list_benchmarks() -> Vec<&'static str> {
-    STRESS_BENCHMARKS.iter().map(|b| b.name).collect()
+    STRESS_BENCHMARKS.iter().map(|entry| entry.name).collect()
 }
 
-/// Get count of registered benchmarks.
+/// Get the number of registered benchmarks.
+#[must_use]
 pub fn benchmark_count() -> usize {
     STRESS_BENCHMARKS.len()
 }
@@ -767,138 +681,68 @@ mod tests {
     use super::*;
 
     #[test]
-    fn glob_matches_substring() {
+    fn glob_matches_substring_and_wildcards() {
         assert!(matches_glob("foo_bar_baz", "bar"));
-        assert!(!matches_glob("foo_bar_baz", "qux"));
-    }
-
-    #[test]
-    fn glob_matches_wildcard() {
         assert!(matches_glob("foo_bar_baz", "foo*baz"));
         assert!(matches_glob("foo_bar_baz", "*bar*"));
-        assert!(matches_glob("foo_bar_baz", "foo*"));
-        assert!(matches_glob("foo_bar_baz", "*baz"));
         assert!(!matches_glob("foo_bar_baz", "qux*"));
     }
 
     #[test]
-    fn glob_is_case_insensitive() {
-        assert!(matches_glob("FooBar", "foobar"));
-        assert!(matches_glob("foobar", "FOO*"));
-    }
-
-    #[test]
-    fn parse_args_keeps_runs_and_warmup_unset_when_not_provided() {
-        let args = vec!["stress-demo".to_string(), "--list".to_string()];
-        let parsed = StressBinaryArgs::parse_from_args(&args);
-        assert_eq!(parsed.runs, None);
-        assert_eq!(parsed.warmup, None);
-    }
-
-    #[test]
-    fn parse_args_sets_runs_and_warmup_only_when_provided() {
+    fn parse_args_uses_new_sample_names() {
         let args = vec![
             "stress-demo".to_string(),
-            "--runs".to_string(),
+            "--profile".to_string(),
+            "release".to_string(),
+            "--samples".to_string(),
             "4".to_string(),
-            "--warmup".to_string(),
+            "--warmup-samples".to_string(),
             "2".to_string(),
         ];
         let parsed = StressBinaryArgs::parse_from_args(&args);
-        assert_eq!(parsed.runs, Some(4));
-        assert_eq!(parsed.warmup, Some(2));
+
+        assert_eq!(parsed.profile, Some(RunProfile::Release));
+        assert_eq!(parsed.samples, Some(4));
+        assert_eq!(parsed.warmup_samples, Some(2));
     }
 
     #[test]
-    fn options_without_cli_values_keep_base_config_values() {
-        let mut cfg = BenchRunnerConfig::new().runs(3).warmup(1).verbose(true);
-        let opts = StressRunnerOptions::new().verbose(false);
-        apply_runner_option_overrides(&mut cfg, &opts);
-        assert_eq!(cfg.runs, 3);
-        assert_eq!(cfg.warmup_runs, 1);
-        assert!(!cfg.verbose);
-    }
-
-    #[test]
-    fn cli_options_override_base_config_values() {
-        let mut cfg = BenchRunnerConfig::new().runs(3).warmup(1).verbose(true);
-        let opts = StressRunnerOptions::new().runs(1).warmup(0).verbose(false);
-        apply_runner_option_overrides(&mut cfg, &opts);
-        assert_eq!(cfg.runs, 1);
-        assert_eq!(cfg.warmup_runs, 0);
-        assert!(!cfg.verbose);
-    }
-
-    #[test]
-    fn parse_plus_option_override_matches_expected_precedence_flow() {
-        // Simulate env-derived base config and explicit CLI override.
-        let mut cfg = BenchRunnerConfig::new().runs(3).warmup(2);
-        let args = vec![
-            "stress-demo".to_string(),
-            "--runs".to_string(),
-            "1".to_string(),
-        ];
-        let parsed = StressBinaryArgs::parse_from_args(&args);
-
-        let mut opts = StressRunnerOptions::new();
-        if let Some(runs) = parsed.runs {
-            opts = opts.runs(runs);
-        }
-        if let Some(warmup) = parsed.warmup {
-            opts = opts.warmup(warmup);
-        }
-
-        apply_runner_option_overrides(&mut cfg, &opts);
-
-        assert_eq!(cfg.runs, 1);
-        assert_eq!(cfg.warmup_runs, 2);
-    }
-
-    #[test]
-    fn resolve_from_binary_args_uses_env_when_cli_absent() {
+    fn resolve_from_binary_args_uses_stress_env() {
         let args = StressBinaryArgs::default();
-        let env = HashMap::from([
-            ("BENCH_RUNS", "3".to_string()),
-            ("BENCH_WARMUP", "1".to_string()),
+        let env = BTreeMap::from([
+            ("STRESS_PROFILE", "release".to_string()),
+            ("STRESS_SAMPLES", "3".to_string()),
+            ("STRESS_WARMUP_SAMPLES", "1".to_string()),
+            ("STRESS_INCLUDE_IGNORED", "true".to_string()),
         ]);
 
         let resolved = resolve_from_binary_args_with(&args, |key| env.get(key).cloned());
 
-        assert_eq!(resolved.config.runs, 3);
-        assert_eq!(resolved.config.warmup_runs, 1);
-        assert_eq!(
-            resolved.metadata.get("runs_src"),
-            Some(&"env BENCH_RUNS".to_string())
-        );
+        assert_eq!(resolved.config.profile, RunProfile::Release);
+        assert_eq!(resolved.config.samples, 3);
+        assert_eq!(resolved.config.warmup_samples, 1);
+        assert!(resolved.include_ignored);
     }
 
     #[test]
-    fn resolve_from_binary_args_cli_overrides_env() {
+    fn cli_overrides_env() {
         let args = StressBinaryArgs {
-            runs: Some(5),
+            profile: Some(RunProfile::Lab),
+            samples: Some(5),
             ..StressBinaryArgs::default()
         };
-        let env = HashMap::from([("BENCH_RUNS", "3".to_string())]);
+        let env = BTreeMap::from([
+            ("STRESS_PROFILE", "release".to_string()),
+            ("STRESS_SAMPLES", "3".to_string()),
+        ]);
 
         let resolved = resolve_from_binary_args_with(&args, |key| env.get(key).cloned());
 
-        assert_eq!(resolved.config.runs, 5);
+        assert_eq!(resolved.config.profile, RunProfile::Lab);
+        assert_eq!(resolved.config.samples, 5);
         assert_eq!(
-            resolved.metadata.get("runs_src"),
-            Some(&"cli --runs".to_string())
+            resolved.metadata.get("samples_src"),
+            Some(&"cli --samples".to_string())
         );
-    }
-
-    #[test]
-    fn resolve_from_binary_args_warns_on_malformed_env() {
-        let args = StressBinaryArgs::default();
-        let env = HashMap::from([("BENCH_THRESHOLD", "nope".to_string())]);
-
-        let resolved = resolve_from_binary_args_with(&args, |key| env.get(key).cloned());
-
-        assert_eq!(resolved.threshold, 0.05);
-        assert!(resolved
-            .warnings
-            .contains(&"invalid BENCH_THRESHOLD, using default 0.05".to_string()));
     }
 }

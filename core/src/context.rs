@@ -1,77 +1,122 @@
-//! Benchmark context for timing control.
+//! Benchmark context for timing, workload facts, and correctness counters.
 
+use crate::result::{BenchmarkMode, CorrectnessCounters};
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-/// Context passed to benchmark closures for timing control.
+/// Context passed to benchmark closures.
 ///
-/// The closure must call exactly one timing method to record a duration.
+/// A benchmark must record exactly one measured duration, usually with
+/// [`StressContext::measure_workload`], [`StressContext::measure`], or
+/// [`StressContext::measure_for`].
 pub struct StressContext {
+    pub(crate) mode: BenchmarkMode,
     pub(crate) duration: Option<Duration>,
-    pub(crate) bytes: Option<u64>,
-    pub(crate) elements: Option<u64>,
-    pub(crate) tags: Vec<(String, String)>,
+    pub(crate) parameters: BTreeMap<String, String>,
+    pub(crate) metadata: BTreeMap<String, String>,
+    pub(crate) latency_ns: Vec<u128>,
+    pub(crate) counters: CorrectnessCounters,
+    pub(crate) operations_hint: Option<u64>,
 }
 
 impl StressContext {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(mode: BenchmarkMode) -> Self {
         Self {
+            mode,
             duration: None,
-            bytes: None,
-            elements: None,
-            tags: Vec::new(),
+            parameters: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+            latency_ns: Vec::new(),
+            counters: CorrectnessCounters::default(),
+            operations_hint: None,
         }
     }
 
-    /// Record throughput in bytes processed.
-    ///
-    /// This enables bytes/sec reporting in results.
-    pub fn set_bytes(&mut self, bytes: u64) {
-        self.bytes = Some(bytes);
+    /// Add a structured workload parameter, such as `client_count`,
+    /// `payload_size`, `transport`, `operation`, or `scenario`.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn parameter(&mut self, key: impl Into<String>, value: impl ToString) -> &mut Self {
+        self.parameters.insert(key.into(), value.to_string());
+        self
     }
 
-    /// Record throughput in elements/operations processed.
-    ///
-    /// This enables ops/sec reporting in results.
-    pub fn set_elements(&mut self, elements: u64) {
-        self.elements = Some(elements);
+    /// Add descriptive benchmark metadata.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn metadata(&mut self, key: impl Into<String>, value: impl ToString) -> &mut Self {
+        self.metadata.insert(key.into(), value.to_string());
+        self
     }
 
-    /// Add a custom tag to this benchmark result.
-    ///
-    /// Tags are included in JSON output for filtering and grouping.
-    pub fn tag(&mut self, key: impl Into<String>, value: impl Into<String>) {
-        self.tags.push((key.into(), value.into()));
+    /// Record one latency observation.
+    pub fn record_latency(&mut self, duration: Duration) -> &mut Self {
+        self.latency_ns.push(duration.as_nanos());
+        self
+    }
+
+    /// Record canonical correctness counters.
+    #[must_use]
+    pub fn correctness(&mut self) -> CorrectnessRecorder<'_> {
+        CorrectnessRecorder {
+            counters: &mut self.counters,
+        }
     }
 
     fn set_duration(&mut self, duration: Duration) {
-        if self.duration.is_some() {
-            panic!("Timing was recorded more than once for this benchmark.");
-        }
+        assert!(
+            self.duration.is_none(),
+            "Timing was recorded more than once for this benchmark."
+        );
         self.duration = Some(duration);
     }
 
-    /// Time a single-shot operation. Call exactly once per benchmark.
+    fn set_successful_operations_if_unset(&mut self, operations: u64) {
+        self.operations_hint = Some(operations);
+        if self.counters.attempted == 0 && self.counters.completed == 0 {
+            self.counters.attempted = operations;
+            self.counters.completed = operations;
+        }
+    }
+
+    /// Time exactly one sample according to the active [`BenchmarkMode`].
     ///
-    /// Everything before this is setup (not timed).
-    /// Everything after this is teardown (not timed).
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use cntryl_stress::StressContext;
-    /// # fn example(ctx: &mut StressContext) {
-    /// let data = prepare_expensive_data();  // Not timed
-    ///
-    /// let result = ctx.measure(|| {
-    ///     process_data(&data)  // Timed
-    /// });
-    ///
-    /// validate_result(&result);  // Not timed
-    /// # }
-    /// # fn prepare_expensive_data() -> Vec<u8> { vec![] }
-    /// # fn process_data(_: &[u8]) -> bool { true }
-    /// # fn validate_result(_: &bool) {}
-    /// ```
+    /// For `fixed_duration`, the closure is called until the sample duration
+    /// elapses. For `fixed_operations`, the closure is called
+    /// `operations_per_sample` times.
+    #[must_use = "use the operation count for additional validation when needed"]
+    pub fn measure_workload<F>(&mut self, mut f: F) -> u64
+    where
+        F: FnMut(),
+    {
+        match self.mode.clone() {
+            BenchmarkMode::FixedDuration { sample_duration } => {
+                let start = Instant::now();
+                let mut operations = 0_u64;
+                loop {
+                    f();
+                    operations = operations.saturating_add(1);
+                    if start.elapsed() >= sample_duration {
+                        break;
+                    }
+                }
+                self.set_duration(start.elapsed());
+                self.set_successful_operations_if_unset(operations);
+                operations
+            }
+            BenchmarkMode::FixedOperations {
+                operations_per_sample,
+            } => {
+                let start = Instant::now();
+                for _ in 0..operations_per_sample {
+                    f();
+                }
+                self.set_duration(start.elapsed());
+                self.set_successful_operations_if_unset(operations_per_sample);
+                operations_per_sample
+            }
+        }
+    }
+
+    /// Time a single-shot operation.
     pub fn measure<F, R>(&mut self, f: F) -> R
     where
         F: FnOnce() -> R,
@@ -79,25 +124,22 @@ impl StressContext {
         let start = Instant::now();
         let result = f();
         self.set_duration(start.elapsed());
+        self.set_successful_operations_if_unset(1);
         result
     }
 
     /// Time a repeated operation until the requested wall-clock budget is met.
-    ///
-    /// The closure is executed as many times as possible until the target
-    /// duration has elapsed. The return value is the number of completed
-    /// iterations, which is useful for reporting total throughput.
     #[must_use = "use the iteration count to report throughput totals"]
     pub fn measure_for<F>(&mut self, duration: Duration, mut f: F) -> usize
     where
         F: FnMut(),
     {
         let start = Instant::now();
-        let mut iterations = 0usize;
+        let mut iterations = 0_usize;
 
         loop {
             f();
-            iterations += 1;
+            iterations = iterations.saturating_add(1);
 
             if start.elapsed() >= duration {
                 break;
@@ -105,12 +147,11 @@ impl StressContext {
         }
 
         self.set_duration(start.elapsed());
+        self.set_successful_operations_if_unset(iterations as u64);
         iterations
     }
 
-    /// Time an operation on a borrowed reference (avoids moves).
-    ///
-    /// Useful when you need to use the target after measurement.
+    /// Time an operation on a borrowed reference.
     pub fn measure_ref<F, T, R>(&mut self, target: &T, f: F) -> R
     where
         F: FnOnce(&T) -> R,
@@ -118,6 +159,7 @@ impl StressContext {
         let start = Instant::now();
         let result = f(target);
         self.set_duration(start.elapsed());
+        self.set_successful_operations_if_unset(1);
         result
     }
 
@@ -129,14 +171,70 @@ impl StressContext {
         let start = Instant::now();
         let result = f(target);
         self.set_duration(start.elapsed());
+        self.set_successful_operations_if_unset(1);
         result
     }
 
-    /// Manually record a duration (for cases where you time externally).
-    ///
-    /// Use this when the timing happens inside the system under test.
+    /// Manually record a duration for externally timed systems under test.
     pub fn record_duration(&mut self, duration: Duration) {
         self.set_duration(duration);
+        self.set_successful_operations_if_unset(1);
+    }
+}
+
+/// Fluent recorder for correctness counters.
+pub struct CorrectnessRecorder<'a> {
+    counters: &'a mut CorrectnessCounters,
+}
+
+impl CorrectnessRecorder<'_> {
+    /// Set attempted operations.
+    #[must_use]
+    pub fn attempted(self, value: u64) -> Self {
+        self.counters.attempted = value;
+        self
+    }
+
+    /// Set completed operations.
+    #[must_use]
+    pub fn completed(self, value: u64) -> Self {
+        self.counters.completed = value;
+        self
+    }
+
+    /// Set failed operations.
+    #[must_use]
+    pub fn failures(self, value: u64) -> Self {
+        self.counters.failures = value;
+        self
+    }
+
+    /// Set timed out operations.
+    #[must_use]
+    pub fn timeouts(self, value: u64) -> Self {
+        self.counters.timeouts = value;
+        self
+    }
+
+    /// Set duplicate operations/results.
+    #[must_use]
+    pub fn duplicates(self, value: u64) -> Self {
+        self.counters.duplicates = value;
+        self
+    }
+
+    /// Set dropped operations/results.
+    #[must_use]
+    pub fn dropped(self, value: u64) -> Self {
+        self.counters.dropped = value;
+        self
+    }
+
+    /// Set validation errors.
+    #[must_use]
+    pub fn validation_errors(self, value: u64) -> Self {
+        self.counters.validation_errors = value;
+        self
     }
 }
 
@@ -144,46 +242,72 @@ impl StressContext {
 mod tests {
     use super::*;
 
-    #[test]
-    fn should_measure_duration_when_called() {
-        let mut ctx = StressContext::new();
-        ctx.measure(|| std::thread::sleep(Duration::from_millis(10)));
-
-        let d = ctx.duration.unwrap();
-        assert!(d >= Duration::from_millis(10));
-        assert!(d < Duration::from_millis(100));
+    fn ctx() -> StressContext {
+        StressContext::new(BenchmarkMode::FixedOperations {
+            operations_per_sample: 3,
+        })
     }
 
     #[test]
-    fn should_measure_duration_for_budget() {
-        let mut ctx = StressContext::new();
-        let iterations = ctx.measure_for(Duration::from_millis(5), || {
-            std::hint::black_box(1usize);
+    fn measure_workload_records_fixed_operations_sample() {
+        let mut ctx = ctx();
+        let operations = ctx.measure_workload(|| {
+            std::hint::black_box(1_u64);
+        });
+
+        assert_eq!(operations, 3);
+        assert_eq!(ctx.counters.attempted, 3);
+        assert_eq!(ctx.counters.completed, 3);
+        assert!(ctx.duration.expect("duration") > Duration::ZERO);
+    }
+
+    #[test]
+    fn measure_for_records_operation_hint() {
+        let mut ctx = StressContext::new(BenchmarkMode::FixedDuration {
+            sample_duration: Duration::from_millis(1),
+        });
+        let iterations = ctx.measure_for(Duration::from_millis(1), || {
+            std::hint::black_box(1_usize);
         });
 
         assert!(iterations > 0);
-        assert!(ctx.duration.unwrap() >= Duration::from_millis(5));
+        assert_eq!(ctx.operations_hint, Some(iterations as u64));
+        assert_eq!(ctx.counters.completed, iterations as u64);
     }
 
     #[test]
-    fn should_track_bytes_when_set() {
-        let mut ctx = StressContext::new();
-        ctx.set_bytes(1024);
-        assert_eq!(ctx.bytes, Some(1024));
+    fn records_parameters_metadata_latency_and_correctness() {
+        let mut ctx = ctx();
+        ctx.parameter("client_count", 4)
+            .metadata("scenario", "fanout")
+            .record_latency(Duration::from_micros(25));
+        let _ = ctx
+            .correctness()
+            .attempted(10)
+            .completed(9)
+            .failures(1)
+            .timeouts(2)
+            .duplicates(3)
+            .dropped(4)
+            .validation_errors(5);
+
+        assert_eq!(ctx.parameters.get("client_count"), Some(&"4".to_string()));
+        assert_eq!(ctx.metadata.get("scenario"), Some(&"fanout".to_string()));
+        assert_eq!(ctx.latency_ns, vec![25_000]);
+        assert_eq!(ctx.counters.attempted, 10);
+        assert_eq!(ctx.counters.completed, 9);
+        assert_eq!(ctx.counters.failures, 1);
+        assert_eq!(ctx.counters.timeouts, 2);
+        assert_eq!(ctx.counters.duplicates, 3);
+        assert_eq!(ctx.counters.dropped, 4);
+        assert_eq!(ctx.counters.validation_errors, 5);
     }
 
     #[test]
-    fn should_track_elements_when_set() {
-        let mut ctx = StressContext::new();
-        ctx.set_elements(100);
-        assert_eq!(ctx.elements, Some(100));
-    }
-
-    #[test]
-    fn should_collect_tags_when_added() {
-        let mut ctx = StressContext::new();
-        ctx.tag("env", "prod");
-        ctx.tag("version", "1.0");
-        assert_eq!(ctx.tags.len(), 2);
+    #[should_panic(expected = "Timing was recorded more than once")]
+    fn panics_when_timing_recorded_twice() {
+        let mut ctx = ctx();
+        ctx.measure(|| {});
+        ctx.measure(|| {});
     }
 }

@@ -59,7 +59,7 @@ automatically at runtime by each binary.
 Example:
     cargo stress                        # Run all stress tests
     cargo stress --workload 'fsync*'    # Filter by pattern
-    cargo stress --runs 5               # Multiple measurement runs
+    cargo stress --profile release      # Release-profile sample policy
     cargo stress --list                 # List available tests
 "
 )]
@@ -76,6 +76,7 @@ enum Commands {
 }
 
 #[derive(Debug, Parser)]
+#[allow(clippy::struct_excessive_bools)]
 struct StressArgs {
     // ========================================================================
     // Test Selection
@@ -85,7 +86,7 @@ struct StressArgs {
     #[arg(long)]
     workload: Option<String>,
 
-    /// Include ignored benchmarks (falls back to BENCH_INCLUDE_IGNORED)
+    /// Include ignored benchmarks (falls back to `STRESS_INCLUDE_IGNORED`)
     #[arg(long)]
     include_ignored: bool,
 
@@ -104,18 +105,30 @@ struct StressArgs {
     // ========================================================================
     // Execution Options
     // ========================================================================
-    /// Number of measurement runs per benchmark (falls back to BENCH_RUNS, then 1)
+    /// Run profile: smoke, release, or lab (falls back to `STRESS_PROFILE`)
     #[arg(long)]
-    runs: Option<usize>,
+    profile: Option<String>,
 
-    /// Number of warmup runs (falls back to BENCH_WARMUP, then 0)
+    /// Run only one numeric benchmark tier
     #[arg(long)]
-    warmup: Option<usize>,
+    tier: Option<u32>,
+
+    /// Number of measured samples per benchmark (falls back to `STRESS_SAMPLES`)
+    #[arg(long)]
+    samples: Option<usize>,
+
+    /// Number of warmup samples (falls back to `STRESS_WARMUP_SAMPLES`)
+    #[arg(long)]
+    warmup_samples: Option<usize>,
+
+    /// Number of cooldown samples (falls back to `STRESS_COOLDOWN_SAMPLES`)
+    #[arg(long)]
+    cooldown_samples: Option<usize>,
 
     // ========================================================================
     // Output Control
     // ========================================================================
-    /// Verbose output (falls back to BENCH_VERBOSE)
+    /// Verbose output (falls back to `STRESS_VERBOSE`)
     #[arg(long, short = 'v')]
     verbose: bool,
 
@@ -123,18 +136,18 @@ struct StressArgs {
     #[arg(long, short = 'q')]
     quiet: bool,
 
-    /// Output directory for JSON results (falls back to BENCH_OUTPUT_DIR)
+    /// Output directory for artifacts (falls back to `STRESS_OUTPUT_DIR`)
     #[arg(long)]
     output_dir: Option<PathBuf>,
 
     // ========================================================================
     // Regression Detection
     // ========================================================================
-    /// Baseline JSON file for regression comparison (falls back to BENCH_BASELINE)
+    /// Baseline v2 JSON file for regression comparison (falls back to `STRESS_BASELINE`)
     #[arg(long)]
     baseline: Option<PathBuf>,
 
-    /// Regression threshold percentage (falls back to BENCH_THRESHOLD, then 5%)
+    /// Regression threshold percentage (falls back to `STRESS_THRESHOLD`, then 5%)
     #[arg(long)]
     threshold: Option<f64>,
 
@@ -181,7 +194,7 @@ struct StressFile {
     path: PathBuf,
     /// Stem of the filename (e.g., "fsync")
     stem: String,
-    /// Derived binary name (e.g., "stress_fsync") when built as a bin
+    /// Derived binary name (e.g., "`stress_fsync`") when built as a bin
     binary_name: String,
 }
 
@@ -189,7 +202,7 @@ impl StressFile {
     fn from_path(path: PathBuf) -> Option<Self> {
         let stem = path.file_stem()?.to_str()?.to_string();
         // Binary name: prefix with "stress_" to avoid conflicts
-        let binary_name = format!("stress_{}", stem);
+        let binary_name = format!("stress_{stem}");
         Some(Self {
             path,
             stem,
@@ -232,6 +245,7 @@ fn create_temp_workspace(files: &[StressFile], project_root: &Path) -> Result<(P
 
     // Convert path to use forward slashes for TOML compatibility
     let project_root_str = project_root.display().to_string().replace('\\', "/");
+    let stress_version = env!("CARGO_PKG_VERSION");
 
     // Check if this IS the cntryl-stress repo itself
     let is_stress_repo = pkg_name == "cntryl-stress";
@@ -264,7 +278,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-cntryl-stress = "0.1"
+cntryl-stress = "{stress_version}"
 {pkg_name} = {{ path = "{project_root_str}" }}
 "#
         )
@@ -312,15 +326,15 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.cmd {
-        Commands::Stress(args) => run_stress(args),
+        Commands::Stress(args) => run_stress(&args),
     }
 }
 
-fn run_stress(args: StressArgs) -> Result<()> {
-    let verbosity = Verbosity::from_args(&args);
+fn run_stress(args: &StressArgs) -> Result<()> {
+    let verbosity = Verbosity::from_args(args);
 
     // Step 1: Locate project root
-    let manifest_path = find_manifest(&args)?;
+    let manifest_path = find_manifest(args)?;
     let project_root = manifest_path
         .parent()
         .context("Cargo.toml has no parent directory")?;
@@ -331,7 +345,7 @@ fn run_stress(args: StressArgs) -> Result<()> {
 
     // Step 2: Discover stress files
     let benches_dir = project_root.join("benches");
-    let stress_files = discover_stress_files(&benches_dir, &args)?;
+    let stress_files = discover_stress_files(&benches_dir, args)?;
 
     if stress_files.is_empty() {
         if verbosity.is_normal() {
@@ -363,7 +377,7 @@ fn run_stress(args: StressArgs) -> Result<()> {
     if !args.no_build {
         build_stress_binaries(
             &stress_files,
-            &args,
+            args,
             &temp_manifest,
             verbosity,
             Some(&temp_target_dir),
@@ -371,10 +385,10 @@ fn run_stress(args: StressArgs) -> Result<()> {
     }
 
     // Step 4: Run stress binaries
-    let results = run_stress_binaries(&stress_files, &args, &temp_target_dir, verbosity)?;
+    let results = run_stress_binaries(&stress_files, args, &temp_target_dir, verbosity)?;
 
     // Step 5: Report results
-    report_results(&results, verbosity)?;
+    report_results(&results, verbosity);
 
     // Step 6: Exit with appropriate code
     let failed_count = results.iter().filter(|r| !r.success()).count();
@@ -430,16 +444,16 @@ impl Verbosity {
         }
     }
 
-    fn is_quiet(&self) -> bool {
-        *self == Verbosity::Quiet
+    fn is_quiet(self) -> bool {
+        self == Verbosity::Quiet
     }
 
-    fn is_normal(&self) -> bool {
+    fn is_normal(self) -> bool {
         !self.is_quiet()
     }
 
-    fn is_verbose(&self) -> bool {
-        *self == Verbosity::Verbose
+    fn is_verbose(self) -> bool {
+        self == Verbosity::Verbose
     }
 }
 
@@ -579,7 +593,7 @@ fn build_stress_binaries(
     }
 
     if verbosity.is_verbose() {
-        println!("   Running: {:?}", cmd);
+        println!("   Running: {cmd:?}");
     }
 
     let output = cmd
@@ -602,10 +616,10 @@ fn build_stress_binaries(
 
         eprintln!("\n❌ Build failed!");
         if !stdout.is_empty() {
-            eprintln!("{}", stdout);
+            eprintln!("{stdout}");
         }
         if !stderr.is_empty() {
-            eprintln!("{}", stderr);
+            eprintln!("{stderr}");
         }
 
         bail!(
@@ -690,7 +704,7 @@ fn run_single_binary(
     build_passthrough_args(&mut cmd, args);
 
     if verbosity.is_verbose() {
-        println!("   Executing: {:?}", cmd);
+        println!("   Executing: {cmd:?}");
     }
 
     let start = Instant::now();
@@ -757,14 +771,25 @@ fn build_passthrough_args(cmd: &mut Command, args: &StressArgs) {
         cmd.arg("--workload").arg(workload);
     }
 
-    // Runs
-    if let Some(runs) = args.runs {
-        cmd.arg("--runs").arg(runs.to_string());
+    if let Some(profile) = &args.profile {
+        cmd.arg("--profile").arg(profile);
     }
 
-    // Warmup
-    if let Some(warmup) = args.warmup {
-        cmd.arg("--warmup").arg(warmup.to_string());
+    if let Some(tier) = args.tier {
+        cmd.arg("--tier").arg(tier.to_string());
+    }
+
+    if let Some(samples) = args.samples {
+        cmd.arg("--samples").arg(samples.to_string());
+    }
+
+    if let Some(warmup_samples) = args.warmup_samples {
+        cmd.arg("--warmup-samples").arg(warmup_samples.to_string());
+    }
+
+    if let Some(cooldown_samples) = args.cooldown_samples {
+        cmd.arg("--cooldown-samples")
+            .arg(cooldown_samples.to_string());
     }
 
     // Verbosity
@@ -810,9 +835,9 @@ fn build_passthrough_args(cmd: &mut Command, args: &StressArgs) {
 // ============================================================================
 
 /// Print summary of all stress test results.
-fn report_results(results: &[StressRunResult], verbosity: Verbosity) -> Result<()> {
+fn report_results(results: &[StressRunResult], verbosity: Verbosity) {
     if results.is_empty() || verbosity.is_quiet() {
-        return Ok(());
+        return;
     }
 
     println!("Summary:");
@@ -824,8 +849,7 @@ fn report_results(results: &[StressRunResult], verbosity: Verbosity) -> Result<(
         let exit_info = result
             .status
             .code()
-            .map(|c| format!("exit {}", c))
-            .unwrap_or_else(|| "signal".to_string());
+            .map_or_else(|| "signal".to_string(), |c| format!("exit {c}"));
 
         println!(
             "  {} {} ({:.2}s, {})",
@@ -837,6 +861,4 @@ fn report_results(results: &[StressRunResult], verbosity: Verbosity) -> Result<(
     }
 
     println!("Total time: {:.2}s", total_duration.as_secs_f64());
-
-    Ok(())
 }

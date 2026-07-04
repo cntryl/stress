@@ -1,133 +1,194 @@
-//! Proc macros for cntryl-stress benchmark framework.
-//!
-//! This crate provides the `#[stress_test]` attribute macro for defining
-//! benchmarks that are automatically discovered and run.
+//! Proc macros for cntryl-stress.
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, ItemFn};
+use syn::parse::Parser;
+use syn::{parse_macro_input, Expr, ExprLit, ItemFn, Lit, Meta, MetaNameValue, Token};
 
 /// Mark a function as a stress benchmark.
 ///
-/// Functions annotated with `#[stress_test]` are automatically discovered
-/// and run when using `cargo stress` or the `stress_main!` macro.
-///
-/// # Example
+/// Common usage stays intentionally small:
 ///
 /// ```rust,ignore
 /// use cntryl_stress::{stress_test, StressContext};
 ///
-/// #[stress_test]
-/// fn my_benchmark(ctx: &mut StressContext) {
-///     let data = vec![0u8; 1024 * 1024];
-///     ctx.set_bytes(data.len() as u64);
-///     ctx.measure(|| {
-///         std::hint::black_box(&data);
-///     });
+/// #[stress_test(tier = 2)]
+/// fn write_batch(ctx: &mut StressContext) {
+///     ctx.parameter("payload_size", 4096);
+///     ctx.measure(|| write_the_batch());
 /// }
 /// ```
 ///
-/// # Attributes
+/// Supported attributes:
 ///
-/// - `#[stress_test]` - Basic benchmark
-/// - `#[stress_test(ignore)]` - Skip this benchmark unless explicitly requested
-/// - `#[stress_test(name = "custom_name")]` - Use a custom name instead of function name
+/// - `tier = 2` through `N` (defaults to `2`)
+/// - `mode = "fixed_operations"` or `mode = "fixed_duration"`
+/// - `name = "custom_name"`
+/// - `ignore`
+/// - `metadata(owner = "storage", scenario = "fanout")`
 #[proc_macro_attribute]
 pub fn stress_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
     let fn_name = &input.sig.ident;
     let fn_name_str = fn_name.to_string();
 
-    // Parse attributes
-    let attr_str = attr.to_string();
-    let is_ignored = attr_str.contains("ignore");
-    let custom_name = parse_custom_name(&attr_str).unwrap_or_else(|| fn_name_str.clone());
+    let attrs = match StressAttrs::parse(attr) {
+        Ok(attrs) => attrs,
+        Err(error) => return error.to_compile_error().into(),
+    };
+    if attrs.tier < 2 {
+        return syn::Error::new_spanned(
+            fn_name,
+            "cntryl-stress tiers start at 2; use Criterion for Tier 1 microbenchmarks",
+        )
+        .to_compile_error()
+        .into();
+    }
 
-    // Generate a unique identifier for the inventory submission
+    let benchmark_name = attrs.name.unwrap_or_else(|| fn_name_str.clone());
+    let is_ignored = attrs.ignore;
+    let tier = attrs.tier;
+    let mode = match attrs.mode.as_str() {
+        "fixed_duration" => quote! { ::cntryl_stress::BenchmarkModeKind::FixedDuration },
+        "fixed_operations" => quote! { ::cntryl_stress::BenchmarkModeKind::FixedOperations },
+        other => {
+            return syn::Error::new_spanned(
+                fn_name,
+                format!(
+                    "unsupported stress_test mode '{other}'; expected fixed_operations or fixed_duration"
+                ),
+            )
+            .to_compile_error()
+            .into();
+        }
+    };
+    let metadata_keys = attrs.metadata.iter().map(|(key, _)| key);
+    let metadata_values = attrs.metadata.iter().map(|(_, value)| value);
     let submit_ident = syn::Ident::new(
         &format!("__STRESS_BENCH_{}", fn_name_str.to_uppercase()),
         fn_name.span(),
     );
 
-    let expanded = quote! {
+    quote! {
         #input
 
         #[allow(non_upper_case_globals)]
         #[::cntryl_stress::__private::linkme::distributed_slice(::cntryl_stress::__private::STRESS_BENCHMARKS)]
         #[linkme(crate = ::cntryl_stress::__private::linkme)]
         static #submit_ident: ::cntryl_stress::__private::BenchmarkEntry = ::cntryl_stress::__private::BenchmarkEntry {
-            name: #custom_name,
+            name: #benchmark_name,
             func: #fn_name,
             ignored: #is_ignored,
             module_path: module_path!(),
+            tier: #tier,
+            mode: #mode,
+            metadata: &[#((#metadata_keys, #metadata_values)),*],
         };
-    };
-
-    TokenStream::from(expanded)
+    }
+    .into()
 }
 
-fn parse_custom_name(attr: &str) -> Option<String> {
-    // Simple parsing for name = "value"
-    if let Some(start) = attr.find("name") {
-        let rest = &attr[start..];
-        if let Some(eq) = rest.find('=') {
-            let after_eq = &rest[eq + 1..];
-            if let Some(quote_start) = after_eq.find('"') {
-                let after_quote = &after_eq[quote_start + 1..];
-                if let Some(quote_end) = after_quote.find('"') {
-                    return Some(after_quote[..quote_end].to_string());
+#[derive(Debug)]
+struct StressAttrs {
+    name: Option<String>,
+    tier: u32,
+    mode: String,
+    ignore: bool,
+    metadata: Vec<(String, String)>,
+}
+
+impl Default for StressAttrs {
+    fn default() -> Self {
+        Self {
+            name: None,
+            tier: 2,
+            mode: "fixed_operations".to_string(),
+            ignore: false,
+            metadata: Vec::new(),
+        }
+    }
+}
+
+impl StressAttrs {
+    fn parse(attr: TokenStream) -> syn::Result<Self> {
+        let parser = syn::punctuated::Punctuated::<Meta, Token![,]>::parse_terminated;
+        let metas = parser.parse(attr)?;
+        let mut attrs = Self::default();
+
+        for meta in metas {
+            match meta {
+                Meta::Path(path) if path.is_ident("ignore") => attrs.ignore = true,
+                Meta::NameValue(name_value) if name_value.path.is_ident("name") => {
+                    attrs.name = Some(string_value(&name_value)?);
+                }
+                Meta::NameValue(name_value) if name_value.path.is_ident("tier") => {
+                    attrs.tier = int_value(&name_value)?;
+                }
+                Meta::NameValue(name_value) if name_value.path.is_ident("mode") => {
+                    attrs.mode = string_value(&name_value)?;
+                }
+                Meta::List(list) if list.path.is_ident("metadata") => {
+                    attrs.metadata.extend(parse_metadata(list.tokens)?);
+                }
+                other => {
+                    return Err(syn::Error::new_spanned(
+                        other,
+                        "unsupported stress_test attribute",
+                    ));
                 }
             }
         }
+
+        Ok(attrs)
     }
-    None
 }
 
-/// Generate the main function for running stress benchmarks.
-///
-/// Place this at the end of your benchmark file to create an executable
-/// that discovers and runs all `#[stress_test]` benchmarks.
-///
-/// The generated main function:
-/// - Parses command-line arguments (--workload, --runs, --list, etc.)
-/// - Runs benchmarks matching the filter criteria
-/// - Exits with non-zero status on failure
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use cntryl_stress::{stress_test, stress_main, StressContext};
-///
-/// #[stress_test]
-/// fn benchmark_one(ctx: &mut StressContext) {
-///     ctx.measure(|| { /* ... */ });
-/// }
-///
-/// stress_main!();
-/// ```
-///
-/// # Command-line arguments
-///
-/// The generated binary accepts these arguments:
-///
-/// - `--workload <PATTERN>`: Filter benchmarks by glob pattern
-/// - `--runs <N>`: Number of measurement runs (fallback: `BENCH_RUNS`, then `1`)
-/// - `--warmup <N>`: Number of warmup runs (fallback: `BENCH_WARMUP`, then `0`)
-/// - `--verbose` / `-v`: Verbose output
-/// - `--quiet` / `-q`: Quiet mode
-/// - `--include-ignored`: Include ignored benchmarks
-/// - `--list`: List benchmarks without running
-/// - `--print-config`: Print the resolved config and exit
-/// - `--output-dir <PATH>`: Output directory for JSON results
-/// - `--baseline <PATH>`: Baseline JSON for regression comparison (fallback: `BENCH_BASELINE`)
-/// - `--threshold <FLOAT>`: Regression threshold (fallback: `BENCH_THRESHOLD`, then `0.05`)
+fn parse_metadata(tokens: proc_macro2::TokenStream) -> syn::Result<Vec<(String, String)>> {
+    let parser = syn::punctuated::Punctuated::<MetaNameValue, Token![,]>::parse_terminated;
+    parser
+        .parse2(tokens)?
+        .into_iter()
+        .map(|name_value| {
+            let key = name_value
+                .path
+                .get_ident()
+                .map(ToString::to_string)
+                .ok_or_else(|| {
+                    syn::Error::new_spanned(&name_value.path, "metadata keys must be identifiers")
+                })?;
+            let value = string_value(&name_value)?;
+            Ok((key, value))
+        })
+        .collect()
+}
+
+fn string_value(name_value: &MetaNameValue) -> syn::Result<String> {
+    match &name_value.value {
+        Expr::Lit(ExprLit {
+            lit: Lit::Str(value),
+            ..
+        }) => Ok(value.value()),
+        value => Err(syn::Error::new_spanned(value, "expected string literal")),
+    }
+}
+
+fn int_value(name_value: &MetaNameValue) -> syn::Result<u32> {
+    match &name_value.value {
+        Expr::Lit(ExprLit {
+            lit: Lit::Int(value),
+            ..
+        }) => value.base10_parse(),
+        value => Err(syn::Error::new_spanned(value, "expected integer literal")),
+    }
+}
+
+/// Generate a `main` function for stress benchmark binaries.
 #[proc_macro]
 pub fn stress_main(_input: TokenStream) -> TokenStream {
-    let expanded = quote! {
+    quote! {
         fn main() {
-            // Use the CLI-parsing entry point that handles all flags
             ::cntryl_stress::stress_binary_main();
         }
-    };
-    TokenStream::from(expanded)
+    }
+    .into()
 }

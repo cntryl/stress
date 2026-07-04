@@ -5,7 +5,7 @@ use std::time::Duration;
 #[stress_test]
 fn sort_large_vector(ctx: &mut StressContext) {
     let mut data = vec![42u32; 1_000_000];
-    ctx.set_elements(data.len() as u64);
+    ctx.parameter("item_count", data.len());
 
     ctx.measure(|| {
         data.sort_unstable();
@@ -16,7 +16,7 @@ fn sort_large_vector(ctx: &mut StressContext) {
 #[stress_test]
 fn hash_string_throughput(ctx: &mut StressContext) {
     use std::collections::HashSet;
-    let strings: Vec<_> = (0..10_000).map(|i| format!("key_{}", i)).collect();
+    let strings: Vec<_> = (0..10_000).map(|i| format!("key_{i}")).collect();
     let iterations = ctx.measure_for(Duration::from_secs(3), || {
         let mut set = HashSet::new();
         for s in &strings {
@@ -25,17 +25,21 @@ fn hash_string_throughput(ctx: &mut StressContext) {
         black_box(&set);
     });
 
-    ctx.set_elements((strings.len() * iterations) as u64);
+    let operations = (strings.len() * iterations) as u64;
+    let _ = ctx
+        .correctness()
+        .attempted(operations)
+        .completed(operations);
 }
 
 #[stress_test]
 fn memory_copy_1mb(ctx: &mut StressContext) {
     let src = vec![1u8; 1024 * 1024];
-    ctx.set_bytes(src.len() as u64);
+    ctx.parameter("payload_size", src.len());
 
     ctx.measure(|| {
-        let _dst = src.clone();
-        black_box(&_dst);
+        let dst = src.clone();
+        black_box(&dst);
     });
 }
 

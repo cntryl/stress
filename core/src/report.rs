@@ -1,12 +1,9 @@
-//! Pluggable reporters for benchmark output.
-//!
-//! All reporters implement the `Reporter` trait and are designed to be:
-//! - Non-panicking: errors are logged to stderr but never propagate
-//! - Atomic: output is written in complete lines to avoid interleaving
-//! - Deterministic: identical inputs produce identical outputs
+//! Pluggable reporters for v2 stress artifacts.
 
-use crate::config::BenchRunnerConfig;
-use crate::result::{BenchResult, SuiteResult};
+use crate::config::StressRunnerConfig;
+use crate::result::{BenchmarkSummary, ComparisonClass, PrimaryMetric, QualityClass, StressRun};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as FmtWrite;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -14,99 +11,51 @@ use std::sync::Mutex;
 /// Trait for benchmark result reporters.
 pub trait Reporter: Send + Sync {
     /// Called when a suite starts.
-    fn suite_start(&self, _suite: &str, _config: &BenchRunnerConfig) {}
+    fn suite_start(&self, _suite: &str, _config: &StressRunnerConfig) {}
 
-    /// Called when a benchmark starts.
-    /// Note: Reporters should NOT print partial output here to ensure atomicity.
-    fn bench_start(&self, _name: &str) {}
-
-    /// Called when a benchmark completes.
-    fn bench_end(&self, _result: &BenchResult) {}
+    /// Called when a benchmark summary is available.
+    fn bench_end(&self, _summary: &BenchmarkSummary) {}
 
     /// Called when a suite completes.
-    fn suite_end(&self, _result: &SuiteResult) {}
+    fn suite_end(&self, _run: &StressRun) {}
 }
 
-/// Fixed width for benchmark name column in console output.
-const NAME_WIDTH: usize = 40;
-/// Fixed width for duration column in console output.
-const DURATION_WIDTH: usize = 14;
+const NAME_WIDTH: usize = 48;
+const VALUE_WIDTH: usize = 16;
 
-/// Console reporter that prints results to stdout.
-///
-/// Output is atomic: each benchmark is printed as a single complete line
-/// in `bench_end`, ensuring logs cannot interleave even if a benchmark panics.
+/// Console reporter that prints compact progress to stdout.
 pub struct ConsoleReporter {
-    show_all_runs: bool,
     suite_config_lines: Vec<String>,
-    /// Mutex ensures atomic writes across threads.
     output_lock: Mutex<()>,
 }
 
 impl ConsoleReporter {
+    /// Create a console reporter.
+    #[must_use]
     pub fn new() -> Self {
         Self {
-            show_all_runs: false,
             suite_config_lines: Vec::new(),
             output_lock: Mutex::new(()),
         }
     }
 
-    /// Show individual run times (not just median) on a separate indented line.
-    pub fn show_all_runs(mut self, show: bool) -> Self {
-        self.show_all_runs = show;
-        self
-    }
-
+    /// Attach resolved config lines to the suite header.
+    #[must_use]
     pub fn config_lines(mut self, lines: Vec<String>) -> Self {
         self.suite_config_lines = lines;
         self
     }
 
-    /// Format a duration with consistent units: ns, µs, ms, or s.
-    /// Always uses 2 decimal places, no scientific notation.
-    fn format_duration(d: std::time::Duration) -> String {
-        format_duration(d)
-    }
-
-    /// Format throughput string, only if bytes or elements are set.
-    /// Returns empty string if neither is set.
-    fn format_throughput(result: &BenchResult) -> String {
-        // Bytes take precedence over elements for throughput display
-        if let Some(bps) = result.bytes_per_sec() {
-            if bps >= 1_000_000_000.0 {
-                format!("{:.2} GB/s", bps / 1_000_000_000.0)
-            } else if bps >= 1_000_000.0 {
-                format!("{:.2} MB/s", bps / 1_000_000.0)
-            } else if bps >= 1_000.0 {
-                format!("{:.2} KB/s", bps / 1_000.0)
-            } else {
-                format!("{:.2} B/s", bps)
-            }
-        } else if let Some(eps) = result.elements_per_sec() {
-            if eps >= 1_000_000.0 {
-                format!("{:.2}M ops/s", eps / 1_000_000.0)
-            } else if eps >= 1_000.0 {
-                format!("{:.2}K ops/s", eps / 1_000.0)
-            } else {
-                format!("{:.0} ops/s", eps)
-            }
-        } else {
-            String::new()
-        }
-    }
-
-    /// Atomically write a complete message to stdout.
-    /// Never panics; logs warning on error.
     fn write_stdout(&self, message: &str) {
-        // Acquire lock to ensure atomicity; ignore poison (another thread panicked)
-        let _guard = self.output_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self
+            .output_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut stdout = std::io::stdout().lock();
-        if let Err(e) = writeln!(stdout, "{}", message) {
+        if let Err(error) = writeln!(stdout, "{message}") {
             let _ = writeln!(
                 std::io::stderr(),
-                "Warning: failed to write to stdout: {}",
-                e
+                "Warning: failed to write to stdout: {error}"
             );
         }
     }
@@ -119,291 +68,475 @@ impl Default for ConsoleReporter {
 }
 
 impl Reporter for ConsoleReporter {
-    fn suite_start(&self, suite: &str, config: &BenchRunnerConfig) {
-        // Build complete header atomically
+    fn suite_start(&self, suite: &str, config: &StressRunnerConfig) {
         let details = if self.suite_config_lines.is_empty() {
-            [
-                format!("Runs: {}", config.runs),
-                format!("Warmup: {}", config.warmup_runs),
-                format!("Output: {}", config.output_dir.display()),
-                format!("Verbose: {}", config.verbose),
-                format!("Filter: {}", config.filter.as_deref().unwrap_or("<none>")),
-                format!(
-                    "Timeout: {}",
-                    config
-                        .timeout
-                        .map(|timeout| format!("{}s", timeout.as_secs()))
-                        .unwrap_or_else(|| "<none>".to_string())
-                ),
-            ]
-            .join("\n")
+            default_config_lines(config).join("\n")
         } else {
             self.suite_config_lines.join("\n")
         };
         let header = format!(
             "---------------------------------------------------------------\n\
-             Benchmark Suite: {}\n\
-             {}\n\
-             ---------------------------------------------------------------\n",
-            suite, details
+             Benchmark Suite: {suite}\n\
+             {details}\n\
+             ---------------------------------------------------------------"
         );
         self.write_stdout(&header);
     }
 
-    fn bench_start(&self, _name: &str) {
-        // Intentionally empty: we print the complete line in bench_end
-        // to ensure atomic output that cannot interleave.
-    }
-
-    fn bench_end(&self, result: &BenchResult) {
-        // Extract just the benchmark name (remove suite prefix)
-        let name_parts: Vec<&str> = result.name.split('/').collect();
-        let bench_name = if name_parts.len() >= 2 {
-            name_parts[name_parts.len() - 1]
-        } else {
-            &result.name
-        };
-
-        // Format duration (median from BenchResult)
-        let duration_str = Self::format_duration(result.duration);
-
-        // Format throughput only if bytes or elements are set
-        let throughput_str = Self::format_throughput(result);
-
-        // Build the main result line with fixed column alignment
-        let mut line = if throughput_str.is_empty() {
-            format!(
-                "  {:<width$} {:>dur_width$}",
-                bench_name,
-                duration_str,
-                width = NAME_WIDTH,
-                dur_width = DURATION_WIDTH
-            )
-        } else {
-            format!(
-                "  {:<width$} {:>dur_width$}  ({})",
-                bench_name,
-                duration_str,
-                throughput_str,
-                width = NAME_WIDTH,
-                dur_width = DURATION_WIDTH
-            )
-        };
-
-        // Optionally append individual runs on a separate indented line
-        if self.show_all_runs && result.all_runs.len() > 1 {
-            let runs_formatted: Vec<_> = result
-                .all_runs
-                .iter()
-                .map(|d| Self::format_duration(*d))
-                .collect();
-            line.push_str(&format!("\n      runs: [{}]", runs_formatted.join(", ")));
-        }
-
+    fn bench_end(&self, summary: &BenchmarkSummary) {
+        let value = summary.primary_value().map_or_else(
+            || "n/a".to_string(),
+            |value| format_metric(value, summary.primary_metric),
+        );
+        let line = format!(
+            "  {name:<NAME_WIDTH$} {value:>VALUE_WIDTH$}  tier={tier} quality={quality}",
+            name = summary.name,
+            tier = summary.tier,
+            quality = summary.quality
+        );
         self.write_stdout(&line);
     }
 
-    fn suite_end(&self, result: &SuiteResult) {
+    fn suite_end(&self, run: &StressRun) {
         let footer = format!(
             "---------------------------------------------------------------\n\
-             Completed {} benchmarks in {}\n\
-             ---------------------------------------------------------------\n",
-            result.results.len(),
-            Self::format_duration(result.total_duration)
+             Completed {} benchmark(s), {} sample row(s) in {}\n\
+             ---------------------------------------------------------------",
+            run.summaries.len(),
+            run.samples.len(),
+            format_duration_ns(run.total_elapsed_ns)
         );
         self.write_stdout(&footer);
     }
 }
 
-/// JSON reporter that writes results to a file.
-///
-/// Writes timestamped results files organized by suite:
-/// - `{suite}/{timestamp}.json` - Machine-readable results
-/// - `{suite}/{timestamp}.txt` - Human-readable summary
-/// - `{suite}/latest.json` and `latest.txt` - Most recent results
+/// JSON reporter that writes v2 JSON, text, and Markdown reports.
 pub struct JsonReporter {
     output_dir: PathBuf,
 }
 
 impl JsonReporter {
+    /// Create a JSON reporter.
+    #[must_use]
     pub fn new(output_dir: impl Into<PathBuf>) -> Self {
         Self {
             output_dir: output_dir.into(),
         }
     }
 
-    /// Write JSON results to the output directory.
-    /// Creates both timestamped JSON and text summary files organized by suite name.
-    /// Never panics; logs warnings to stderr on failure.
-    fn write_results(&self, result: &SuiteResult) {
-        if let Err(e) = self.write_results_inner(result) {
-            eprintln!("Warning: failed to write results: {}", e);
+    fn write_results(&self, run: &StressRun) {
+        if let Err(error) = self.write_results_inner(run) {
+            eprintln!("Warning: failed to write results: {error}");
         }
     }
 
-    fn write_results_inner(&self, result: &SuiteResult) -> std::io::Result<()> {
-        // Sanitize suite name for directory (replace path separators)
-        let sanitized_name = result.suite.replace(['/', '\\'], "_");
-
-        // Create suite-specific subdirectory
-        let suite_dir = self.output_dir.join(&sanitized_name);
+    fn write_results_inner(&self, run: &StressRun) -> std::io::Result<()> {
+        let sanitized_name = run.suite.replace(['/', '\\'], "_");
+        let suite_dir = self.output_dir.join(sanitized_name);
         std::fs::create_dir_all(&suite_dir)?;
 
-        // Create timestamped filename to make each run unique
-        let timestamp_str = &result.started_at;
-        let json_filename = format!("{}.json", timestamp_str);
-        let txt_filename = format!("{}.txt", timestamp_str);
-
-        let timestamped_json_path = suite_dir.join(&json_filename);
-        let timestamped_txt_path = suite_dir.join(&txt_filename);
-
-        // Serialize to JSON
-        let json = serde_json::to_string_pretty(result).map_err(std::io::Error::other)?;
-
-        // Write timestamped JSON file
-        std::fs::write(&timestamped_json_path, &json)?;
-        eprintln!("  Results written to: {}", timestamped_json_path.display());
-
-        // Generate and write text summary
-        let summary = self.format_summary(result);
-        std::fs::write(&timestamped_txt_path, &summary)?;
-
-        // Write latest files for convenient access to most recent results
+        let timestamp = &run.started_at;
+        let json_path = suite_dir.join(format!("{timestamp}.json"));
+        let txt_path = suite_dir.join(format!("{timestamp}.txt"));
+        let md_path = suite_dir.join(format!("{timestamp}.md"));
         let latest_json_path = suite_dir.join("latest.json");
         let latest_txt_path = suite_dir.join("latest.txt");
+        let latest_md_path = suite_dir.join("latest.md");
+
+        let json = serde_json::to_string_pretty(run).map_err(std::io::Error::other)?;
+        let report = format_report(run);
+        let markdown = format_markdown_report(run);
+
+        std::fs::write(&json_path, &json)?;
+        std::fs::write(&txt_path, &report)?;
+        std::fs::write(&md_path, &markdown)?;
         std::fs::write(&latest_json_path, &json)?;
-        std::fs::write(&latest_txt_path, &summary)?;
+        std::fs::write(&latest_txt_path, &report)?;
+        std::fs::write(&latest_md_path, &markdown)?;
+
+        eprintln!("  Results written to: {}", json_path.display());
         eprintln!("  Latest results at: {}", latest_json_path.display());
-
         Ok(())
-    }
-
-    fn format_summary(&self, result: &SuiteResult) -> String {
-        let mut output = String::new();
-        output.push_str("===============================================================\n");
-        output.push_str(&format!("Benchmark Suite: {}\n", result.suite));
-        output.push_str("===============================================================\n\n");
-
-        output.push_str(&format!("Completed: {}\n", result.started_at));
-        output.push_str(&format_summary_config_line(
-            "Runs",
-            &result.runs.to_string(),
-            result.metadata.get("runs_src"),
-        ));
-        output.push_str(&format_summary_config_line(
-            "Warmup",
-            &result.warmup_runs.to_string(),
-            result.metadata.get("warmup_runs_src"),
-        ));
-        output.push_str(&format_summary_config_line(
-            "Output",
-            result
-                .metadata
-                .get("output_dir")
-                .map(String::as_str)
-                .unwrap_or("target/stress"),
-            result.metadata.get("output_dir_src"),
-        ));
-        output.push_str(&format_summary_config_line(
-            "Filter",
-            result
-                .metadata
-                .get("filter")
-                .map(String::as_str)
-                .unwrap_or("<none>"),
-            result.metadata.get("filter_src"),
-        ));
-        output.push_str(&format_summary_config_line(
-            "Verbose",
-            result
-                .metadata
-                .get("verbose")
-                .map(String::as_str)
-                .unwrap_or("true"),
-            result.metadata.get("verbose_src"),
-        ));
-        let timeout_value = result
-            .metadata
-            .get("timeout_secs")
-            .map(|timeout| format!("{}s", timeout))
-            .unwrap_or_else(|| "<none>".to_string());
-        output.push_str(&format_summary_config_line(
-            "Timeout",
-            &timeout_value,
-            result.metadata.get("timeout_secs_src"),
-        ));
-        if let Some(sha) = &result.git_sha {
-            output.push_str(&format!("Git SHA:   {}\n", sha));
-        }
-        output.push('\n');
-
-        output.push_str("Results:\n");
-        output.push_str("---------------------------------------------------------------\n");
-
-        for result in &result.results {
-            // Extract just the benchmark name (remove suite prefix)
-            let name_parts: Vec<&str> = result.name.split('/').collect();
-            let bench_name = if name_parts.len() >= 2 {
-                name_parts[name_parts.len() - 1]
-            } else {
-                &result.name
-            };
-
-            // Format duration
-            let duration_str = format_duration(result.duration);
-
-            // Format throughput using same logic as console reporter
-            let throughput_str = if let Some(_bps) = result.bytes_per_sec() {
-                let bps = result.bytes_per_sec().unwrap();
-                if bps >= 1_000_000_000.0 {
-                    format!("  ({:.2} GB/s)", bps / 1_000_000_000.0)
-                } else if bps >= 1_000_000.0 {
-                    format!("  ({:.2} MB/s)", bps / 1_000_000.0)
-                } else if bps >= 1_000.0 {
-                    format!("  ({:.2} KB/s)", bps / 1_000.0)
-                } else {
-                    format!("  ({:.2} B/s)", bps)
-                }
-            } else if let Some(_eps) = result.elements_per_sec() {
-                let eps = result.elements_per_sec().unwrap();
-                if eps >= 1_000_000.0 {
-                    format!("  ({:.2}M ops/s)", eps / 1_000_000.0)
-                } else if eps >= 1_000.0 {
-                    format!("  ({:.2}K ops/s)", eps / 1_000.0)
-                } else {
-                    format!("  ({:.0} ops/s)", eps)
-                }
-            } else {
-                String::new()
-            };
-
-            output.push_str(&format!(
-                "  {:<width$} {:>dur_width$}{}
-",
-                bench_name,
-                duration_str,
-                throughput_str,
-                width = NAME_WIDTH,
-                dur_width = DURATION_WIDTH
-            ));
-        }
-
-        output.push_str("---------------------------------------------------------------\n");
-        output.push_str(&format!(
-            "Total time: {}\n",
-            format_duration(result.total_duration)
-        ));
-        output.push_str(&format!("Benchmarks: {}\n", result.results.len()));
-        output.push_str("===============================================================\n");
-
-        output
     }
 }
 
-fn format_duration(nanos: std::time::Duration) -> String {
-    let secs = nanos.as_secs_f64();
+impl Reporter for JsonReporter {
+    fn suite_end(&self, run: &StressRun) {
+        self.write_results(run);
+    }
+}
+
+/// GitHub Actions reporter that emits annotations when running in Actions.
+#[allow(dead_code)]
+pub struct GitHubActionsReporter;
+
+#[allow(dead_code)]
+impl GitHubActionsReporter {
+    /// Create a new GitHub Actions reporter.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+
+    fn is_github_actions() -> bool {
+        std::env::var("GITHUB_ACTIONS").is_ok()
+    }
+}
+
+impl Default for GitHubActionsReporter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Reporter for GitHubActionsReporter {
+    fn suite_end(&self, run: &StressRun) {
+        if !Self::is_github_actions() {
+            return;
+        }
+
+        for comparison in &run.comparisons {
+            if comparison.classification == ComparisonClass::Regression {
+                println!(
+                    "::warning title=Performance Regression in {}::Benchmark '{}' regressed by {:.1}%",
+                    run.suite,
+                    comparison.benchmark_id,
+                    comparison.change_percent.unwrap_or_default().abs()
+                );
+            }
+        }
+
+        println!("::group::Stress Results - {}", run.suite);
+        for summary in &run.summaries {
+            println!(
+                "  {}: {} ({})",
+                summary.name,
+                summary.primary_value().map_or_else(
+                    || "n/a".to_string(),
+                    |value| { format_metric(value, summary.primary_metric) }
+                ),
+                summary.quality
+            );
+        }
+        println!("::endgroup::");
+    }
+}
+
+/// Combines multiple reporters.
+pub struct MultiReporter {
+    reporters: Vec<Box<dyn Reporter>>,
+}
+
+impl MultiReporter {
+    /// Create a multi-reporter.
+    #[must_use]
+    pub fn new(reporters: Vec<Box<dyn Reporter>>) -> Self {
+        Self { reporters }
+    }
+}
+
+impl Reporter for MultiReporter {
+    fn suite_start(&self, suite: &str, config: &StressRunnerConfig) {
+        for reporter in &self.reporters {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                reporter.suite_start(suite, config);
+            }));
+        }
+    }
+
+    fn bench_end(&self, summary: &BenchmarkSummary) {
+        for reporter in &self.reporters {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                reporter.bench_end(summary);
+            }));
+        }
+    }
+
+    fn suite_end(&self, run: &StressRun) {
+        for reporter in &self.reporters {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                reporter.suite_end(run);
+            }));
+        }
+    }
+}
+
+pub(crate) fn format_report(run: &StressRun) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "Benchmark Suite: {}", run.suite);
+    let _ = writeln!(output, "Schema: {}", run.schema_version);
+    let _ = writeln!(output, "Profile: {}", run.run_profile);
+    let _ = writeln!(output, "Completed: {}", run.started_at);
+    let _ = writeln!(
+        output,
+        "Samples: measured={} warmup={} cooldown={}",
+        run.environment.profile_config.measured_samples,
+        run.environment.profile_config.warmup_samples,
+        run.environment.profile_config.cooldown_samples
+    );
+    let _ = writeln!(
+        output,
+        "Total time: {}",
+        format_duration_ns(run.total_elapsed_ns)
+    );
+    output.push('\n');
+
+    output.push_str("Summary\n");
+    output.push_str("-------\n");
+    for summary in &run.summaries {
+        write_summary_line(&mut output, summary);
+    }
+
+    write_comparison_section(&mut output, "Regressions", run, ComparisonClass::Regression);
+    write_comparison_section(
+        &mut output,
+        "Improvements",
+        run,
+        ComparisonClass::Improvement,
+    );
+    write_quality_section(&mut output, run);
+    write_sweep_tables(&mut output, run);
+
+    output
+}
+
+pub(crate) fn format_markdown_report(run: &StressRun) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "# {}", run.suite);
+    let _ = writeln!(output);
+    let _ = writeln!(output, "- Schema: `{}`", run.schema_version);
+    let _ = writeln!(output, "- Profile: `{}`", run.run_profile);
+    let _ = writeln!(output, "- Completed: `{}`", run.started_at);
+    let _ = writeln!(
+        output,
+        "- Total time: `{}`",
+        format_duration_ns(run.total_elapsed_ns)
+    );
+    let _ = writeln!(output);
+    let _ = writeln!(
+        output,
+        "| Benchmark | Tier | Metric | Value | Quality | Samples |"
+    );
+    let _ = writeln!(output, "|---|---:|---|---:|---|---:|");
+    for summary in &run.summaries {
+        let value = summary.primary_value().map_or_else(
+            || "n/a".to_string(),
+            |value| format_metric(value, summary.primary_metric),
+        );
+        let _ = writeln!(
+            output,
+            "| {} | {} | {:?} | {} | {} | {} |",
+            summary.name,
+            summary.tier,
+            summary.primary_metric,
+            value,
+            summary.quality,
+            summary.measured_samples
+        );
+    }
+    output
+}
+
+fn default_config_lines(config: &StressRunnerConfig) -> Vec<String> {
+    vec![
+        format!("Profile: {}", config.profile),
+        format!("Samples: {}", config.samples),
+        format!("Warmup samples: {}", config.warmup_samples),
+        format!("Cooldown samples: {}", config.cooldown_samples),
+        format!("Output: {}", config.output_dir.display()),
+        format!("Filter: {}", config.filter.as_deref().unwrap_or("<none>")),
+        format!(
+            "Tier: {}",
+            config
+                .tier
+                .map_or_else(|| "<any>".to_string(), |tier| tier.to_string())
+        ),
+    ]
+}
+
+fn write_summary_line(output: &mut String, summary: &BenchmarkSummary) {
+    let value = summary.primary_value().map_or_else(
+        || "n/a".to_string(),
+        |value| format_metric(value, summary.primary_metric),
+    );
+    let _ = writeln!(
+        output,
+        "  {name:<NAME_WIDTH$} {value:>VALUE_WIDTH$}  tier={tier} quality={quality} samples={samples}",
+        name = summary.name,
+        tier = summary.tier,
+        quality = summary.quality,
+        samples = summary.measured_samples
+    );
+}
+
+fn write_comparison_section(
+    output: &mut String,
+    title: &str,
+    run: &StressRun,
+    class: ComparisonClass,
+) {
+    let rows = run
+        .comparisons
+        .iter()
+        .filter(|comparison| comparison.classification == class)
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return;
+    }
+
+    let _ = writeln!(output);
+    let _ = writeln!(output, "{title}");
+    output.push_str(&"-".repeat(title.len()));
+    output.push('\n');
+    for comparison in rows {
+        let _ = writeln!(
+            output,
+            "  {} {:+.1}% ({:?})",
+            comparison.benchmark_id,
+            comparison.change_percent.unwrap_or_default(),
+            comparison.primary_metric
+        );
+    }
+}
+
+fn write_quality_section(output: &mut String, run: &StressRun) {
+    let rows = run
+        .summaries
+        .iter()
+        .filter(|summary| {
+            matches!(
+                summary.quality,
+                QualityClass::Noisy | QualityClass::Untrustworthy
+            )
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return;
+    }
+
+    output.push_str("\nNoisy Or Untrustworthy\n");
+    output.push_str("----------------------\n");
+    for summary in rows {
+        let _ = writeln!(
+            output,
+            "  {} quality={} correctness={}",
+            summary.name, summary.quality, summary.correctness.passed
+        );
+    }
+}
+
+fn write_sweep_tables(output: &mut String, run: &StressRun) {
+    let numeric_keys = numeric_parameter_keys(&run.summaries);
+    if numeric_keys.is_empty() {
+        return;
+    }
+
+    output.push_str("\nSweep Tables\n");
+    output.push_str("------------\n");
+    for key in numeric_keys {
+        let mut rows = run
+            .summaries
+            .iter()
+            .filter_map(|summary| {
+                let x = summary.parameters.get(&key)?.parse::<f64>().ok()?;
+                let y = summary.primary_value()?;
+                Some((x, y, summary))
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| left.0.total_cmp(&right.0));
+        if rows.len() < 2 {
+            continue;
+        }
+
+        let baseline_x = rows[0].0;
+        let baseline_y = rows[0].1;
+        let mut plateau = None;
+        let _ = writeln!(output, "Parameter: {key}");
+        for (idx, (x, y, summary)) in rows.iter().enumerate() {
+            let speedup = if summary.primary_metric.higher_is_better() {
+                y / baseline_y
+            } else {
+                baseline_y / y
+            };
+            let efficiency = if baseline_x > 0.0 && *x > 0.0 {
+                speedup / (*x / baseline_x)
+            } else {
+                0.0
+            };
+            if idx > 0 && plateau.is_none() {
+                let previous_y = rows[idx - 1].1;
+                let gain = if summary.primary_metric.higher_is_better() {
+                    (y - previous_y) / previous_y
+                } else {
+                    (previous_y - y) / previous_y
+                };
+                if gain < 0.10 {
+                    plateau = Some(*x);
+                }
+            }
+            let _ = writeln!(
+                output,
+                "  {}={} value={} speedup={:.2} efficiency={:.2}",
+                key,
+                x,
+                format_metric(*y, summary.primary_metric),
+                speedup,
+                efficiency
+            );
+        }
+        if let Some(point) = plateau {
+            let _ = writeln!(
+                output,
+                "  plateau: first {key} where incremental gain < 10% is {point}"
+            );
+        }
+    }
+}
+
+fn numeric_parameter_keys(summaries: &[BenchmarkSummary]) -> Vec<String> {
+    let mut values: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for summary in summaries {
+        for (key, value) in &summary.parameters {
+            if value.parse::<f64>().is_ok() {
+                values.entry(key.clone()).or_default().insert(value.clone());
+            }
+        }
+    }
+    values
+        .into_iter()
+        .filter_map(|(key, seen)| (seen.len() > 1).then_some(key))
+        .collect()
+}
+
+fn format_metric(value: f64, metric: PrimaryMetric) -> String {
+    match metric {
+        PrimaryMetric::Throughput => format_throughput(value),
+        PrimaryMetric::LatencyP95 | PrimaryMetric::ElapsedPerOperation => {
+            format_duration_ns(f64_to_u128(value))
+        }
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn f64_to_u128(value: f64) -> u128 {
+    value.max(0.0).round() as u128
+}
+
+fn format_throughput(value: f64) -> String {
+    if value >= 1_000_000.0 {
+        format!("{:.2}M ops/s", value / 1_000_000.0)
+    } else if value >= 1_000.0 {
+        format!("{:.2}K ops/s", value / 1_000.0)
+    } else {
+        format!("{value:.2} ops/s")
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn format_duration_ns(nanos: u128) -> String {
+    let secs = nanos as f64 / 1_000_000_000.0;
     if secs >= 1.0 {
-        format!("{:.2}s", secs)
+        format!("{secs:.2}s")
     } else if secs >= 0.001 {
         format!("{:.2}ms", secs * 1_000.0)
     } else if secs >= 0.000_001 {
@@ -413,276 +546,153 @@ fn format_duration(nanos: std::time::Duration) -> String {
     }
 }
 
-fn format_summary_config_line(label: &str, value: &str, source: Option<&String>) -> String {
-    match source {
-        Some(source) => format!("{label:<10} {value} ({source})\n"),
-        None => format!("{label:<10} {value}\n"),
-    }
-}
-
-impl Reporter for JsonReporter {
-    fn suite_end(&self, result: &SuiteResult) {
-        self.write_results(result);
-    }
-}
-
-/// GitHub Actions reporter that emits annotations.
-///
-/// Only produces output when running in GitHub Actions environment.
-/// Emits warnings for performance regressions that exceed the threshold.
-/// Output goes to stdout (as required by GitHub Actions annotation format).
-#[allow(dead_code)]
-pub struct GitHubActionsReporter {
-    threshold: f64,
-    baseline: Option<SuiteResult>,
-}
-
-#[allow(dead_code)]
-impl GitHubActionsReporter {
-    /// Create a new GitHub Actions reporter.
-    ///
-    /// `threshold` is the regression threshold (e.g., 0.05 for 5%).
-    pub fn new(threshold: f64) -> Self {
-        Self {
-            threshold,
-            baseline: None,
-        }
-    }
-
-    /// Load baseline from a file for comparison.
-    pub fn with_baseline(mut self, path: impl AsRef<std::path::Path>) -> Self {
-        match SuiteResult::load(path.as_ref()) {
-            Ok(baseline) => self.baseline = Some(baseline),
-            Err(e) => {
-                // Log to stderr, don't fail - baseline is optional
-                eprintln!(
-                    "Warning: failed to load baseline from '{}': {}",
-                    path.as_ref().display(),
-                    e
-                );
-            }
-        }
-        self
-    }
-
-    /// Check if we're running in GitHub Actions environment.
-    fn is_github_actions() -> bool {
-        std::env::var("GITHUB_ACTIONS").is_ok()
-    }
-
-    /// Format duration consistently for GitHub Actions output.
-    fn format_duration(d: std::time::Duration) -> String {
-        let secs = d.as_secs_f64();
-        if secs >= 1.0 {
-            format!("{:.2}s", secs)
-        } else {
-            format!("{:.2}ms", secs * 1000.0)
-        }
-    }
-}
-
-impl Reporter for GitHubActionsReporter {
-    fn suite_end(&self, result: &SuiteResult) {
-        // Only emit when running in GitHub Actions
-        if !Self::is_github_actions() {
-            return;
-        }
-
-        // Emit regression warnings if baseline is available
-        if let Some(baseline) = &self.baseline {
-            let regressions = result.find_regressions(baseline, self.threshold);
-            for (r, ratio) in regressions {
-                let pct = (ratio - 1.0) * 100.0;
-                // Include suite name and benchmark name in annotation
-                // Format: ::warning title=<title>::<message>
-                println!(
-                    "::warning title=Performance Regression in {}::Benchmark '{}' is {:.1}% slower than baseline",
-                    result.suite, r.name, pct
-                );
-            }
-        }
-
-        // Output summary in a collapsible group
-        println!("::group::Benchmark Results - {}", result.suite);
-        for r in &result.results {
-            let duration = Self::format_duration(r.duration);
-            println!("  {}: {}", r.name, duration);
-        }
-        println!("::endgroup::");
-    }
-}
-
-/// Combines multiple reporters.
-///
-/// Delegates all reporter calls to each contained reporter.
-/// Errors in one reporter do not affect others.
-pub struct MultiReporter {
-    reporters: Vec<Box<dyn Reporter>>,
-}
-
-impl MultiReporter {
-    pub fn new(reporters: Vec<Box<dyn Reporter>>) -> Self {
-        Self { reporters }
-    }
-}
-
-impl Reporter for MultiReporter {
-    fn suite_start(&self, suite: &str, config: &BenchRunnerConfig) {
-        for r in &self.reporters {
-            // Catch panics to ensure one reporter failure doesn't affect others
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                r.suite_start(suite, config);
-            }));
-        }
-    }
-
-    fn bench_start(&self, name: &str) {
-        for r in &self.reporters {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                r.bench_start(name);
-            }));
-        }
-    }
-
-    fn bench_end(&self, result: &BenchResult) {
-        for r in &self.reporters {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                r.bench_end(result);
-            }));
-        }
-    }
-
-    fn suite_end(&self, result: &SuiteResult) {
-        for r in &self.reporters {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                r.suite_end(result);
-            }));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::time::Duration;
+    use crate::result::{
+        BenchmarkMode, BenchmarkSpec, ComparisonResult, CorrectnessCounters, CorrectnessSummary,
+        EnvironmentInfo, ProfileConfig, Sample, SamplePhase, SummaryStats, SCHEMA_VERSION,
+    };
 
-    #[test]
-    fn should_format_duration_in_appropriate_units() {
-        // Seconds for durations >= 1s
-        assert!(ConsoleReporter::format_duration(Duration::from_secs(2)).contains("s"));
-        assert!(!ConsoleReporter::format_duration(Duration::from_secs(2)).contains("ms"));
+    fn summary(name: &str, value: f64, quality: QualityClass) -> BenchmarkSummary {
+        BenchmarkSummary {
+            benchmark_id: name.to_string(),
+            name: name.to_string(),
+            tier: 2,
+            primary_metric: PrimaryMetric::Throughput,
+            measured_samples: 10,
+            warmup_samples: 1,
+            cooldown_samples: 0,
+            stats: SummaryStats::from_values(&[value, value * 1.01])
+                .or_else(|| SummaryStats::from_values(&[value])),
+            quality,
+            correctness: CorrectnessSummary {
+                passed: true,
+                counters: CorrectnessCounters {
+                    attempted: 10,
+                    completed: 10,
+                    ..CorrectnessCounters::default()
+                },
+                errors: Vec::new(),
+            },
+            parameters: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+        }
+    }
 
-        // Milliseconds for durations >= 1ms and < 1s
-        assert!(ConsoleReporter::format_duration(Duration::from_millis(500)).contains("ms"));
-
-        // Microseconds for durations < 1ms
-        assert!(ConsoleReporter::format_duration(Duration::from_micros(100)).contains("us"));
+    fn run_with_summaries(summaries: Vec<BenchmarkSummary>) -> StressRun {
+        let profile_config = ProfileConfig::default();
+        StressRun {
+            schema_version: SCHEMA_VERSION.to_string(),
+            tool_version: "0.3.0".to_string(),
+            suite: "suite".to_string(),
+            run_profile: profile_config.profile,
+            environment: EnvironmentInfo::unknown(profile_config),
+            benchmark_specs: vec![BenchmarkSpec {
+                id: "bench".to_string(),
+                name: "bench".to_string(),
+                tier: 2,
+                mode: BenchmarkMode::FixedOperations {
+                    operations_per_sample: 1,
+                },
+                parameters: BTreeMap::new(),
+                metadata: BTreeMap::new(),
+            }],
+            samples: vec![Sample {
+                benchmark_id: "bench".to_string(),
+                sample_number: 0,
+                phase: SamplePhase::Measured,
+                elapsed_ns: 1,
+                operations_attempted: 1,
+                operations_completed: 1,
+                throughput: 1.0,
+                latency_ns: Vec::new(),
+                parameters: BTreeMap::new(),
+                counters: CorrectnessCounters {
+                    attempted: 1,
+                    completed: 1,
+                    ..CorrectnessCounters::default()
+                },
+                environment: EnvironmentInfo::unknown(ProfileConfig::default()),
+            }],
+            summaries,
+            comparisons: Vec::new(),
+            started_at: "123".to_string(),
+            total_elapsed_ns: 1_000,
+            metadata: BTreeMap::new(),
+        }
     }
 
     #[test]
-    fn should_format_duration_with_two_decimals() {
-        let d = Duration::from_secs_f64(1.234567);
-        let formatted = ConsoleReporter::format_duration(d);
-        assert_eq!(formatted, "1.23s");
+    fn formats_summary_and_noisy_rows() {
+        let run = run_with_summaries(vec![
+            summary("fast", 1_000_000.0, QualityClass::Authoritative),
+            summary("weak", 10.0, QualityClass::Noisy),
+        ]);
 
-        let d = Duration::from_secs_f64(0.123456);
-        let formatted = ConsoleReporter::format_duration(d);
-        assert_eq!(formatted, "123.46ms");
+        let report = format_report(&run);
 
-        let d = Duration::from_secs_f64(0.000123456);
-        let formatted = ConsoleReporter::format_duration(d);
-        assert_eq!(formatted, "123.46us");
+        assert!(report.contains("Summary"));
+        assert!(report.contains("fast"));
+        assert!(report.contains("Noisy Or Untrustworthy"));
+        assert!(report.contains("weak quality=noisy"));
     }
 
     #[test]
-    fn should_format_throughput_when_bytes_set() {
-        let result = BenchResult {
-            name: "test".to_string(),
-            duration: Duration::from_secs(1),
-            bytes: Some(1_000_000_000),
-            elements: None,
-            all_runs: vec![],
-            tags: HashMap::new(),
-        };
-        let throughput = ConsoleReporter::format_throughput(&result);
-        assert!(throughput.contains("GB/s"));
+    fn formats_regressions_and_improvements() {
+        let mut run = run_with_summaries(vec![summary("bench", 100.0, QualityClass::Acceptable)]);
+        run.comparisons = vec![
+            ComparisonResult {
+                benchmark_id: "regressed".to_string(),
+                current_quality: QualityClass::Acceptable,
+                baseline_quality: Some(QualityClass::Acceptable),
+                primary_metric: PrimaryMetric::Throughput,
+                baseline_value: Some(100.0),
+                current_value: Some(80.0),
+                change_percent: Some(-20.0),
+                threshold: 0.05,
+                confidence_intervals_overlap: Some(false),
+                classification: ComparisonClass::Regression,
+            },
+            ComparisonResult {
+                benchmark_id: "improved".to_string(),
+                current_quality: QualityClass::Acceptable,
+                baseline_quality: Some(QualityClass::Acceptable),
+                primary_metric: PrimaryMetric::Throughput,
+                baseline_value: Some(100.0),
+                current_value: Some(130.0),
+                change_percent: Some(30.0),
+                threshold: 0.05,
+                confidence_intervals_overlap: Some(false),
+                classification: ComparisonClass::Improvement,
+            },
+        ];
+
+        let report = format_report(&run);
+
+        assert!(report.contains("Regressions"));
+        assert!(report.contains("regressed -20.0%"));
+        assert!(report.contains("Improvements"));
+        assert!(report.contains("improved +30.0%"));
     }
 
     #[test]
-    fn should_format_throughput_when_elements_set() {
-        let result = BenchResult {
-            name: "test".to_string(),
-            duration: Duration::from_secs(1),
-            bytes: None,
-            elements: Some(1_000_000),
-            all_runs: vec![],
-            tags: HashMap::new(),
-        };
-        let throughput = ConsoleReporter::format_throughput(&result);
-        assert!(throughput.contains("ops/s"));
-    }
+    fn formats_sweep_table_and_plateau() {
+        let mut s1 = summary("client-1", 100.0, QualityClass::Acceptable);
+        s1.parameters
+            .insert("client_count".to_string(), "1".to_string());
+        let mut s2 = summary("client-2", 180.0, QualityClass::Acceptable);
+        s2.parameters
+            .insert("client_count".to_string(), "2".to_string());
+        let mut s4 = summary("client-4", 190.0, QualityClass::Acceptable);
+        s4.parameters
+            .insert("client_count".to_string(), "4".to_string());
+        let run = run_with_summaries(vec![s1, s2, s4]);
 
-    #[test]
-    fn should_return_empty_throughput_when_neither_set() {
-        let result = BenchResult {
-            name: "test".to_string(),
-            duration: Duration::from_secs(1),
-            bytes: None,
-            elements: None,
-            all_runs: vec![],
-            tags: HashMap::new(),
-        };
-        let throughput = ConsoleReporter::format_throughput(&result);
-        assert!(throughput.is_empty());
-    }
+        let report = format_report(&run);
 
-    #[test]
-    fn should_prefer_bytes_over_elements_for_throughput() {
-        let result = BenchResult {
-            name: "test".to_string(),
-            duration: Duration::from_secs(1),
-            bytes: Some(1_000_000),
-            elements: Some(500),
-            all_runs: vec![],
-            tags: HashMap::new(),
-        };
-        let throughput = ConsoleReporter::format_throughput(&result);
-        // Should show bytes throughput, not elements
-        assert!(throughput.contains("MB/s") || throughput.contains("KB/s"));
-        assert!(!throughput.contains("ops/s"));
-    }
-
-    #[test]
-    fn summary_includes_runs_and_warmup() {
-        let reporter = JsonReporter::new("target/stress");
-        let mut metadata = HashMap::new();
-        metadata.insert("output_dir".to_string(), "target/stress".to_string());
-        metadata.insert(
-            "output_dir_src".to_string(),
-            "env BENCH_OUTPUT_DIR".to_string(),
-        );
-        metadata.insert("runs_src".to_string(), "env BENCH_RUNS".to_string());
-        metadata.insert("warmup_runs_src".to_string(), "cli --warmup".to_string());
-        metadata.insert("verbose".to_string(), "true".to_string());
-        metadata.insert("verbose_src".to_string(), "default".to_string());
-        let suite = SuiteResult {
-            suite: "demo".to_string(),
-            results: vec![],
-            total_duration: Duration::from_millis(10),
-            started_at: "12345".to_string(),
-            runs: 3,
-            warmup_runs: 1,
-            git_sha: None,
-            metadata,
-        };
-
-        let summary = reporter.format_summary(&suite);
-        assert!(summary.contains("Runs"));
-        assert!(summary.contains("3 (env BENCH_RUNS)"));
-        assert!(summary.contains("Warmup"));
-        assert!(summary.contains("1 (cli --warmup)"));
-        assert!(summary.contains("target/stress (env BENCH_OUTPUT_DIR)"));
-        assert!(summary.contains("true (default)"));
+        assert!(report.contains("Sweep Tables"));
+        assert!(report.contains("Parameter: client_count"));
+        assert!(report.contains("plateau: first client_count"));
     }
 }

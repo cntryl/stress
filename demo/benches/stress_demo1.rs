@@ -4,7 +4,7 @@ use std::hint::black_box;
 #[stress_test]
 fn write_1kb_file(ctx: &mut StressContext) {
     let data = vec![0u8; 1024];
-    ctx.set_bytes(data.len() as u64);
+    ctx.parameter("payload_size", data.len());
 
     ctx.measure(|| {
         let _ = std::fs::write("target/stress_test1", &data);
@@ -16,7 +16,7 @@ fn write_1kb_file(ctx: &mut StressContext) {
 #[stress_test]
 fn allocate_large_buffer(ctx: &mut StressContext) {
     let size = 10 * 1024 * 1024; // 10 MB
-    ctx.set_bytes(size as u64);
+    ctx.parameter("payload_size", size);
 
     ctx.measure(|| {
         let mut buffer = vec![0u8; size];

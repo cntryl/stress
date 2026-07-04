@@ -1,18 +1,19 @@
-//! Configuration for the benchmark runner.
+//! Configuration and profile resolution for stress runs.
 
+use crate::result::{BenchmarkMode, BenchmarkModeKind, ProfileConfig, QualityClass, RunProfile};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub(crate) struct EnvConfigResolution {
-    pub config: BenchRunnerConfig,
+    pub config: StressRunnerConfig,
     pub metadata: HashMap<String, String>,
     pub warnings: Vec<String>,
 }
 
 impl EnvConfigResolution {
-    fn new(config: BenchRunnerConfig) -> Self {
+    fn new(config: StressRunnerConfig) -> Self {
         Self {
             config,
             metadata: HashMap::new(),
@@ -21,59 +22,133 @@ impl EnvConfigResolution {
     }
 }
 
-/// Configuration for the benchmark runner.
+/// Configuration for one stress suite run.
 #[derive(Debug, Clone)]
-pub struct BenchRunnerConfig {
-    /// Number of measurement runs (reports median).
-    pub runs: usize,
-    /// Warmup runs (discarded).
-    pub warmup_runs: usize,
-    /// Output directory for JSON results.
+pub struct StressRunnerConfig {
+    /// Selected run profile.
+    pub profile: RunProfile,
+    /// Measured samples per benchmark.
+    pub samples: usize,
+    /// Warmup samples retained but excluded from summaries.
+    pub warmup_samples: usize,
+    /// Cooldown samples retained but excluded from summaries.
+    pub cooldown_samples: usize,
+    /// Output directory for artifacts.
     pub output_dir: PathBuf,
-    /// Print results to stdout.
+    /// Print progress/results to stdout.
     pub verbose: bool,
-    /// Filter benchmarks by name substring.
+    /// Filter benchmarks by name/module pattern.
     pub filter: Option<String>,
-    /// Git SHA to include in results (for regression tracking).
+    /// Exact tier filter.
+    pub tier: Option<u32>,
+    /// Git SHA to include in artifacts.
     pub git_sha: Option<String>,
-    /// Fail if any benchmark exceeds this duration.
-    pub timeout: Option<std::time::Duration>,
+    /// Per-benchmark timeout.
+    pub timeout: Option<Duration>,
+    /// Fixed-duration sample budget.
+    pub sample_duration: Duration,
+    /// Fixed-operations sample size.
+    pub operations_per_sample: u64,
+    /// Minimum quality required by the active profile.
+    pub min_quality: QualityClass,
+    /// Whether quality below `min_quality` fails the run.
+    pub fail_on_quality: bool,
+    /// Whether meaningful regressions fail the run.
+    pub fail_on_regression: bool,
+    /// Regression/improvement threshold.
+    pub threshold: f64,
+    /// Human-readable report depth label.
+    pub report_depth: String,
 }
 
-impl Default for BenchRunnerConfig {
+impl Default for StressRunnerConfig {
     fn default() -> Self {
-        Self {
-            runs: 1,
-            warmup_runs: 0,
-            output_dir: PathBuf::from("target/stress"),
-            verbose: true,
-            filter: None,
-            git_sha: None,
-            timeout: None,
-        }
+        Self::for_profile(RunProfile::Smoke)
     }
 }
 
-impl BenchRunnerConfig {
-    /// Create a new config with default settings.
+impl StressRunnerConfig {
+    /// Create a default smoke-profile config.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Parse config from environment variables.
-    ///
-    /// Supported variables:
-    /// - `BENCH_RUNS`: measurement runs (default: 1)
-    /// - `BENCH_WARMUP`: warmup runs (default: 0)
-    /// - `BENCH_VERBOSE`: verbose output (default: true)
-    /// - `BENCH_OUTPUT_DIR`: output directory
-    /// - `BENCH_FILTER`: filter benchmarks by name
-    /// - `BENCH_GIT_SHA`: git commit hash
-    /// - `BENCH_TIMEOUT_SECS`: timeout per benchmark in seconds
+    /// Create a config initialized from a profile.
+    #[must_use]
+    pub fn for_profile(profile: RunProfile) -> Self {
+        let profile_config = match profile {
+            RunProfile::Smoke => ProfileConfig {
+                profile,
+                measured_samples: 1,
+                warmup_samples: 0,
+                cooldown_samples: 0,
+                min_quality: QualityClass::Untrustworthy,
+                fail_on_quality: false,
+                fail_on_regression: false,
+                regression_threshold: 0.05,
+                sample_duration: Duration::from_millis(100),
+                operations_per_sample: 1,
+                report_depth: "summary".to_string(),
+            },
+            RunProfile::Release => ProfileConfig {
+                profile,
+                measured_samples: 10,
+                warmup_samples: 1,
+                cooldown_samples: 0,
+                min_quality: QualityClass::Acceptable,
+                fail_on_quality: true,
+                fail_on_regression: true,
+                regression_threshold: 0.05,
+                sample_duration: Duration::from_secs(1),
+                operations_per_sample: 1,
+                report_depth: "gated".to_string(),
+            },
+            RunProfile::Lab => ProfileConfig {
+                profile,
+                measured_samples: 30,
+                warmup_samples: 2,
+                cooldown_samples: 1,
+                min_quality: QualityClass::Noisy,
+                fail_on_quality: false,
+                fail_on_regression: false,
+                regression_threshold: 0.05,
+                sample_duration: Duration::from_secs(5),
+                operations_per_sample: 1,
+                report_depth: "deep".to_string(),
+            },
+        };
+        Self::from_profile_config(profile_config)
+    }
+
+    fn from_profile_config(profile_config: ProfileConfig) -> Self {
+        Self {
+            profile: profile_config.profile,
+            samples: profile_config.measured_samples,
+            warmup_samples: profile_config.warmup_samples,
+            cooldown_samples: profile_config.cooldown_samples,
+            output_dir: PathBuf::from("target/stress"),
+            verbose: true,
+            filter: None,
+            tier: None,
+            git_sha: None,
+            timeout: None,
+            sample_duration: profile_config.sample_duration,
+            operations_per_sample: profile_config.operations_per_sample,
+            min_quality: profile_config.min_quality,
+            fail_on_quality: profile_config.fail_on_quality,
+            fail_on_regression: profile_config.fail_on_regression,
+            threshold: profile_config.regression_threshold,
+            report_depth: profile_config.report_depth,
+        }
+    }
+
+    /// Resolve config from canonical `STRESS_*` environment variables.
+    #[must_use]
     pub fn from_env() -> Self {
         let resolution = Self::resolve_from_env();
         for warning in &resolution.warnings {
-            eprintln!("Warning: {}", warning);
+            eprintln!("Warning: {warning}");
         }
         resolution.config
     }
@@ -86,89 +161,20 @@ impl BenchRunnerConfig {
     where
         F: Fn(&str) -> Option<String>,
     {
-        let mut resolution = EnvConfigResolution::new(Self::default());
-
-        if let Some(v) = get_var("BENCH_RUNS") {
-            match v.parse() {
-                Ok(n) => {
-                    resolution.config.runs = n;
-                    resolution
-                        .metadata
-                        .insert("runs_src".to_string(), "env BENCH_RUNS".to_string());
-                }
-                Err(_) => resolution
-                    .warnings
-                    .push("invalid BENCH_RUNS, using default 1".to_string()),
-            }
-        }
-
-        if let Some(v) = get_var("BENCH_WARMUP") {
-            match v.parse() {
-                Ok(n) => {
-                    resolution.config.warmup_runs = n;
-                    resolution.metadata.insert(
-                        "warmup_runs_src".to_string(),
-                        "env BENCH_WARMUP".to_string(),
-                    );
-                }
-                Err(_) => resolution
-                    .warnings
-                    .push("invalid BENCH_WARMUP, using default 0".to_string()),
-            }
-        }
-
-        if let Some(v) = get_var("BENCH_VERBOSE") {
-            match parse_bool_env(&v) {
-                Some(verbose) => {
-                    resolution.config.verbose = verbose;
-                    resolution
-                        .metadata
-                        .insert("verbose_src".to_string(), "env BENCH_VERBOSE".to_string());
-                }
-                None => resolution
-                    .warnings
-                    .push("invalid BENCH_VERBOSE, using default true".to_string()),
-            }
-        }
-
-        if let Some(v) = get_var("BENCH_OUTPUT_DIR") {
-            resolution.config.output_dir = PathBuf::from(v);
-            resolution.metadata.insert(
-                "output_dir_src".to_string(),
-                "env BENCH_OUTPUT_DIR".to_string(),
-            );
-        }
-
-        if let Some(v) = get_var("BENCH_FILTER") {
-            resolution.config.filter = Some(v);
+        let mut resolution = EnvConfigResolution::new(Self::for_profile(resolve_profile(
+            &get_var,
+            "STRESS_PROFILE",
+        )));
+        if get_var("STRESS_PROFILE").is_some_and(|value| value.parse::<RunProfile>().is_err()) {
             resolution
-                .metadata
-                .insert("filter_src".to_string(), "env BENCH_FILTER".to_string());
+                .warnings
+                .push("invalid STRESS_PROFILE, using smoke".to_string());
         }
-
-        if let Some(v) = get_var("BENCH_GIT_SHA") {
-            resolution.config.git_sha = Some(v);
-            resolution
-                .metadata
-                .insert("git_sha_src".to_string(), "env BENCH_GIT_SHA".to_string());
-        }
-
-        if let Some(v) = get_var("BENCH_TIMEOUT_SECS") {
-            match v.parse::<u64>() {
-                Ok(secs) => {
-                    resolution.config.timeout = Some(Duration::from_secs(secs));
-                    resolution.metadata.insert(
-                        "timeout_secs_src".to_string(),
-                        "env BENCH_TIMEOUT_SECS".to_string(),
-                    );
-                }
-                Err(_) => resolution
-                    .warnings
-                    .push("invalid BENCH_TIMEOUT_SECS, using no timeout".to_string()),
-            }
-        }
-
-        apply_default_sources(&mut resolution.metadata);
+        resolution.metadata.insert(
+            "profile_src".to_string(),
+            source_for(&get_var, "STRESS_PROFILE"),
+        );
+        apply_env_overrides(&get_var, &mut resolution);
 
         if resolution.config.git_sha.is_none() {
             resolution.config.git_sha = detect_git_sha();
@@ -179,67 +185,318 @@ impl BenchRunnerConfig {
             }
         }
 
+        apply_default_sources(&mut resolution.metadata);
         resolution
     }
 
-    /// Set the number of measurement runs.
-    pub fn runs(mut self, n: usize) -> Self {
-        self.runs = n;
+    /// Return the profile config embedded in artifacts.
+    #[must_use]
+    pub fn profile_config(&self) -> ProfileConfig {
+        ProfileConfig {
+            profile: self.profile,
+            measured_samples: self.samples,
+            warmup_samples: self.warmup_samples,
+            cooldown_samples: self.cooldown_samples,
+            min_quality: self.min_quality,
+            fail_on_quality: self.fail_on_quality,
+            fail_on_regression: self.fail_on_regression,
+            regression_threshold: self.threshold,
+            sample_duration: self.sample_duration,
+            operations_per_sample: self.operations_per_sample,
+            report_depth: self.report_depth.clone(),
+        }
+    }
+
+    /// Build a concrete mode from a static mode kind.
+    #[must_use]
+    pub fn mode_for_kind(&self, kind: BenchmarkModeKind) -> BenchmarkMode {
+        match kind {
+            BenchmarkModeKind::FixedDuration => BenchmarkMode::FixedDuration {
+                sample_duration: self.sample_duration,
+            },
+            BenchmarkModeKind::FixedOperations => BenchmarkMode::FixedOperations {
+                operations_per_sample: self.operations_per_sample,
+            },
+        }
+    }
+
+    /// Set profile and profile-derived defaults.
+    #[must_use]
+    pub fn profile(self, profile: RunProfile) -> Self {
+        let mut next = Self::for_profile(profile);
+        next.output_dir = self.output_dir;
+        next.verbose = self.verbose;
+        next.filter = self.filter;
+        next.tier = self.tier;
+        next.git_sha = self.git_sha;
+        next.timeout = self.timeout;
+        next
+    }
+
+    /// Set measured sample count.
+    #[must_use]
+    pub fn samples(mut self, value: usize) -> Self {
+        self.samples = value;
         self
     }
 
-    /// Set the number of warmup runs.
-    pub fn warmup(mut self, n: usize) -> Self {
-        self.warmup_runs = n;
+    /// Set warmup sample count.
+    #[must_use]
+    pub fn warmup_samples(mut self, value: usize) -> Self {
+        self.warmup_samples = value;
         self
     }
 
-    /// Set the output directory.
+    /// Set cooldown sample count.
+    #[must_use]
+    pub fn cooldown_samples(mut self, value: usize) -> Self {
+        self.cooldown_samples = value;
+        self
+    }
+
+    /// Set output directory.
+    #[must_use]
     pub fn output_dir(mut self, path: impl Into<PathBuf>) -> Self {
         self.output_dir = path.into();
         self
     }
 
-    /// Set verbose output.
-    pub fn verbose(mut self, v: bool) -> Self {
-        self.verbose = v;
+    /// Set console output.
+    #[must_use]
+    pub fn verbose(mut self, value: bool) -> Self {
+        self.verbose = value;
         self
     }
 
-    /// Set filter pattern.
+    /// Set name/module filter.
+    #[must_use]
     pub fn filter(mut self, pattern: impl Into<String>) -> Self {
         self.filter = Some(pattern.into());
         self
     }
 
-    /// Clear filter pattern.
+    /// Clear name/module filter.
+    #[must_use]
     pub fn no_filter(mut self) -> Self {
         self.filter = None;
         self
     }
 
+    /// Set exact tier filter.
+    #[must_use]
+    pub fn tier(mut self, tier: u32) -> Self {
+        self.tier = Some(tier);
+        self
+    }
+
+    /// Clear tier filter.
+    #[must_use]
+    pub fn no_tier(mut self) -> Self {
+        self.tier = None;
+        self
+    }
+
     /// Set git SHA.
+    #[must_use]
     pub fn git_sha(mut self, sha: impl Into<String>) -> Self {
         self.git_sha = Some(sha.into());
         self
     }
 
-    /// Set timeout per benchmark.
-    pub fn timeout(mut self, duration: std::time::Duration) -> Self {
+    /// Set per-benchmark timeout.
+    #[must_use]
+    pub fn timeout(mut self, duration: Duration) -> Self {
         self.timeout = Some(duration);
         self
+    }
+
+    /// Set fixed-duration sample budget.
+    #[must_use]
+    pub fn sample_duration(mut self, duration: Duration) -> Self {
+        self.sample_duration = duration;
+        self
+    }
+
+    /// Set fixed-operations sample size.
+    #[must_use]
+    pub fn operations_per_sample(mut self, value: u64) -> Self {
+        self.operations_per_sample = value;
+        self
+    }
+
+    /// Set regression threshold.
+    #[must_use]
+    pub fn threshold(mut self, value: f64) -> Self {
+        self.threshold = value;
+        self
+    }
+}
+
+fn resolve_profile<F>(get_var: &F, env_key: &'static str) -> RunProfile
+where
+    F: Fn(&str) -> Option<String>,
+{
+    get_var(env_key)
+        .and_then(|value| value.parse::<RunProfile>().ok())
+        .unwrap_or_default()
+}
+
+fn apply_env_overrides<F>(get_var: &F, resolution: &mut EnvConfigResolution)
+where
+    F: Fn(&str) -> Option<String>,
+{
+    parse_env(
+        &get_var,
+        resolution,
+        "STRESS_SAMPLES",
+        "samples",
+        |value| value.parse::<usize>().ok(),
+        |config, value| config.samples = value,
+    );
+    parse_env(
+        &get_var,
+        resolution,
+        "STRESS_WARMUP_SAMPLES",
+        "warmup_samples",
+        |value| value.parse::<usize>().ok(),
+        |config, value| config.warmup_samples = value,
+    );
+    parse_env(
+        &get_var,
+        resolution,
+        "STRESS_COOLDOWN_SAMPLES",
+        "cooldown_samples",
+        |value| value.parse::<usize>().ok(),
+        |config, value| config.cooldown_samples = value,
+    );
+    parse_env(
+        &get_var,
+        resolution,
+        "STRESS_VERBOSE",
+        "verbose",
+        parse_bool_env,
+        |config, value| config.verbose = value,
+    );
+    parse_env(
+        &get_var,
+        resolution,
+        "STRESS_OUTPUT_DIR",
+        "output_dir",
+        |value| Some(value.to_string()),
+        |config, value| config.output_dir = PathBuf::from(value),
+    );
+    parse_env(
+        &get_var,
+        resolution,
+        "STRESS_FILTER",
+        "filter",
+        |value| Some(value.to_string()),
+        |config, value| config.filter = Some(value),
+    );
+    parse_env(
+        &get_var,
+        resolution,
+        "STRESS_GIT_SHA",
+        "git_sha",
+        |value| Some(value.to_string()),
+        |config, value| config.git_sha = Some(value),
+    );
+    parse_env(
+        &get_var,
+        resolution,
+        "STRESS_TIMEOUT_SECS",
+        "timeout_secs",
+        |value| value.parse::<u64>().ok(),
+        |config, value| config.timeout = Some(Duration::from_secs(value)),
+    );
+    parse_env(
+        &get_var,
+        resolution,
+        "STRESS_TIER",
+        "tier",
+        |value| value.parse::<u32>().ok(),
+        |config, value| config.tier = Some(value),
+    );
+    parse_env(
+        &get_var,
+        resolution,
+        "STRESS_SAMPLE_DURATION_MS",
+        "sample_duration",
+        |value| value.parse::<u64>().ok(),
+        |config, value| config.sample_duration = Duration::from_millis(value),
+    );
+    parse_env(
+        &get_var,
+        resolution,
+        "STRESS_OPERATIONS_PER_SAMPLE",
+        "operations_per_sample",
+        |value| value.parse::<u64>().ok(),
+        |config, value| config.operations_per_sample = value,
+    );
+    parse_env(
+        &get_var,
+        resolution,
+        "STRESS_THRESHOLD",
+        "threshold",
+        |value| value.parse::<f64>().ok(),
+        |config, value| config.threshold = value,
+    );
+}
+
+fn parse_env<F, T, P, A>(
+    get_var: &F,
+    resolution: &mut EnvConfigResolution,
+    env_key: &'static str,
+    metadata_key: &'static str,
+    parse: P,
+    apply: A,
+) where
+    F: Fn(&str) -> Option<String>,
+    P: FnOnce(&str) -> Option<T>,
+    A: FnOnce(&mut StressRunnerConfig, T),
+{
+    let Some(value) = get_var(env_key) else {
+        return;
+    };
+    match parse(&value) {
+        Some(parsed) => {
+            apply(&mut resolution.config, parsed);
+            resolution
+                .metadata
+                .insert(format!("{metadata_key}_src"), format!("env {env_key}"));
+        }
+        None => resolution
+            .warnings
+            .push(format!("invalid {env_key}, using profile/default value")),
+    }
+}
+
+fn source_for<F>(get_var: &F, env_key: &'static str) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if get_var(env_key).is_some() {
+        format!("env {env_key}")
+    } else {
+        "default".to_string()
     }
 }
 
 fn apply_default_sources(metadata: &mut HashMap<String, String>) {
     for key in [
-        "runs_src",
-        "warmup_runs_src",
+        "profile_src",
+        "samples_src",
+        "warmup_samples_src",
+        "cooldown_samples_src",
         "output_dir_src",
         "verbose_src",
         "filter_src",
+        "tier_src",
         "git_sha_src",
         "timeout_secs_src",
+        "sample_duration_src",
+        "operations_per_sample_src",
+        "threshold_src",
     ] {
         metadata
             .entry(key.to_string())
@@ -247,7 +504,7 @@ fn apply_default_sources(metadata: &mut HashMap<String, String>) {
     }
 }
 
-fn parse_bool_env(value: &str) -> Option<bool> {
+pub(crate) fn parse_bool_env(value: &str) -> Option<bool> {
     if value == "1" || value.eq_ignore_ascii_case("true") {
         Some(true)
     } else if value == "0" || value.eq_ignore_ascii_case("false") {
@@ -262,11 +519,11 @@ fn detect_git_sha() -> Option<String> {
         .args(["rev-parse", "HEAD"])
         .output()
         .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                String::from_utf8(o.stdout)
+        .and_then(|output| {
+            if output.status.success() {
+                String::from_utf8(output.stdout)
                     .ok()
-                    .map(|s| s.trim().to_string())
+                    .map(|sha| sha.trim().to_string())
             } else {
                 None
             }
@@ -278,74 +535,100 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_use_defaults_when_env_not_set() {
-        let cfg = BenchRunnerConfig::default();
-        assert_eq!(cfg.runs, 1);
-        assert_eq!(cfg.warmup_runs, 0);
-        assert!(cfg.verbose);
+    fn smoke_profile_defaults_to_fast_correctness_run() {
+        let cfg = StressRunnerConfig::default();
+
+        assert_eq!(cfg.profile, RunProfile::Smoke);
+        assert_eq!(cfg.samples, 1);
+        assert_eq!(cfg.warmup_samples, 0);
+        assert!(!cfg.fail_on_quality);
+        assert!(!cfg.fail_on_regression);
     }
 
     #[test]
-    fn should_build_config_with_builder() {
-        let cfg = BenchRunnerConfig::new()
-            .runs(5)
-            .warmup(2)
-            .verbose(false)
-            .filter("my_bench");
+    fn release_profile_enforces_quality_and_regression_gates() {
+        let cfg = StressRunnerConfig::for_profile(RunProfile::Release);
 
-        assert_eq!(cfg.runs, 5);
-        assert_eq!(cfg.warmup_runs, 2);
+        assert_eq!(cfg.samples, 10);
+        assert_eq!(cfg.warmup_samples, 1);
+        assert_eq!(cfg.min_quality, QualityClass::Acceptable);
+        assert!(cfg.fail_on_quality);
+        assert!(cfg.fail_on_regression);
+    }
+
+    #[test]
+    fn builder_sets_sample_and_filter_fields() {
+        let cfg = StressRunnerConfig::new()
+            .samples(5)
+            .warmup_samples(2)
+            .cooldown_samples(1)
+            .verbose(false)
+            .filter("my_bench")
+            .tier(3)
+            .operations_per_sample(10);
+
+        assert_eq!(cfg.samples, 5);
+        assert_eq!(cfg.warmup_samples, 2);
+        assert_eq!(cfg.cooldown_samples, 1);
         assert!(!cfg.verbose);
         assert_eq!(cfg.filter, Some("my_bench".to_string()));
+        assert_eq!(cfg.tier, Some(3));
+        assert_eq!(cfg.operations_per_sample, 10);
     }
 
     #[test]
-    fn should_use_env_values_when_present() {
+    fn stress_env_values_override_profile_defaults() {
         let env = HashMap::from([
-            ("BENCH_RUNS", "5".to_string()),
-            ("BENCH_WARMUP", "2".to_string()),
-            ("BENCH_VERBOSE", "false".to_string()),
+            ("STRESS_PROFILE", "release".to_string()),
+            ("STRESS_SAMPLES", "7".to_string()),
+            ("STRESS_WARMUP_SAMPLES", "2".to_string()),
+            ("STRESS_VERBOSE", "false".to_string()),
+            ("STRESS_TIER", "4".to_string()),
         ]);
 
-        let resolution = BenchRunnerConfig::resolve_from_env_with(|key| env.get(key).cloned());
-        let cfg = resolution.config;
+        let resolution = StressRunnerConfig::resolve_from_env_with(|key| env.get(key).cloned());
 
-        assert_eq!(cfg.runs, 5);
-        assert_eq!(cfg.warmup_runs, 2);
-        assert!(!cfg.verbose);
+        assert_eq!(resolution.config.profile, RunProfile::Release);
+        assert_eq!(resolution.config.samples, 7);
+        assert_eq!(resolution.config.warmup_samples, 2);
+        assert!(!resolution.config.verbose);
+        assert_eq!(resolution.config.tier, Some(4));
         assert!(resolution.warnings.is_empty());
     }
 
     #[test]
-    fn should_use_defaults_when_env_missing() {
-        let cfg = BenchRunnerConfig::resolve_from_env_with(|_| None).config;
+    fn malformed_env_values_warn_and_keep_defaults() {
+        let env = HashMap::from([
+            ("STRESS_SAMPLES", "abc".to_string()),
+            ("STRESS_VERBOSE", "maybe".to_string()),
+            ("STRESS_TIMEOUT_SECS", "soon".to_string()),
+        ]);
 
-        assert_eq!(cfg.runs, 1);
-        assert_eq!(cfg.warmup_runs, 0);
-        assert!(cfg.verbose);
+        let resolution = StressRunnerConfig::resolve_from_env_with(|key| env.get(key).cloned());
+
+        assert_eq!(resolution.config.samples, 1);
+        assert!(resolution.config.verbose);
+        assert_eq!(resolution.config.timeout, None);
+        assert_eq!(resolution.warnings.len(), 3);
     }
 
     #[test]
-    fn should_warn_when_env_values_are_invalid() {
-        let env = HashMap::from([
-            ("BENCH_RUNS", "abc".to_string()),
-            ("BENCH_VERBOSE", "maybe".to_string()),
-            ("BENCH_TIMEOUT_SECS", "soon".to_string()),
-        ]);
+    fn mode_for_kind_uses_resolved_profile_settings() {
+        let cfg = StressRunnerConfig::new()
+            .sample_duration(Duration::from_millis(250))
+            .operations_per_sample(12);
 
-        let resolution = BenchRunnerConfig::resolve_from_env_with(|key| env.get(key).cloned());
-
-        assert_eq!(resolution.config.runs, 1);
-        assert!(resolution.config.verbose);
-        assert_eq!(resolution.config.timeout, None);
-        assert!(resolution
-            .warnings
-            .contains(&"invalid BENCH_RUNS, using default 1".to_string()));
-        assert!(resolution
-            .warnings
-            .contains(&"invalid BENCH_VERBOSE, using default true".to_string()));
-        assert!(resolution
-            .warnings
-            .contains(&"invalid BENCH_TIMEOUT_SECS, using no timeout".to_string()));
+        assert_eq!(
+            cfg.mode_for_kind(BenchmarkModeKind::FixedDuration),
+            BenchmarkMode::FixedDuration {
+                sample_duration: Duration::from_millis(250)
+            }
+        );
+        assert_eq!(
+            cfg.mode_for_kind(BenchmarkModeKind::FixedOperations),
+            BenchmarkMode::FixedOperations {
+                operations_per_sample: 12
+            }
+        );
     }
 }

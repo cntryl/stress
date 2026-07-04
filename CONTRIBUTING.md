@@ -44,12 +44,12 @@ cargo build
 
 Run all tests:
 ```bash
-cargo test --all
+cargo test --workspace --all-features
 ```
 
 Run tests in release mode:
 ```bash
-cargo test --all --release
+cargo test --workspace --all-features --release
 ```
 
 ### Code Quality
@@ -64,10 +64,10 @@ cargo fmt --all
 cargo fmt --all -- --check
 
 # Lint with clippy
-cargo clippy --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::pedantic
 
 # Check documentation
-cargo doc --all --no-deps
+cargo doc --workspace --all-features --no-deps
 ```
 
 All of these must pass before submitting a PR.
@@ -85,7 +85,7 @@ cargo bench --bench stress-demo2
 
 - **core/** - Main library (`cntryl-stress`)
   - `src/harness.rs` - Test discovery and execution
-  - `src/runner.rs` - BenchRunner API
+  - `src/runner.rs` - StressRunner API
   - `src/report.rs` - Output reporters (Console, JSON)
   - `src/result.rs` - Result data structures
   - `src/config.rs` - Configuration and CLI parsing
@@ -104,7 +104,7 @@ cargo bench --bench stress-demo2
 2. Create a branch: `git checkout -b fix/issue-description`
 3. Make your changes
 4. Add tests if applicable
-5. Ensure all checks pass: `cargo test && cargo fmt --all && cargo clippy --all-targets`
+5. Ensure all checks pass: `cargo test --workspace --all-features && cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::pedantic`
 6. Create a pull request with a clear description
 
 ### For Features
@@ -130,9 +130,9 @@ cargo bench --bench stress-demo2
 3. Ensure all checks pass:
    ```bash
    cargo fmt --all
-   cargo clippy --all-targets -- -D warnings
-   cargo test --all
-   cargo doc --all --no-deps
+   cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::pedantic
+   cargo test --workspace --all-features
+   cargo doc --workspace --all-features --no-deps
    ```
 4. Write a clear PR description:
    - What problem does it solve?

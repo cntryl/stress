@@ -1,8 +1,8 @@
 [package]
 name = "cntryl-stress-macros"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
-description = "Proc macros for cntryl-stress benchmark framework"
+description = "Proc macros for the cntryl-stress benchmark framework"
 license = "Apache-2.0"
 repository = "https://github.com/cntryl/stress"
 keywords = ["benchmark", "stress", "testing", "performance"]

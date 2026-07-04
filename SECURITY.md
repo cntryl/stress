@@ -52,8 +52,8 @@ We keep dependencies minimal and up-to-date:
 
 | Version | Status | Security Updates |
 |---------|--------|------------------|
-| 0.1.x   | Current | Yes - all patches |
-| < 0.1.0 | Legacy | No |
+| 0.3.x   | Current | Yes - all patches |
+| < 0.3.0 | Legacy | No |
 
 ## Public Vulnerabilities
 
@@ -70,7 +70,7 @@ Once a fix is available, we will:
 - Use `git-secrets` or similar tools
 - Review dependencies before adding them
 - Follow Rust security guidelines
-- Use clippy with `-- -D warnings`
+- Use `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::pedantic`
 
 ## Questions?
 
@@ -80,4 +80,4 @@ Once a fix is available, we will:
 
 ---
 
-**Last Updated**: 2026-02-17
+**Last Updated**: 2026-07-04
