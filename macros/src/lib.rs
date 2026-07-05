@@ -109,7 +109,7 @@ pub fn stress(attr: TokenStream, item: TokenStream) -> TokenStream {
             module_path: module_path!(),
             tier: #tier,
             mode: #mode,
-            budgets: ::cntryl_stress::BenchmarkBudgets {
+            budgets: ::cntryl_stress::artifact::BenchmarkBudgets {
                 max_ns_per_op: #max_ns_per_op,
                 max_allocs_per_op: #max_allocs_per_op,
                 max_bytes_per_op: #max_bytes_per_op,
@@ -275,11 +275,13 @@ enum ModeKind {
 impl ModeKind {
     fn tokens(self) -> proc_macro2::TokenStream {
         match self {
-            Self::Micro => quote! { ::cntryl_stress::BenchmarkModeKind::Micro },
+            Self::Micro => quote! { ::cntryl_stress::artifact::BenchmarkModeKind::Micro },
             Self::FixedOperations => {
-                quote! { ::cntryl_stress::BenchmarkModeKind::FixedOperations }
+                quote! { ::cntryl_stress::artifact::BenchmarkModeKind::FixedOperations }
             }
-            Self::FixedDuration => quote! { ::cntryl_stress::BenchmarkModeKind::FixedDuration },
+            Self::FixedDuration => {
+                quote! { ::cntryl_stress::artifact::BenchmarkModeKind::FixedDuration }
+            }
         }
     }
 }
@@ -308,7 +310,7 @@ fn tier_error(tier: u32) -> Option<String> {
 pub fn stress_main(_input: TokenStream) -> TokenStream {
     quote! {
         fn main() {
-            ::cntryl_stress::stress_binary_main();
+            ::cntryl_stress::__private::stress_binary_main();
         }
     }
     .into()

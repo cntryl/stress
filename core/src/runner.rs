@@ -1,13 +1,13 @@
 //! Stress runner that records raw samples and derives current artifacts.
 
-use crate::config::StressRunnerConfig;
-use crate::context::{MeasurementRecord, StressContext};
-use crate::report::{ConsoleReporter, JsonReporter, JsonStdoutReporter, Reporter};
-use crate::result::{
+use crate::artifact::{
     attach_regression_diagnostics, compare_summaries, summarize_benchmark, BenchmarkModeKind,
     BenchmarkSpec, ComparisonClass, EnvironmentInfo, MeasurementIntent, Sample, SamplePhase,
     StressRun, MAX_TIER, SCHEMA_VERSION,
 };
+use crate::config::StressRunnerConfig;
+use crate::context::{MeasurementRecord, StressContext};
+use crate::reporting::{ConsoleReporter, JsonReporter, JsonStdoutReporter, Reporter};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
@@ -19,7 +19,7 @@ pub struct StressRunner {
     config: StressRunnerConfig,
     benchmark_specs: Vec<BenchmarkSpec>,
     samples: Vec<Sample>,
-    summaries: Vec<crate::result::BenchmarkSummary>,
+    summaries: Vec<crate::artifact::BenchmarkSummary>,
     suite_start: Instant,
     reporters: Vec<Box<dyn Reporter>>,
     metadata: BTreeMap<String, String>,
@@ -129,7 +129,7 @@ impl StressRunner {
                 .config
                 .mode_for_kind(BenchmarkModeKind::FixedOperations),
             intent: MeasurementIntent::General,
-            budgets: crate::result::BenchmarkBudgets::default(),
+            budgets: crate::artifact::BenchmarkBudgets::default(),
             parameters: BTreeMap::new(),
             metadata: BTreeMap::new(),
         };
@@ -229,7 +229,7 @@ impl StressRunner {
         Ok(self.finish_inner(comparisons))
     }
 
-    fn finish_inner(mut self, comparisons: Vec<crate::result::ComparisonResult>) -> StressRun {
+    fn finish_inner(mut self, comparisons: Vec<crate::artifact::ComparisonResult>) -> StressRun {
         attach_regression_diagnostics(&mut self.summaries, &comparisons);
         let run = StressRun {
             schema_version: SCHEMA_VERSION.to_string(),
@@ -580,7 +580,7 @@ pub fn evaluate_run_gate(run: &StressRun) -> RunGate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::result::{
+    use crate::artifact::{
         BenchmarkBudgets, BenchmarkMode, BenchmarkModeKind, CorrectnessCounters, PrimaryMetric,
         RunProfile,
     };
@@ -644,7 +644,7 @@ mod tests {
                 operations_per_sample: 1,
             },
             intent: MeasurementIntent::General,
-            budgets: crate::result::BenchmarkBudgets::default(),
+            budgets: crate::artifact::BenchmarkBudgets::default(),
             parameters: BTreeMap::new(),
             metadata: BTreeMap::new(),
         };
@@ -670,7 +670,7 @@ mod tests {
                 operations_per_sample: 1,
             },
             intent: MeasurementIntent::General,
-            budgets: crate::result::BenchmarkBudgets::default(),
+            budgets: crate::artifact::BenchmarkBudgets::default(),
             parameters: BTreeMap::new(),
             metadata: BTreeMap::new(),
         };
@@ -739,7 +739,7 @@ mod tests {
                 sample_duration: Duration::from_millis(1),
             },
             intent: MeasurementIntent::General,
-            budgets: crate::result::BenchmarkBudgets::default(),
+            budgets: crate::artifact::BenchmarkBudgets::default(),
             parameters: BTreeMap::new(),
             metadata: BTreeMap::new(),
         };

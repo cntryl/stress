@@ -358,6 +358,12 @@ Files are written under `target/stress/{suite}/`:
 
 The JSON artifact contains tool version, run profile, environment, benchmark specs, raw samples, summaries, diagnostics, quality, and comparisons. Unknown environment fields are explicit `"unknown"` or `null`.
 
+## Import Migration
+
+Common benchmark files do not change: keep using root imports such as `stress`, `stress_main`, `black_box`, `StressContext`, `StressRunner`, `StressRunnerConfig`, `StressRunnerOptions`, and `RunProfile`.
+
+Advanced imports moved out of the crate root. Result and schema types are under `cntryl_stress::artifact`, reporters and console formatting helpers are under `cntryl_stress::reporting`, and run gate helpers are under `cntryl_stress::runner`.
+
 ## Programmatic Runner
 
 ```rust

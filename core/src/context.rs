@@ -1,7 +1,7 @@
 //! Benchmark context for named measurements, workload facts, and correctness counters.
 
 use crate::allocation;
-use crate::result::{BenchmarkMode, CorrectnessCounters, MeasurementIntent};
+use crate::artifact::{BenchmarkMode, CorrectnessCounters, MeasurementIntent};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -44,11 +44,11 @@ pub(crate) struct MeasurementOverrides {
 }
 
 impl MeasurementOverrides {
-    pub fn target_for_phase(self, phase: crate::result::SamplePhase, default: usize) -> usize {
+    pub fn target_for_phase(self, phase: crate::artifact::SamplePhase, default: usize) -> usize {
         match phase {
-            crate::result::SamplePhase::Warmup => self.warmup_samples.unwrap_or(default),
-            crate::result::SamplePhase::Measured => self.samples.unwrap_or(default),
-            crate::result::SamplePhase::Cooldown => self.cooldown_samples.unwrap_or(default),
+            crate::artifact::SamplePhase::Warmup => self.warmup_samples.unwrap_or(default),
+            crate::artifact::SamplePhase::Measured => self.samples.unwrap_or(default),
+            crate::artifact::SamplePhase::Cooldown => self.cooldown_samples.unwrap_or(default),
         }
     }
 }

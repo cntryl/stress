@@ -34,7 +34,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use cntryl_stress::{format_console_runs, StressRun};
+use cntryl_stress::{artifact::StressRun, reporting::format_console_runs};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -891,7 +891,7 @@ fn report_child_failures(results: &[StressRunResult]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cntryl_stress::{
+    use cntryl_stress::artifact::{
         BenchmarkBudgets, BenchmarkMode, BenchmarkSpec, BenchmarkSummary, CorrectnessCounters,
         CorrectnessSummary, EnvironmentInfo, MeasurementIntent, PrimaryMetric, ProfileConfig,
         QualityClass, RunProfile, Sample, SamplePhase, SummaryStats, SCHEMA_VERSION,

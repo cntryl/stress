@@ -1,10 +1,10 @@
 //! Pluggable reporters for current stress artifacts.
 
-use crate::config::StressRunnerConfig;
-use crate::result::{
+use crate::artifact::{
     BenchmarkDiagnostic, BenchmarkSummary, ComparisonClass, ComparisonResult, CorrectnessSummary,
     PrimaryMetric, QualityClass, StressRun, SummaryStats,
 };
+use crate::config::StressRunnerConfig;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as FmtWrite;
 use std::io::Write;
@@ -1282,7 +1282,7 @@ fn budget_note(summary: &BenchmarkSummary) -> String {
         .join(", ")
 }
 
-fn allocation_budget_unavailable(result: &crate::result::BudgetResult) -> bool {
+fn allocation_budget_unavailable(result: &crate::artifact::BudgetResult) -> bool {
     matches!(
         result.metric.as_str(),
         "max_allocs_per_op" | "max_bytes_per_op"
@@ -1759,7 +1759,7 @@ fn format_duration_ns(nanos: u128) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::result::{
+    use crate::artifact::{
         BenchmarkBudgets, BenchmarkMode, BenchmarkSpec, BudgetResult, ComparisonResult,
         CorrectnessCounters, CorrectnessSummary, DiagnosticSeverity, EnvironmentInfo,
         MeasurementIntent, Sample, SamplePhase, SummaryStats, SCHEMA_VERSION,
@@ -1804,7 +1804,7 @@ mod tests {
 
     fn run_with_summaries(summaries: Vec<BenchmarkSummary>) -> StressRun {
         let profile_config =
-            crate::config::StressRunnerConfig::for_profile(crate::result::RunProfile::Release)
+            crate::config::StressRunnerConfig::for_profile(crate::artifact::RunProfile::Release)
                 .profile_config();
         StressRun {
             schema_version: SCHEMA_VERSION.to_string(),

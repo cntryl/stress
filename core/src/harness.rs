@@ -1,7 +1,7 @@
 //! Harness for auto-discovered stress benchmarks.
 
+use crate::artifact::{BenchmarkBudgets, BenchmarkModeKind, BenchmarkSpec, RunProfile};
 use crate::config::{parse_bool_env, StressRunnerConfig};
-use crate::result::{BenchmarkBudgets, BenchmarkModeKind, BenchmarkSpec, RunProfile};
 use crate::runner::{evaluate_run_gate, RunGate, StressRunner};
 use crate::StressContext;
 use std::collections::BTreeMap;
@@ -305,11 +305,13 @@ impl StressRunnerOptions {
 }
 
 /// Run all registered benchmarks with default options.
+#[allow(dead_code)]
 pub fn run_registered_benchmarks() {
     run_with_options(StressRunnerOptions::new());
 }
 
 /// Run all registered benchmarks with programmatic options.
+#[allow(dead_code)]
 pub fn run_with_options(options: StressRunnerOptions) {
     let args = StressBinaryArgs {
         workload: options.workload,
@@ -465,7 +467,7 @@ fn run_with_resolved_config(resolved: ResolvedStressConfig) {
             name: display_name,
             tier: entry.tier,
             mode: config_for_specs.mode_for_kind(entry.mode),
-            intent: crate::result::MeasurementIntent::General,
+            intent: crate::artifact::MeasurementIntent::General,
             budgets: entry.budgets,
             parameters: BTreeMap::new(),
             metadata,
@@ -694,6 +696,7 @@ pub fn list_benchmarks() -> Vec<&'static str> {
 
 /// Get the number of registered benchmarks.
 #[must_use]
+#[allow(dead_code)]
 pub fn benchmark_count() -> usize {
     STRESS_BENCHMARKS.len()
 }

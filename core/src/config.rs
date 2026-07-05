@@ -1,6 +1,6 @@
 //! Configuration and profile resolution for stress runs.
 
-use crate::result::{
+use crate::artifact::{
     BenchmarkMode, BenchmarkModeKind, ProfileConfig, QualityClass, RunProfile, MAX_TIER,
 };
 use std::collections::HashMap;

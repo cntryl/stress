@@ -942,7 +942,7 @@ impl StressRun {
 
 /// Summarize one benchmark from raw samples.
 #[must_use]
-pub fn summarize_benchmark(spec: &BenchmarkSpec, samples: &[Sample]) -> BenchmarkSummary {
+pub(crate) fn summarize_benchmark(spec: &BenchmarkSpec, samples: &[Sample]) -> BenchmarkSummary {
     let measured: Vec<&Sample> = samples
         .iter()
         .filter(|sample| sample.benchmark_id == spec.id && sample.phase == SamplePhase::Measured)
@@ -1034,7 +1034,7 @@ pub fn summarize_benchmark(spec: &BenchmarkSpec, samples: &[Sample]) -> Benchmar
 
 /// Compare current summaries to baseline summaries.
 #[must_use]
-pub fn compare_summaries(
+pub(crate) fn compare_summaries(
     current: &[BenchmarkSummary],
     baseline: &[BenchmarkSummary],
     threshold: f64,
@@ -1061,7 +1061,7 @@ pub fn compare_summaries(
 }
 
 /// Add regression diagnostics to summaries after baseline comparison.
-pub fn attach_regression_diagnostics(
+pub(crate) fn attach_regression_diagnostics(
     summaries: &mut [BenchmarkSummary],
     comparisons: &[ComparisonResult],
 ) {

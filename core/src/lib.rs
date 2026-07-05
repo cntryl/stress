@@ -45,12 +45,12 @@
 //! ```
 
 mod allocation;
+pub mod artifact;
 mod config;
-mod context;
+pub mod context;
 mod harness;
-mod report;
-mod result;
-mod runner;
+pub mod reporting;
+pub mod runner;
 
 #[cfg(test)]
 #[global_allocator]
@@ -64,37 +64,22 @@ static CNTRYL_STRESS_TEST_ALLOCATOR: allocation::StressAllocator =
 static CNTRYL_STRESS_TEST_ALLOCATOR_INSTALLATION: fn() =
     allocation::stress_allocator_installed_marker;
 
-pub use allocation::StressAllocator;
+pub use artifact::RunProfile;
 pub use config::StressRunnerConfig;
-pub use context::{CorrectnessRecorder, StressContext};
-pub use report::{
-    format_console_run, format_console_runs, ConsoleReporter, GitHubActionsReporter, JsonReporter,
-    MultiReporter, Reporter,
-};
-pub use result::{
-    BenchmarkBudgets, BenchmarkDiagnostic, BenchmarkMode, BenchmarkModeKind, BenchmarkSpec,
-    BenchmarkSummary, BudgetResult, ComparisonClass, ComparisonResult, ConfidenceInterval,
-    CorrectnessCounters, CorrectnessSummary, DiagnosticSeverity, EnvironmentInfo,
-    MeasurementIntent, PrimaryMetric, ProfileConfig, QualityClass, RunProfile, Sample, SamplePhase,
-    StressRun, SummaryStats, MAX_TIER, SCHEMA_VERSION,
-};
-pub use runner::{evaluate_run_gate, RunGate, StressRunner};
+pub use context::StressContext;
+pub use runner::StressRunner;
 pub use std::hint::black_box;
 
 pub use cntryl_stress_macros::{stress, stress_main};
-pub use harness::stress_binary_main;
-pub use harness::{benchmark_count, list_benchmarks};
-pub use harness::{
-    run_from_env_and_args, run_registered_benchmarks, run_with_options, StressRunnerOptions,
-};
+pub use harness::StressRunnerOptions;
 
 /// Private module for macro internals.
 #[doc(hidden)]
 pub mod __private {
     pub use crate::allocation::{
-        stress_allocator_installed_marker, STRESS_ALLOCATOR_INSTALLATIONS,
+        stress_allocator_installed_marker, StressAllocator, STRESS_ALLOCATOR_INSTALLATIONS,
     };
-    pub use crate::harness::{linkme, BenchmarkEntry, STRESS_BENCHMARKS};
+    pub use crate::harness::{linkme, stress_binary_main, BenchmarkEntry, STRESS_BENCHMARKS};
 
     /// Run a future to completion without requiring a runtime dependency.
     pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -132,7 +117,8 @@ pub mod __private {
 macro_rules! stress_allocator {
     () => {
         #[global_allocator]
-        static CNTRYL_STRESS_ALLOCATOR: $crate::StressAllocator = $crate::StressAllocator::new();
+        static CNTRYL_STRESS_ALLOCATOR: $crate::__private::StressAllocator =
+            $crate::__private::StressAllocator::new();
 
         #[allow(non_upper_case_globals)]
         #[::cntryl_stress::__private::linkme::distributed_slice(
