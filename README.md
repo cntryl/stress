@@ -75,7 +75,7 @@ cargo stress --baseline target/stress/storage_stress/latest.json
 - Warmup and cooldown samples are retained in JSON and excluded from summary statistics and baseline comparison.
 - Tier drives benchmark mode: Tier 1 uses micro timing, Tier 2 uses fixed operations, and Tiers 3-6 use fixed duration.
 - `mode = "..."` is not public API; choose `#[stress(tier = 1..6)]`.
-- Compact console output shows good-quality rows, rows needing attention, concrete facts, and suggestions. Verbose output includes the deeper diagnostic columns.
+- Human console output is one table per suite. Bench-shape, result, and diagnostic issues are shown as bullets after the table.
 
 ## Tier Recipes
 
@@ -227,7 +227,7 @@ Command-line arguments override `STRESS_*` environment variables, which override
 | `STRESS_FILTER` | Benchmark name/module filter |
 | `STRESS_TIER` | Exact tier filter, 1 through 6 |
 | `STRESS_OUTPUT_DIR` | Artifact output directory |
-| `STRESS_CONSOLE` | Console mode: `compact`, `full`, `verbose`, `ci`, or `json` |
+| `STRESS_JSON` | Emit machine-readable JSON to stdout instead of the console table |
 | `STRESS_INCLUDE_IGNORED` | Include ignored benchmarks |
 | `STRESS_BASELINE` | Baseline stress artifact |
 | `STRESS_THRESHOLD` | Regression threshold |
@@ -245,17 +245,14 @@ cargo bench --bench storage_stress -- --baseline target/stress/storage_stress/la
 cargo bench --bench storage_stress -- --print-config
 ```
 
-Console modes:
+Console output:
 
 ```bash
-cargo bench --bench storage_stress -- --console compact
-cargo bench --bench storage_stress -- --console full
-cargo bench --bench storage_stress -- --console verbose
-cargo bench --bench storage_stress -- --console ci
-cargo bench --bench storage_stress -- --console json
+cargo bench --bench storage_stress
+cargo bench --bench storage_stress -- --json
 ```
 
-The default console output is `compact`: one run header, suite PASS/WARN/FAIL lines, per-row good-quality or needs-attention blocks, suggestions, and one aggregate run summary. Use `full` for every row with narrow columns, `verbose` for diagnostic columns and notes, `ci` for only actionable suites, and `json` for machine-readable stdout.
+`cargo bench --bench ...` uses one console format: one simple benchmark table per suite, followed by an `issues` bullet list only when a row needs attention. Use `--json` only for machine-readable stdout.
 
 ## Artifacts
 

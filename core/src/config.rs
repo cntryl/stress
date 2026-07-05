@@ -4,52 +4,8 @@ use crate::result::{
     BenchmarkMode, BenchmarkModeKind, ProfileConfig, QualityClass, RunProfile, MAX_TIER,
 };
 use std::collections::HashMap;
-use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
-
-/// Console output mode for human and machine-readable stdout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ConsoleMode {
-    /// Compact decision surface focused on actionable rows.
-    #[default]
-    Compact,
-    /// Full table with every benchmark row and compact columns.
-    Full,
-    /// Full diagnostic table with every benchmark row.
-    Verbose,
-    /// CI-oriented output with only actionable rows.
-    Ci,
-    /// Print the current JSON artifact to stdout.
-    Json,
-}
-
-impl fmt::Display for ConsoleMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Compact => f.write_str("compact"),
-            Self::Full => f.write_str("full"),
-            Self::Verbose => f.write_str("verbose"),
-            Self::Ci => f.write_str("ci"),
-            Self::Json => f.write_str("json"),
-        }
-    }
-}
-
-impl std::str::FromStr for ConsoleMode {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "compact" => Ok(Self::Compact),
-            "full" => Ok(Self::Full),
-            "verbose" => Ok(Self::Verbose),
-            "ci" => Ok(Self::Ci),
-            "json" => Ok(Self::Json),
-            other => Err(format!("unknown console mode '{other}'")),
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub(crate) struct EnvConfigResolution {
@@ -81,8 +37,8 @@ pub struct StressRunnerConfig {
     pub cooldown_samples: usize,
     /// Output directory for artifacts.
     pub output_dir: PathBuf,
-    /// Console output mode.
-    pub console: ConsoleMode,
+    /// Emit the current run JSON to stdout instead of the human console table.
+    pub json_stdout: bool,
     /// Filter benchmarks by name/module pattern.
     pub filter: Option<String>,
     /// Exact tier filter.
@@ -193,7 +149,7 @@ impl StressRunnerConfig {
             warmup_samples: profile_config.warmup_samples,
             cooldown_samples: profile_config.cooldown_samples,
             output_dir: PathBuf::from("target/stress"),
-            console: ConsoleMode::Compact,
+            json_stdout: false,
             filter: None,
             tier: None,
             git_sha: None,
@@ -323,7 +279,7 @@ impl StressRunnerConfig {
     pub fn profile(self, profile: RunProfile) -> Self {
         let mut next = Self::for_profile(profile);
         next.output_dir = self.output_dir;
-        next.console = self.console;
+        next.json_stdout = self.json_stdout;
         next.filter = self.filter;
         next.tier = self.tier;
         next.git_sha = self.git_sha;
@@ -359,21 +315,10 @@ impl StressRunnerConfig {
         self
     }
 
-    /// Set console output mode.
+    /// Emit machine-readable JSON to stdout instead of the human console table.
     #[must_use]
-    pub const fn console(mut self, value: ConsoleMode) -> Self {
-        self.console = value;
-        self
-    }
-
-    /// Set verbose console output.
-    #[must_use]
-    pub const fn verbose(mut self, value: bool) -> Self {
-        self.console = if value {
-            ConsoleMode::Verbose
-        } else {
-            ConsoleMode::Compact
-        };
+    pub const fn json_stdout(mut self, value: bool) -> Self {
+        self.json_stdout = value;
         self
     }
 
@@ -519,10 +464,10 @@ where
     parse_env(
         &get_var,
         resolution,
-        "STRESS_CONSOLE",
-        "console",
-        |value| value.parse::<ConsoleMode>().ok(),
-        |config, value| config.console = value,
+        "STRESS_JSON",
+        "json_stdout",
+        parse_bool_env,
+        |config, value| config.json_stdout = value,
     );
     parse_env(
         &get_var,
@@ -639,7 +584,7 @@ fn apply_default_sources(metadata: &mut HashMap<String, String>) {
         "warmup_samples_src",
         "cooldown_samples_src",
         "output_dir_src",
-        "console_src",
+        "json_stdout_src",
         "filter_src",
         "tier_src",
         "git_sha_src",
@@ -735,7 +680,6 @@ mod tests {
             .samples(5)
             .warmup_samples(2)
             .cooldown_samples(1)
-            .verbose(false)
             .filter("my_bench")
             .tier(3)
             .operations_per_sample(10);
@@ -743,7 +687,7 @@ mod tests {
         assert_eq!(cfg.samples, 5);
         assert_eq!(cfg.warmup_samples, 2);
         assert_eq!(cfg.cooldown_samples, 1);
-        assert_eq!(cfg.console, ConsoleMode::Compact);
+        assert!(!cfg.json_stdout);
         assert_eq!(cfg.filter, Some("my_bench".to_string()));
         assert_eq!(cfg.tier, Some(3));
         assert_eq!(cfg.operations_per_sample, 10);
@@ -766,7 +710,7 @@ mod tests {
             ("STRESS_PROFILE", "release".to_string()),
             ("STRESS_SAMPLES", "7".to_string()),
             ("STRESS_WARMUP_SAMPLES", "2".to_string()),
-            ("STRESS_CONSOLE", "full".to_string()),
+            ("STRESS_JSON", "true".to_string()),
             ("STRESS_TIER", "4".to_string()),
         ]);
 
@@ -775,7 +719,7 @@ mod tests {
         assert_eq!(resolution.config.profile, RunProfile::Release);
         assert_eq!(resolution.config.samples, 7);
         assert_eq!(resolution.config.warmup_samples, 2);
-        assert_eq!(resolution.config.console, ConsoleMode::Full);
+        assert!(resolution.config.json_stdout);
         assert_eq!(resolution.config.tier, Some(4));
         assert!(resolution.warnings.is_empty());
     }
@@ -784,23 +728,16 @@ mod tests {
     fn malformed_env_values_warn_and_keep_defaults() {
         let env = HashMap::from([
             ("STRESS_SAMPLES", "abc".to_string()),
-            ("STRESS_CONSOLE", "maybe".to_string()),
+            ("STRESS_JSON", "maybe".to_string()),
             ("STRESS_TIMEOUT_SECS", "soon".to_string()),
         ]);
 
         let resolution = StressRunnerConfig::resolve_from_env_with(|key| env.get(key).cloned());
 
         assert_eq!(resolution.config.samples, 5);
-        assert_eq!(resolution.config.console, ConsoleMode::Compact);
+        assert!(!resolution.config.json_stdout);
         assert_eq!(resolution.config.timeout, None);
         assert_eq!(resolution.warnings.len(), 3);
-    }
-
-    #[test]
-    fn old_console_mode_names_are_rejected() {
-        for mode in ["default", "quiet", "markdown"] {
-            assert!(mode.parse::<ConsoleMode>().is_err());
-        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Harness for auto-discovered stress benchmarks.
 
-use crate::config::{parse_bool_env, ConsoleMode, StressRunnerConfig};
+use crate::config::{parse_bool_env, StressRunnerConfig};
 use crate::result::{BenchmarkBudgets, BenchmarkModeKind, BenchmarkSpec, RunProfile};
 use crate::runner::{evaluate_run_gate, RunGate, StressRunner};
 use crate::StressContext;
@@ -46,7 +46,7 @@ struct StressBinaryArgs {
     samples: Option<usize>,
     warmup_samples: Option<usize>,
     cooldown_samples: Option<usize>,
-    console: Option<ConsoleMode>,
+    json_stdout: Option<bool>,
     include_ignored: Option<bool>,
     list: bool,
     print_config: bool,
@@ -114,14 +114,8 @@ impl StressBinaryArgs {
                         result.cooldown_samples = Some(value);
                     }
                 }
-                "--verbose" | "-v" => {
-                    result.console = Some(ConsoleMode::Verbose);
-                }
-                "--console" => {
-                    index += 1;
-                    if let Some(value) = args.get(index).and_then(|value| value.parse().ok()) {
-                        result.console = Some(value);
-                    }
+                "--json" => {
+                    result.json_stdout = Some(true);
                 }
                 "--include-ignored" => {
                     result.include_ignored = Some(true);
@@ -178,8 +172,7 @@ fn print_help() {
     eprintln!("    --samples <N>                  Measured samples per benchmark");
     eprintln!("    --warmup-samples <N>           Warmup samples");
     eprintln!("    --cooldown-samples <N>         Cooldown samples");
-    eprintln!("    --console <MODE>               compact, full, verbose, ci, or json");
-    eprintln!("    -v, --verbose                  Shortcut for --console verbose");
+    eprintln!("    --json                         Print machine-readable JSON to stdout");
     eprintln!("    --include-ignored              Include ignored benchmarks");
     eprintln!("    --list                         List benchmarks");
     eprintln!("    --print-config                 Print resolved config");
@@ -232,8 +225,8 @@ pub struct StressRunnerOptions {
     pub samples: Option<usize>,
     /// Warmup samples.
     pub warmup_samples: Option<usize>,
-    /// Console output mode.
-    pub console: Option<ConsoleMode>,
+    /// Print machine-readable JSON to stdout.
+    pub json_stdout: bool,
     /// Baseline artifact.
     pub baseline: Option<PathBuf>,
     /// Regression threshold.
@@ -289,21 +282,10 @@ impl StressRunnerOptions {
         self
     }
 
-    /// Set console output mode.
+    /// Print machine-readable JSON to stdout.
     #[must_use]
-    pub const fn console(mut self, value: ConsoleMode) -> Self {
-        self.console = Some(value);
-        self
-    }
-
-    /// Set verbose console output.
-    #[must_use]
-    pub const fn verbose(mut self, value: bool) -> Self {
-        self.console = Some(if value {
-            ConsoleMode::Verbose
-        } else {
-            ConsoleMode::Compact
-        });
+    pub const fn json_stdout(mut self, value: bool) -> Self {
+        self.json_stdout = value;
         self
     }
 
@@ -335,7 +317,7 @@ pub fn run_with_options(options: StressRunnerOptions) {
         tier: options.tier,
         samples: options.samples,
         warmup_samples: options.warmup_samples,
-        console: options.console,
+        json_stdout: options.json_stdout.then_some(true),
         include_ignored: Some(options.include_ignored),
         baseline: options.baseline,
         threshold: options.threshold,
@@ -406,12 +388,9 @@ where
             "cli --cooldown-samples".to_string(),
         );
     }
-    if let Some(console) = args.console {
-        config.console = console;
-        metadata.insert(
-            "console_src".to_string(),
-            format!("cli --console {console}"),
-        );
+    if let Some(json_stdout) = args.json_stdout {
+        config.json_stdout = json_stdout;
+        metadata.insert("json_stdout_src".to_string(), "cli --json".to_string());
     }
     if let Some(output_dir) = &args.output_dir {
         config.output_dir.clone_from(output_dir);
@@ -642,7 +621,7 @@ fn print_resolved_config(suite: &str, resolved: &ResolvedStressConfig) {
             .get("tier_src")
             .map_or("unknown", String::as_str)
     );
-    println!("Console: {}", resolved.config.console);
+    println!("JSON stdout: {}", resolved.config.json_stdout);
     println!("Include ignored: {}", resolved.include_ignored);
     println!(
         "Baseline: {} ({})",

@@ -54,7 +54,7 @@ static CNTRYL_STRESS_TEST_ALLOCATOR_INSTALLATION: fn() =
     allocation::stress_allocator_installed_marker;
 
 pub use allocation::StressAllocator;
-pub use config::{ConsoleMode, StressRunnerConfig};
+pub use config::StressRunnerConfig;
 pub use context::{CorrectnessRecorder, StressContext};
 pub use report::{
     format_console_run, format_console_runs, ConsoleReporter, GitHubActionsReporter, JsonReporter,
@@ -136,7 +136,7 @@ macro_rules! stress_allocator {
 /// Prelude module for benchmark files.
 pub mod prelude {
     pub use crate::{
-        black_box, stress, stress_allocator, stress_main, ConsoleMode, RunProfile, StressContext,
-        StressRunner, StressRunnerConfig, StressRunnerOptions,
+        black_box, stress, stress_allocator, stress_main, RunProfile, StressContext, StressRunner,
+        StressRunnerConfig, StressRunnerOptions,
     };
 }

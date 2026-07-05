@@ -34,7 +34,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use cntryl_stress::{format_console_runs, ConsoleMode, StressRun};
+use cntryl_stress::{format_console_runs, StressRun};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -129,17 +129,13 @@ struct StressArgs {
     // ========================================================================
     // Output Control
     // ========================================================================
-    /// Shortcut for --console verbose
-    #[arg(long, short = 'v')]
-    verbose: bool,
-
     /// Quiet mode (minimal output, only errors)
     #[arg(long, short = 'q')]
     quiet: bool,
 
-    /// Console output mode: compact, full, verbose, ci, or json
+    /// Print machine-readable JSON to stdout
     #[arg(long)]
-    console: Option<ConsoleMode>,
+    json: bool,
 
     /// Output directory for artifacts (falls back to `STRESS_OUTPUT_DIR`)
     #[arg(long)]
@@ -375,8 +371,7 @@ fn main() -> Result<()> {
 
 fn run_stress(args: &StressArgs) -> Result<()> {
     let verbosity = Verbosity::from_args(args);
-    let console_mode = selected_console_mode(args);
-    let passthrough_mode = (!args.list && !args.print_config).then_some(ConsoleMode::Json);
+    let passthrough_json = !args.list && !args.print_config;
 
     // Step 1: Locate project root
     let manifest_path = find_manifest(args)?
@@ -418,11 +413,11 @@ fn run_stress(args: &StressArgs) -> Result<()> {
         args,
         &temp_target_dir,
         verbosity,
-        passthrough_mode,
+        passthrough_json,
     )?;
 
     // Step 5: Report results
-    report_results(&results, console_mode, verbosity, passthrough_mode)?;
+    report_results(&results, args.json, verbosity, passthrough_json)?;
 
     // Step 6: Exit with appropriate code
     let failed_count = results.iter().filter(|r| !r.success()).count();
@@ -443,16 +438,6 @@ fn run_stress(args: &StressArgs) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn selected_console_mode(args: &StressArgs) -> ConsoleMode {
-    args.console.unwrap_or({
-        if args.verbose {
-            ConsoleMode::Verbose
-        } else {
-            ConsoleMode::Compact
-        }
-    })
 }
 
 // ============================================================================
@@ -647,7 +632,7 @@ fn run_stress_binaries(
     args: &StressArgs,
     target_dir_parent: &Path,
     verbosity: Verbosity,
-    passthrough_mode: Option<ConsoleMode>,
+    passthrough_json: bool,
 ) -> Result<Vec<StressRunResult>> {
     let target_dir = target_dir_parent.join(if args.dev { "debug" } else { "release" });
 
@@ -671,7 +656,7 @@ fn run_stress_binaries(
             continue;
         }
 
-        let result = run_single_binary(file, &binary_path, args, passthrough_mode)?;
+        let result = run_single_binary(file, &binary_path, args, passthrough_json)?;
 
         let failed = !result.success();
         results.push(result);
@@ -690,13 +675,13 @@ fn run_single_binary(
     file: &StressFile,
     binary_path: &Path,
     args: &StressArgs,
-    passthrough_mode: Option<ConsoleMode>,
+    passthrough_json: bool,
 ) -> Result<StressRunResult> {
     let mut cmd = Command::new(binary_path);
 
     // Pass through all relevant arguments to the stress binary
     // These are handled by the stress_main!() macro via clap parsing
-    build_passthrough_args(&mut cmd, args, passthrough_mode);
+    build_passthrough_args(&mut cmd, args, passthrough_json);
 
     let start = Instant::now();
 
@@ -707,7 +692,7 @@ fn run_single_binary(
         .with_context(|| format!("Failed to execute {}", binary_path.display()))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let (run, parse_error) = if passthrough_mode == Some(ConsoleMode::Json) {
+    let (run, parse_error) = if passthrough_json {
         match serde_json::from_str::<StressRun>(&stdout) {
             Ok(run) => (Some(run), None),
             Err(error) => (None, Some(error.to_string())),
@@ -730,11 +715,7 @@ fn run_single_binary(
 }
 
 /// Build arguments to pass through to the stress binary.
-fn build_passthrough_args(
-    cmd: &mut Command,
-    args: &StressArgs,
-    passthrough_mode: Option<ConsoleMode>,
-) {
+fn build_passthrough_args(cmd: &mut Command, args: &StressArgs, passthrough_json: bool) {
     // Workload filter
     if let Some(ref workload) = args.workload {
         cmd.arg("--workload").arg(workload);
@@ -761,8 +742,8 @@ fn build_passthrough_args(
             .arg(cooldown_samples.to_string());
     }
 
-    if let Some(console) = passthrough_mode.or(args.console) {
-        cmd.arg("--console").arg(console.to_string());
+    if passthrough_json || args.json {
+        cmd.arg("--json");
     }
 
     // Include ignored
@@ -802,20 +783,24 @@ fn build_passthrough_args(
 /// Print consolidated stress test results.
 fn report_results(
     results: &[StressRunResult],
-    console: ConsoleMode,
+    json_stdout: bool,
     verbosity: Verbosity,
-    passthrough_mode: Option<ConsoleMode>,
+    passthrough_json: bool,
 ) -> Result<()> {
     if results.is_empty() {
         return Ok(());
     }
 
-    if passthrough_mode.is_none() {
+    if !passthrough_json {
         report_passthrough_results(results, verbosity);
         return Ok(());
     }
 
-    let output = consolidated_output(results, console)?;
+    let output = if json_stdout {
+        consolidated_json_output(results)?
+    } else {
+        consolidated_output(results)?
+    };
     if !verbosity.is_quiet() {
         println!("{output}");
     }
@@ -823,13 +808,22 @@ fn report_results(
     Ok(())
 }
 
-fn consolidated_output(results: &[StressRunResult], console: ConsoleMode) -> Result<String> {
+fn consolidated_output(results: &[StressRunResult]) -> Result<String> {
     report_parse_errors(results)?;
     let runs = results
         .iter()
         .filter_map(|result| result.run.clone())
         .collect::<Vec<_>>();
-    Ok(format_console_runs(&runs, console))
+    Ok(format_console_runs(&runs))
+}
+
+fn consolidated_json_output(results: &[StressRunResult]) -> Result<String> {
+    report_parse_errors(results)?;
+    let runs = results
+        .iter()
+        .filter_map(|result| result.run.clone())
+        .collect::<Vec<_>>();
+    serde_json::to_string_pretty(&runs).context("failed to serialize consolidated stress JSON")
 }
 
 fn report_passthrough_results(results: &[StressRunResult], verbosity: Verbosity) {
@@ -1044,7 +1038,7 @@ mod tests {
     }
 
     #[test]
-    fn cargo_stress_compact_output_is_consolidated() {
+    fn cargo_stress_human_output_is_consolidated() {
         let results = vec![
             result_for(run(
                 "suite-a",
@@ -1056,16 +1050,17 @@ mod tests {
             )),
         ];
 
-        let output = consolidated_output(&results, ConsoleMode::Compact).expect("output");
+        let output = consolidated_output(&results).expect("output");
 
         assert_eq!(output.matches("@cntryl/stress").count(), 1);
-        assert!(output.contains("suite-a  PASS  1 benches"));
-        assert!(output.contains("suite-b  PASS  1 benches"));
-        assert_eq!(output.matches("Run summary").count(), 1);
+        assert!(output.contains("suite-a"));
+        assert!(output.contains("suite-b"));
+        assert_eq!(output.matches("benchmark").count(), 2);
+        assert!(!output.contains("summary: gate"));
     }
 
     #[test]
-    fn cargo_stress_ci_hides_clean_suites_and_keeps_summary() {
+    fn cargo_stress_human_output_shows_all_suites() {
         let results = vec![
             result_for(run(
                 "clean-suite",
@@ -1077,11 +1072,11 @@ mod tests {
             )),
         ];
 
-        let output = consolidated_output(&results, ConsoleMode::Ci).expect("output");
+        let output = consolidated_output(&results).expect("output");
 
-        assert!(!output.contains("clean-suite  PASS"));
-        assert!(output.contains("noisy-suite  FAIL  1 benches"));
-        assert!(output.contains("Run summary"));
+        assert!(output.contains("clean-suite"));
+        assert!(output.contains("noisy-suite"));
+        assert!(output.contains("issues"));
     }
 
     #[test]
@@ -1097,7 +1092,7 @@ mod tests {
             )),
         ];
 
-        let output = consolidated_output(&results, ConsoleMode::Json).expect("output");
+        let output = consolidated_json_output(&results).expect("output");
         let parsed = serde_json::from_str::<Vec<StressRun>>(&output).expect("json array");
 
         assert_eq!(parsed.len(), 2);

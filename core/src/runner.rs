@@ -1,8 +1,8 @@
 //! Stress runner that records raw samples and derives current artifacts.
 
-use crate::config::{ConsoleMode, StressRunnerConfig};
+use crate::config::StressRunnerConfig;
 use crate::context::{MeasurementRecord, StressContext};
-use crate::report::{ConsoleReporter, JsonReporter, Reporter};
+use crate::report::{ConsoleReporter, JsonReporter, JsonStdoutReporter, Reporter};
 use crate::result::{
     attach_regression_diagnostics, compare_summaries, summarize_benchmark, BenchmarkModeKind,
     BenchmarkSpec, ComparisonClass, EnvironmentInfo, MeasurementIntent, Sample, SamplePhase,
@@ -69,14 +69,14 @@ impl StressRunner {
         );
 
         let environment = capture_environment(&config);
-        let announce_artifacts = matches!(
-            config.console,
-            ConsoleMode::Compact | ConsoleMode::Full | ConsoleMode::Verbose
-        );
         let mut reporters: Vec<Box<dyn Reporter>> = vec![Box::new(
-            JsonReporter::new(config.output_dir.clone()).announce(announce_artifacts),
+            JsonReporter::new(config.output_dir.clone()).announce(false),
         )];
-        reporters.insert(0, Box::new(ConsoleReporter::new(config.console)));
+        if config.json_stdout {
+            reporters.insert(0, Box::new(JsonStdoutReporter::new()));
+        } else {
+            reporters.insert(0, Box::new(ConsoleReporter::new()));
+        }
 
         let runner = Self {
             suite: suite.to_string(),
@@ -591,8 +591,7 @@ mod tests {
         let config = StressRunnerConfig::new()
             .samples(2)
             .warmup_samples(1)
-            .cooldown_samples(0)
-            .verbose(false);
+            .cooldown_samples(0);
         let mut runner = StressRunner::with_config("suite", config);
         runner.reporters(Vec::new());
 
@@ -619,7 +618,7 @@ mod tests {
 
     #[test]
     fn run_spec_respects_tier_filter() {
-        let config = StressRunnerConfig::new().tier(3).verbose(false);
+        let config = StressRunnerConfig::new().tier(3);
         let mut runner = StressRunner::with_config("suite", config);
         runner.reporters(Vec::new());
 
@@ -634,7 +633,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "tiers are 1 through 6")]
     fn run_spec_rejects_undefined_tiers() {
-        let config = StressRunnerConfig::new().verbose(false);
+        let config = StressRunnerConfig::new();
         let mut runner = StressRunner::with_config("suite", config);
         runner.reporters(Vec::new());
         let spec = BenchmarkSpec {
@@ -660,7 +659,7 @@ mod tests {
         expected = "Tier 3 uses fixed_duration; remove mode or use tier = 2 for fixed_operations."
     )]
     fn run_spec_rejects_tier_mode_mismatches() {
-        let config = StressRunnerConfig::new().verbose(false);
+        let config = StressRunnerConfig::new();
         let mut runner = StressRunner::with_config("suite", config);
         runner.reporters(Vec::new());
         let spec = BenchmarkSpec {
@@ -685,8 +684,7 @@ mod tests {
     fn correctness_error_fails_run_gate() {
         let config = StressRunnerConfig::new()
             .samples(2)
-            .profile(RunProfile::Release)
-            .verbose(false);
+            .profile(RunProfile::Release);
         let mut runner = StressRunner::with_config("suite", config);
         runner.reporters(Vec::new());
 
@@ -701,9 +699,7 @@ mod tests {
 
     #[test]
     fn run_gate_fails_release_quality_policy() {
-        let config = StressRunnerConfig::for_profile(RunProfile::Release)
-            .samples(2)
-            .verbose(false);
+        let config = StressRunnerConfig::for_profile(RunProfile::Release).samples(2);
         let mut runner = StressRunner::with_config("suite", config);
         runner.reporters(Vec::new());
 
@@ -717,7 +713,7 @@ mod tests {
 
     #[test]
     fn low_ceremony_fixed_operation_benchmark_has_one_completed_operation() {
-        let config = StressRunnerConfig::new().verbose(false);
+        let config = StressRunnerConfig::new();
         let mut runner = StressRunner::with_config("suite", config);
         runner.reporters(Vec::new());
 
@@ -732,9 +728,7 @@ mod tests {
 
     #[test]
     fn explicit_fixed_duration_workload_uses_active_mode() {
-        let config = StressRunnerConfig::new()
-            .sample_duration(Duration::from_millis(1))
-            .verbose(false);
+        let config = StressRunnerConfig::new().sample_duration(Duration::from_millis(1));
         let mut runner = StressRunner::with_config("suite", config);
         runner.reporters(Vec::new());
         let spec = BenchmarkSpec {
@@ -763,7 +757,7 @@ mod tests {
 
     #[test]
     fn tier2_counted_recipe_records_logical_operation_totals() {
-        let config = StressRunnerConfig::for_profile(RunProfile::Smoke).verbose(false);
+        let config = StressRunnerConfig::for_profile(RunProfile::Smoke);
         let mut runner = StressRunner::with_config("suite", config.clone());
         runner.reporters(Vec::new());
         let spec = BenchmarkSpec {
@@ -797,7 +791,7 @@ mod tests {
 
     #[test]
     fn externally_timed_recipe_records_logical_throughput_without_allocation_stats() {
-        let config = StressRunnerConfig::for_profile(RunProfile::Smoke).verbose(false);
+        let config = StressRunnerConfig::for_profile(RunProfile::Smoke);
         let mut runner = StressRunner::with_config("suite", config);
         runner.reporters(Vec::new());
 
@@ -820,8 +814,7 @@ mod tests {
     #[test]
     fn micro_mode_records_raw_overhead_and_per_operation_fields() {
         let config = StressRunnerConfig::for_profile(RunProfile::Smoke)
-            .micro_sample_duration(Duration::from_millis(1))
-            .verbose(false);
+            .micro_sample_duration(Duration::from_millis(1));
         let mut runner = StressRunner::with_config("suite", config.clone());
         runner.reporters(Vec::new());
         let spec = BenchmarkSpec {
@@ -852,8 +845,7 @@ mod tests {
     fn run_allocating_fixed_operation(budgets: BenchmarkBudgets) -> StressRun {
         let config = StressRunnerConfig::for_profile(RunProfile::Smoke)
             .samples(2)
-            .operations_per_sample(2)
-            .verbose(false);
+            .operations_per_sample(2);
         let mut runner = StressRunner::with_config("suite", config.clone());
         runner.reporters(Vec::new());
         let spec = BenchmarkSpec {
@@ -928,7 +920,7 @@ mod tests {
 
     #[test]
     fn manual_correctness_counters_are_preserved() {
-        let config = StressRunnerConfig::new().verbose(false);
+        let config = StressRunnerConfig::new();
         let mut runner = StressRunner::with_config("suite", config);
         runner.reporters(Vec::new());
 
