@@ -91,6 +91,15 @@ stress is intentionally focused.
 
 It is built for engineers who spend significant time optimizing systems and want a fast feedback loop with minimal ceremony. It favors practical engineering decisions, clear benchmark shape, and a workflow optimized for day-to-day performance development.
 
+## Dependency Posture
+
+stress keeps the dependencies that directly support the benchmark authoring and reporting experience.
+
+- `serde` and `serde_json` are core dependencies because JSON artifacts, baselines, schema validation, and machine-readable output are part of the stable workflow.
+- `linkme` keeps `#[stress]` benchmarks automatically registered without asking users to maintain manual benchmark lists.
+- `cntryl-stress-macros` and its proc-macro stack power the macro-first API, including async benchmark support and benchmark metadata.
+- `clap` and `anyhow` are limited to the optional `cli` feature used by the `cargo stress` wrapper, so ordinary benchmark builds do not compile that CLI dependency graph.
+
 ## Quick Start
 
 ```toml

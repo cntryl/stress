@@ -20,9 +20,6 @@ anyhow = { version = "1", optional = true }
 linkme = "0.3"
 cntryl-stress-macros = { version = "0.3", path = "../macros" }
 
-[dev-dependencies]
-tempfile = "3"
-
 [[bin]]
 name = "cargo-stress"
 path = "src/bin/cargo-stress.rs"
