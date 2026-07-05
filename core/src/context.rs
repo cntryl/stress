@@ -704,7 +704,14 @@ mod tests {
     fn measure_counted_records_returned_logical_operations() {
         let mut ctx = ctx();
 
-        let completed = ctx.measure_counted(|| 256);
+        let completed = ctx.measure_counted(|| {
+            let mut value = 0_u64;
+            for index in 0..256 {
+                value = value.wrapping_add(std::hint::black_box(index));
+            }
+            std::hint::black_box(value);
+            256
+        });
 
         assert_eq!(completed, 256);
         assert_eq!(ctx.operations_hint, Some(256));

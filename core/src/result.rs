@@ -323,6 +323,7 @@ pub struct SummaryStats {
     /// Sample standard deviation.
     pub std_dev: f64,
     /// `std_dev / mean`.
+    #[serde(with = "nullable_f64_serde")]
     pub relative_std_dev: f64,
     /// 95% confidence interval around the mean.
     pub confidence_interval_95: ConfidenceInterval,
@@ -1383,10 +1384,25 @@ pub(crate) mod duration_serde {
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
-        let nanos = u128::deserialize(deserializer)?;
-        u64::try_from(nanos)
-            .map(Duration::from_nanos)
-            .map_err(serde::de::Error::custom)
+        let nanos = u64::deserialize(deserializer)?;
+        Ok(Duration::from_nanos(nanos))
+    }
+}
+
+mod nullable_f64_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub fn serialize<S: Serializer>(value: &f64, serializer: S) -> Result<S::Ok, S::Error> {
+        if value.is_finite() {
+            value.serialize(serializer)
+        } else {
+            None::<f64>.serialize(serializer)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+        Ok(Option::<f64>::deserialize(deserializer)?.unwrap_or(f64::NAN))
     }
 }
 
@@ -1532,6 +1548,17 @@ mod tests {
         assert_close(stats.p99, 5.0);
         assert!(stats.confidence_interval_95.lower < stats.mean);
         assert!(stats.confidence_interval_95.upper > stats.mean);
+    }
+
+    #[test]
+    fn stats_relative_std_dev_round_trips_null_when_non_finite() {
+        let stats = SummaryStats::from_values(&[0.0]).expect("stats");
+
+        let json = serde_json::to_string(&stats).expect("serialize");
+        let parsed = serde_json::from_str::<SummaryStats>(&json).expect("deserialize");
+
+        assert!(json.contains(r#""relative_std_dev":null"#));
+        assert!(parsed.relative_std_dev.is_nan());
     }
 
     #[test]
@@ -1863,6 +1890,34 @@ mod tests {
 
         assert_eq!(json["schema_version"], SCHEMA_VERSION);
         assert_eq!(json["samples"].as_array().expect("samples").len(), 0);
+    }
+
+    #[test]
+    fn json_duration_fields_round_trip_from_emitted_numbers() {
+        let profile_config = ProfileConfig::default();
+        let run = StressRun {
+            schema_version: SCHEMA_VERSION.to_string(),
+            tool_version: "0.3.0".to_string(),
+            suite: "suite".to_string(),
+            run_profile: profile_config.profile,
+            environment: EnvironmentInfo::unknown(profile_config),
+            benchmark_specs: vec![micro_spec("micro"), tier3_spec("duration")],
+            samples: Vec::new(),
+            summaries: Vec::new(),
+            comparisons: Vec::new(),
+            started_at: "123".to_string(),
+            total_elapsed_ns: 0,
+            metadata: BTreeMap::new(),
+        };
+
+        let json = serde_json::to_string(&run).expect("serialize");
+        let parsed = StressRun::from_json_str(&json).expect("round trip");
+
+        assert_eq!(parsed.benchmark_specs, run.benchmark_specs);
+        assert_eq!(
+            parsed.environment.profile_config.sample_duration,
+            run.environment.profile_config.sample_duration
+        );
     }
 
     #[test]

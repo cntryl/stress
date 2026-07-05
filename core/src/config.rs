@@ -11,27 +11,27 @@ use std::time::Duration;
 /// Console output mode for human and machine-readable stdout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConsoleMode {
-    /// Compact grouped decision surface.
+    /// Compact decision surface focused on actionable rows.
     #[default]
-    Default,
-    /// Full grouped table with every benchmark row.
+    Compact,
+    /// Full table with every benchmark row and compact columns.
+    Full,
+    /// Full diagnostic table with every benchmark row.
     Verbose,
-    /// Summary counts only.
-    Quiet,
+    /// CI-oriented output with only actionable rows.
+    Ci,
     /// Print the current JSON artifact to stdout.
     Json,
-    /// Print the Markdown report to stdout.
-    Markdown,
 }
 
 impl fmt::Display for ConsoleMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Default => f.write_str("default"),
+            Self::Compact => f.write_str("compact"),
+            Self::Full => f.write_str("full"),
             Self::Verbose => f.write_str("verbose"),
-            Self::Quiet => f.write_str("quiet"),
+            Self::Ci => f.write_str("ci"),
             Self::Json => f.write_str("json"),
-            Self::Markdown => f.write_str("markdown"),
         }
     }
 }
@@ -41,11 +41,11 @@ impl std::str::FromStr for ConsoleMode {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "default" => Ok(Self::Default),
+            "compact" => Ok(Self::Compact),
+            "full" => Ok(Self::Full),
             "verbose" => Ok(Self::Verbose),
-            "quiet" => Ok(Self::Quiet),
+            "ci" => Ok(Self::Ci),
             "json" => Ok(Self::Json),
-            "markdown" => Ok(Self::Markdown),
             other => Err(format!("unknown console mode '{other}'")),
         }
     }
@@ -193,7 +193,7 @@ impl StressRunnerConfig {
             warmup_samples: profile_config.warmup_samples,
             cooldown_samples: profile_config.cooldown_samples,
             output_dir: PathBuf::from("target/stress"),
-            console: ConsoleMode::Default,
+            console: ConsoleMode::Compact,
             filter: None,
             tier: None,
             git_sha: None,
@@ -366,13 +366,13 @@ impl StressRunnerConfig {
         self
     }
 
-    /// Set verbose or quiet console output.
+    /// Set verbose console output.
     #[must_use]
     pub const fn verbose(mut self, value: bool) -> Self {
         self.console = if value {
             ConsoleMode::Verbose
         } else {
-            ConsoleMode::Quiet
+            ConsoleMode::Compact
         };
         self
     }
@@ -743,7 +743,7 @@ mod tests {
         assert_eq!(cfg.samples, 5);
         assert_eq!(cfg.warmup_samples, 2);
         assert_eq!(cfg.cooldown_samples, 1);
-        assert_eq!(cfg.console, ConsoleMode::Quiet);
+        assert_eq!(cfg.console, ConsoleMode::Compact);
         assert_eq!(cfg.filter, Some("my_bench".to_string()));
         assert_eq!(cfg.tier, Some(3));
         assert_eq!(cfg.operations_per_sample, 10);
@@ -766,7 +766,7 @@ mod tests {
             ("STRESS_PROFILE", "release".to_string()),
             ("STRESS_SAMPLES", "7".to_string()),
             ("STRESS_WARMUP_SAMPLES", "2".to_string()),
-            ("STRESS_CONSOLE", "quiet".to_string()),
+            ("STRESS_CONSOLE", "full".to_string()),
             ("STRESS_TIER", "4".to_string()),
         ]);
 
@@ -775,7 +775,7 @@ mod tests {
         assert_eq!(resolution.config.profile, RunProfile::Release);
         assert_eq!(resolution.config.samples, 7);
         assert_eq!(resolution.config.warmup_samples, 2);
-        assert_eq!(resolution.config.console, ConsoleMode::Quiet);
+        assert_eq!(resolution.config.console, ConsoleMode::Full);
         assert_eq!(resolution.config.tier, Some(4));
         assert!(resolution.warnings.is_empty());
     }
@@ -791,9 +791,16 @@ mod tests {
         let resolution = StressRunnerConfig::resolve_from_env_with(|key| env.get(key).cloned());
 
         assert_eq!(resolution.config.samples, 5);
-        assert_eq!(resolution.config.console, ConsoleMode::Default);
+        assert_eq!(resolution.config.console, ConsoleMode::Compact);
         assert_eq!(resolution.config.timeout, None);
         assert_eq!(resolution.warnings.len(), 3);
+    }
+
+    #[test]
+    fn old_console_mode_names_are_rejected() {
+        for mode in ["default", "quiet", "markdown"] {
+            assert!(mode.parse::<ConsoleMode>().is_err());
+        }
     }
 
     #[test]

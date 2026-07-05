@@ -68,8 +68,10 @@ impl StressRunner {
         );
 
         let environment = capture_environment(&config);
-        let announce_artifacts =
-            matches!(config.console, ConsoleMode::Default | ConsoleMode::Verbose);
+        let announce_artifacts = matches!(
+            config.console,
+            ConsoleMode::Compact | ConsoleMode::Full | ConsoleMode::Verbose
+        );
         let mut reporters: Vec<Box<dyn Reporter>> = vec![Box::new(
             JsonReporter::new(config.output_dir.clone()).announce(announce_artifacts),
         )];

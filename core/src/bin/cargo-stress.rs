@@ -34,6 +34,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use cntryl_stress::{format_console_runs, ConsoleMode, StressRun};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -128,7 +129,7 @@ struct StressArgs {
     // ========================================================================
     // Output Control
     // ========================================================================
-    /// Verbose wrapper output and benchmark console output
+    /// Shortcut for --console verbose
     #[arg(long, short = 'v')]
     verbose: bool,
 
@@ -136,9 +137,9 @@ struct StressArgs {
     #[arg(long, short = 'q')]
     quiet: bool,
 
-    /// Console output mode passed to stress binaries: default, verbose, quiet, json, or markdown
+    /// Console output mode: compact, full, verbose, ci, or json
     #[arg(long)]
-    console: Option<String>,
+    console: Option<ConsoleMode>,
 
     /// Output directory for artifacts (falls back to `STRESS_OUTPUT_DIR`)
     #[arg(long)]
@@ -350,11 +351,13 @@ struct StressRunResult {
     duration: Duration,
     stdout: String,
     stderr: String,
+    run: Option<StressRun>,
+    parse_error: Option<String>,
 }
 
 impl StressRunResult {
     fn success(&self) -> bool {
-        self.status.success()
+        self.status.success() && self.parse_error.is_none()
     }
 }
 
@@ -372,6 +375,8 @@ fn main() -> Result<()> {
 
 fn run_stress(args: &StressArgs) -> Result<()> {
     let verbosity = Verbosity::from_args(args);
+    let console_mode = selected_console_mode(args);
+    let passthrough_mode = (!args.list && !args.print_config).then_some(ConsoleMode::Json);
 
     // Step 1: Locate project root
     let manifest_path = find_manifest(args)?
@@ -381,20 +386,13 @@ fn run_stress(args: &StressArgs) -> Result<()> {
         .parent()
         .context("Cargo.toml has no parent directory")?;
 
-    if verbosity.is_verbose() {
-        println!("📁 Project root: {}", project_root.display());
-    }
-
     // Step 2: Discover stress files
     let benches_dir = project_root.join("benches");
     let stress_files = discover_stress_files(&benches_dir, args)?;
 
     if stress_files.is_empty() {
         if verbosity.is_normal() {
-            println!(
-                "⚠️  No stress test files found in {}",
-                benches_dir.display()
-            );
+            println!("No stress test files found in {}", benches_dir.display());
             println!("   Create .rs files in benches/ that include cntryl_stress::stress_main!()");
         }
         return Ok(());
@@ -402,18 +400,6 @@ fn run_stress(args: &StressArgs) -> Result<()> {
 
     // Create temporary workspace so users don't need to update Cargo.toml
     let (temp_manifest, temp_target_dir) = create_temp_workspace(&stress_files, project_root)?;
-
-    if verbosity.is_verbose() {
-        println!(
-            "🔍 Found {} stress file(s): {}",
-            stress_files.len(),
-            stress_files
-                .iter()
-                .map(|f| f.stem.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
 
     // Step 3: Build stress binaries (unless --no-build)
     if !args.no_build {
@@ -427,41 +413,46 @@ fn run_stress(args: &StressArgs) -> Result<()> {
     }
 
     // Step 4: Run stress binaries
-    let results = run_stress_binaries(&stress_files, args, &temp_target_dir, verbosity)?;
+    let results = run_stress_binaries(
+        &stress_files,
+        args,
+        &temp_target_dir,
+        verbosity,
+        passthrough_mode,
+    )?;
 
     // Step 5: Report results
-    report_results(&results, verbosity);
+    report_results(&results, console_mode, verbosity, passthrough_mode)?;
 
     // Step 6: Exit with appropriate code
     let failed_count = results.iter().filter(|r| !r.success()).count();
     if failed_count > 0 {
-        if verbosity.is_normal() {
-            println!(
-                "\n❌ {} of {} stress test(s) failed",
-                failed_count,
-                results.len()
-            );
-        }
         std::process::exit(1);
-    }
-
-    if verbosity.is_normal() {
-        println!("\n✅ All {} stress test(s) passed", results.len());
     }
 
     // Cleanup temp workspace on success (leave on failure for debugging)
     let temp_root = temp_manifest.parent().unwrap();
-    if let Err(e) = fs::remove_dir_all(temp_root) {
-        if verbosity.is_verbose() {
-            println!(
-                "⚠️  Failed to clean up temp workspace {}: {}",
+    if let Err(error) = fs::remove_dir_all(temp_root) {
+        if verbosity.is_normal() {
+            eprintln!(
+                "Warning: failed to clean up temp workspace {}: {}",
                 temp_root.display(),
-                e
+                error
             );
         }
     }
 
     Ok(())
+}
+
+fn selected_console_mode(args: &StressArgs) -> ConsoleMode {
+    args.console.unwrap_or({
+        if args.verbose {
+            ConsoleMode::Verbose
+        } else {
+            ConsoleMode::Compact
+        }
+    })
 }
 
 // ============================================================================
@@ -472,15 +463,12 @@ fn run_stress(args: &StressArgs) -> Result<()> {
 enum Verbosity {
     Quiet,
     Normal,
-    Verbose,
 }
 
 impl Verbosity {
     fn from_args(args: &StressArgs) -> Self {
         if args.quiet {
             Verbosity::Quiet
-        } else if args.verbose {
-            Verbosity::Verbose
         } else {
             Verbosity::Normal
         }
@@ -492,10 +480,6 @@ impl Verbosity {
 
     fn is_normal(self) -> bool {
         !self.is_quiet()
-    }
-
-    fn is_verbose(self) -> bool {
-        self == Verbosity::Verbose
     }
 }
 
@@ -589,17 +573,9 @@ fn build_stress_binaries(
     files: &[StressFile],
     args: &StressArgs,
     manifest_path: &Path,
-    verbosity: Verbosity,
+    _verbosity: Verbosity,
     target_dir_override: Option<&Path>,
 ) -> Result<()> {
-    if verbosity.is_normal() {
-        println!(
-            "🔨 Building {} stress binary(ies) in {} mode...",
-            files.len(),
-            if args.dev { "debug" } else { "release" }
-        );
-    }
-
     // Build all binaries in one cargo invocation for efficiency
     let mut cmd = Command::new("cargo");
     cmd.arg("build");
@@ -634,21 +610,9 @@ fn build_stress_binaries(
         }
     }
 
-    if verbosity.is_verbose() {
-        println!("   Running: {cmd:?}");
-    }
-
     let output = cmd
-        .stdout(if verbosity.is_verbose() {
-            Stdio::inherit()
-        } else {
-            Stdio::piped()
-        })
-        .stderr(if verbosity.is_verbose() {
-            Stdio::inherit()
-        } else {
-            Stdio::piped()
-        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .output()
         .context("Failed to run cargo build")?;
 
@@ -656,7 +620,7 @@ fn build_stress_binaries(
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        eprintln!("\n❌ Build failed!");
+        eprintln!("Build failed.");
         if !stdout.is_empty() {
             eprintln!("{stdout}");
         }
@@ -668,10 +632,6 @@ fn build_stress_binaries(
             "Cargo build failed with exit code: {:?}",
             output.status.code()
         );
-    }
-
-    if verbosity.is_normal() {
-        println!("   Build complete.");
     }
 
     Ok(())
@@ -687,6 +647,7 @@ fn run_stress_binaries(
     args: &StressArgs,
     target_dir_parent: &Path,
     verbosity: Verbosity,
+    passthrough_mode: Option<ConsoleMode>,
 ) -> Result<Vec<StressRunResult>> {
     let target_dir = target_dir_parent.join(if args.dev { "debug" } else { "release" });
 
@@ -702,7 +663,7 @@ fn run_stress_binaries(
         if !binary_path.exists() {
             if verbosity.is_normal() {
                 eprintln!(
-                    "⚠️  Binary not found: {} (expected at {})",
+                    "Binary not found: {} (expected at {})",
                     file.stem,
                     binary_path.display()
                 );
@@ -710,7 +671,7 @@ fn run_stress_binaries(
             continue;
         }
 
-        let result = run_single_binary(file, &binary_path, args, verbosity)?;
+        let result = run_single_binary(file, &binary_path, args, passthrough_mode)?;
 
         let failed = !result.success();
         results.push(result);
@@ -729,81 +690,51 @@ fn run_single_binary(
     file: &StressFile,
     binary_path: &Path,
     args: &StressArgs,
-    verbosity: Verbosity,
+    passthrough_mode: Option<ConsoleMode>,
 ) -> Result<StressRunResult> {
-    if verbosity.is_normal() {
-        println!("\n🏃 Running stress test: {}", file.stem);
-    }
-
     let mut cmd = Command::new(binary_path);
 
     // Pass through all relevant arguments to the stress binary
     // These are handled by the stress_main!() macro via clap parsing
-    build_passthrough_args(&mut cmd, args);
-
-    if verbosity.is_verbose() {
-        println!("   Executing: {cmd:?}");
-    }
+    build_passthrough_args(&mut cmd, args, passthrough_mode);
 
     let start = Instant::now();
 
-    // Run with inherited stdio for real-time output in verbose mode,
-    // or capture for summary in normal mode
-    let output = if verbosity.is_verbose() {
-        // In verbose mode, let output stream through
-        let status = cmd
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .with_context(|| format!("Failed to execute {}", binary_path.display()))?;
+    let output = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("Failed to execute {}", binary_path.display()))?;
 
-        StressRunResult {
-            file: file.clone(),
-            status,
-            duration: start.elapsed(),
-            stdout: String::new(),
-            stderr: String::new(),
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let (run, parse_error) = if passthrough_mode == Some(ConsoleMode::Json) {
+        match serde_json::from_str::<StressRun>(&stdout) {
+            Ok(run) => (Some(run), None),
+            Err(error) => (None, Some(error.to_string())),
         }
     } else {
-        // Capture output for summary
-        let output = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .with_context(|| format!("Failed to execute {}", binary_path.display()))?;
-
-        StressRunResult {
-            file: file.clone(),
-            status: output.status,
-            duration: start.elapsed(),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        }
+        (None, None)
     };
 
-    // Print captured output in normal mode
-    if !verbosity.is_verbose() && verbosity.is_normal() {
-        if !output.stdout.is_empty() {
-            print!("{}", output.stdout);
-        }
-        if !output.stderr.is_empty() {
-            eprint!("{}", output.stderr);
-        }
-    }
-
-    if verbosity.is_verbose() {
-        println!(
-            "   Completed in {:.2}s with exit code: {:?}",
-            output.duration.as_secs_f64(),
-            output.status.code()
-        );
-    }
+    let output = StressRunResult {
+        file: file.clone(),
+        status: output.status,
+        duration: start.elapsed(),
+        stdout,
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        run,
+        parse_error,
+    };
 
     Ok(output)
 }
 
 /// Build arguments to pass through to the stress binary.
-fn build_passthrough_args(cmd: &mut Command, args: &StressArgs) {
+fn build_passthrough_args(
+    cmd: &mut Command,
+    args: &StressArgs,
+    passthrough_mode: Option<ConsoleMode>,
+) {
     // Workload filter
     if let Some(ref workload) = args.workload {
         cmd.arg("--workload").arg(workload);
@@ -830,15 +761,8 @@ fn build_passthrough_args(cmd: &mut Command, args: &StressArgs) {
             .arg(cooldown_samples.to_string());
     }
 
-    // Verbosity
-    if args.verbose {
-        cmd.arg("--verbose");
-    }
-    if args.quiet {
-        cmd.arg("--quiet");
-    }
-    if let Some(ref console) = args.console {
-        cmd.arg("--console").arg(console);
+    if let Some(console) = passthrough_mode.or(args.console) {
+        cmd.arg("--console").arg(console.to_string());
     }
 
     // Include ignored
@@ -875,31 +799,306 @@ fn build_passthrough_args(cmd: &mut Command, args: &StressArgs) {
 // Results Reporting
 // ============================================================================
 
-/// Print summary of all stress test results.
-fn report_results(results: &[StressRunResult], verbosity: Verbosity) {
-    if results.is_empty() || verbosity.is_quiet() {
-        return;
+/// Print consolidated stress test results.
+fn report_results(
+    results: &[StressRunResult],
+    console: ConsoleMode,
+    verbosity: Verbosity,
+    passthrough_mode: Option<ConsoleMode>,
+) -> Result<()> {
+    if results.is_empty() {
+        return Ok(());
     }
 
-    println!("Summary:");
+    if passthrough_mode.is_none() {
+        report_passthrough_results(results, verbosity);
+        return Ok(());
+    }
 
-    let total_duration: Duration = results.iter().map(|r| r.duration).sum();
+    let output = consolidated_output(results, console)?;
+    if !verbosity.is_quiet() {
+        println!("{output}");
+    }
+    report_child_failures(results);
+    Ok(())
+}
 
+fn consolidated_output(results: &[StressRunResult], console: ConsoleMode) -> Result<String> {
+    report_parse_errors(results)?;
+    let runs = results
+        .iter()
+        .filter_map(|result| result.run.clone())
+        .collect::<Vec<_>>();
+    Ok(format_console_runs(&runs, console))
+}
+
+fn report_passthrough_results(results: &[StressRunResult], verbosity: Verbosity) {
+    if verbosity.is_quiet() {
+        return;
+    }
     for result in results {
-        let status = if result.success() { "✓" } else { "✗" };
+        if !result.stdout.is_empty() {
+            print!("{}", result.stdout);
+        }
+        if !result.stderr.is_empty() {
+            eprint!("{}", result.stderr);
+        }
+    }
+}
+
+fn report_parse_errors(results: &[StressRunResult]) -> Result<()> {
+    let failed = results
+        .iter()
+        .filter_map(|result| {
+            result
+                .parse_error
+                .as_ref()
+                .map(|error| (result, error.as_str()))
+        })
+        .collect::<Vec<_>>();
+    if failed.is_empty() {
+        return Ok(());
+    }
+
+    for (result, error) in failed {
+        eprintln!(
+            "Failed to parse stress JSON from {} after {:.2}s: {}",
+            result.file.stem,
+            result.duration.as_secs_f64(),
+            error
+        );
+        if !result.stdout.trim().is_empty() {
+            eprintln!("stdout:\n{}", result.stdout);
+        }
+        if !result.stderr.trim().is_empty() {
+            eprintln!("stderr:\n{}", result.stderr);
+        }
+    }
+    bail!("one or more stress binaries did not emit parseable JSON")
+}
+
+fn report_child_failures(results: &[StressRunResult]) {
+    for result in results.iter().filter(|result| !result.status.success()) {
         let exit_info = result
             .status
             .code()
-            .map_or_else(|| "signal".to_string(), |c| format!("exit {c}"));
-
-        println!(
-            "  {} {} ({:.2}s, {})",
-            status,
+            .map_or_else(|| "signal".to_string(), |code| format!("exit {code}"));
+        eprintln!(
+            "Stress binary {} failed after {:.2}s ({exit_info})",
             result.file.stem,
-            result.duration.as_secs_f64(),
-            exit_info
+            result.duration.as_secs_f64()
         );
+        if !result.stderr.trim().is_empty() {
+            eprint!("{}", result.stderr);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cntryl_stress::{
+        BenchmarkBudgets, BenchmarkMode, BenchmarkSpec, BenchmarkSummary, CorrectnessCounters,
+        CorrectnessSummary, EnvironmentInfo, PrimaryMetric, ProfileConfig, QualityClass,
+        RunProfile, Sample, SamplePhase, SummaryStats, SCHEMA_VERSION,
+    };
+    use std::collections::BTreeMap;
+
+    fn stress_file(stem: &str) -> StressFile {
+        StressFile {
+            path: PathBuf::from(format!("benches/{stem}.rs")),
+            stem: stem.to_string(),
+            binary_name: format!("stress_{stem}"),
+        }
     }
 
-    println!("Total time: {:.2}s", total_duration.as_secs_f64());
+    fn result_for(run: StressRun) -> StressRunResult {
+        StressRunResult {
+            file: stress_file(&run.suite),
+            status: success_status(),
+            duration: Duration::from_millis(1),
+            stdout: String::new(),
+            stderr: String::new(),
+            run: Some(run),
+            parse_error: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn success_status() -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(0)
+    }
+
+    #[cfg(windows)]
+    fn success_status() -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(0)
+    }
+
+    fn summary(name: &str, quality: QualityClass) -> BenchmarkSummary {
+        BenchmarkSummary {
+            benchmark_id: name.to_string(),
+            name: name.to_string(),
+            tier: 2,
+            primary_metric: PrimaryMetric::Throughput,
+            measured_samples: 10,
+            warmup_samples: 1,
+            cooldown_samples: 0,
+            stats: SummaryStats::from_values(&[100.0, 101.0]),
+            wall_clock: SummaryStats::from_values(&[1_000_000.0]),
+            total_wall_clock_ns: 1_000_000,
+            ns_per_op: None,
+            gross_ns_per_op: None,
+            overhead_ns_per_op: None,
+            allocs_per_op: None,
+            bytes_per_op: None,
+            quality,
+            budgets: BenchmarkBudgets::default(),
+            budget_results: Vec::new(),
+            flags: Vec::new(),
+            correctness: CorrectnessSummary {
+                passed: true,
+                counters: CorrectnessCounters {
+                    attempted: 10,
+                    completed: 10,
+                    ..CorrectnessCounters::default()
+                },
+                errors: Vec::new(),
+            },
+            parameters: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    fn run(suite: &str, summaries: Vec<BenchmarkSummary>) -> StressRun {
+        let profile_config = ProfileConfig {
+            profile: RunProfile::Release,
+            measured_samples: 10,
+            warmup_samples: 1,
+            cooldown_samples: 0,
+            min_quality: QualityClass::Acceptable,
+            fail_on_quality: true,
+            fail_on_regression: true,
+            regression_threshold: 0.05,
+            sample_duration: Duration::from_secs(1),
+            operations_per_sample: 1,
+            micro_sample_duration: Duration::from_millis(100),
+            report_depth: "gated".to_string(),
+        };
+        StressRun {
+            schema_version: SCHEMA_VERSION.to_string(),
+            tool_version: "0.3.0".to_string(),
+            suite: suite.to_string(),
+            run_profile: RunProfile::Release,
+            environment: EnvironmentInfo::unknown(profile_config.clone()),
+            benchmark_specs: vec![BenchmarkSpec {
+                id: format!("{suite}/bench"),
+                name: "bench".to_string(),
+                tier: 2,
+                mode: BenchmarkMode::FixedOperations {
+                    operations_per_sample: 1,
+                },
+                budgets: BenchmarkBudgets::default(),
+                parameters: BTreeMap::new(),
+                metadata: BTreeMap::new(),
+            }],
+            samples: vec![Sample {
+                benchmark_id: format!("{suite}/bench"),
+                sample_number: 0,
+                phase: SamplePhase::Measured,
+                elapsed_ns: 1,
+                wall_clock_ns: 1,
+                operations_attempted: 1,
+                operations_completed: 1,
+                throughput: 1.0,
+                calibrated_iterations: None,
+                gross_elapsed_ns: None,
+                overhead_ns: None,
+                net_elapsed_ns: None,
+                gross_ns_per_op: None,
+                overhead_ns_per_op: None,
+                net_ns_per_op: None,
+                allocs: None,
+                bytes: None,
+                allocs_per_op: None,
+                bytes_per_op: None,
+                latency_ns: Vec::new(),
+                parameters: BTreeMap::new(),
+                counters: CorrectnessCounters {
+                    attempted: 1,
+                    completed: 1,
+                    ..CorrectnessCounters::default()
+                },
+                environment: EnvironmentInfo::unknown(profile_config),
+            }],
+            summaries,
+            comparisons: Vec::new(),
+            started_at: "123".to_string(),
+            total_elapsed_ns: 1_000,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn cargo_stress_compact_output_is_consolidated() {
+        let results = vec![
+            result_for(run(
+                "suite-a",
+                vec![summary("suite_a::fast", QualityClass::Authoritative)],
+            )),
+            result_for(run(
+                "suite-b",
+                vec![summary("suite_b::fast", QualityClass::Acceptable)],
+            )),
+        ];
+
+        let output = consolidated_output(&results, ConsoleMode::Compact).expect("output");
+
+        assert_eq!(output.matches("@cntryl/stress").count(), 1);
+        assert!(output.contains("suite-a  PASS  1 benches"));
+        assert!(output.contains("suite-b  PASS  1 benches"));
+        assert_eq!(output.matches("Run summary").count(), 1);
+    }
+
+    #[test]
+    fn cargo_stress_ci_hides_clean_suites_and_keeps_summary() {
+        let results = vec![
+            result_for(run(
+                "clean-suite",
+                vec![summary("clean::fast", QualityClass::Authoritative)],
+            )),
+            result_for(run(
+                "noisy-suite",
+                vec![summary("noisy::row", QualityClass::Noisy)],
+            )),
+        ];
+
+        let output = consolidated_output(&results, ConsoleMode::Ci).expect("output");
+
+        assert!(!output.contains("clean-suite  PASS"));
+        assert!(output.contains("noisy-suite  FAIL  1 benches"));
+        assert!(output.contains("Run summary"));
+    }
+
+    #[test]
+    fn cargo_stress_json_output_is_parseable_suite_array() {
+        let results = vec![
+            result_for(run(
+                "suite-a",
+                vec![summary("suite_a::fast", QualityClass::Authoritative)],
+            )),
+            result_for(run(
+                "suite-b",
+                vec![summary("suite_b::fast", QualityClass::Acceptable)],
+            )),
+        ];
+
+        let output = consolidated_output(&results, ConsoleMode::Json).expect("output");
+        let parsed = serde_json::from_str::<Vec<StressRun>>(&output).expect("json array");
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].suite, "suite-a");
+        assert_eq!(parsed[1].suite, "suite-b");
+    }
 }

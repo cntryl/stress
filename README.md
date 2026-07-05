@@ -209,7 +209,7 @@ Command-line arguments override `STRESS_*` environment variables, which override
 | `STRESS_FILTER` | Benchmark name/module filter |
 | `STRESS_TIER` | Exact tier filter, 1 through 6 |
 | `STRESS_OUTPUT_DIR` | Artifact output directory |
-| `STRESS_CONSOLE` | Console mode: `default`, `verbose`, `quiet`, `json`, or `markdown` |
+| `STRESS_CONSOLE` | Console mode: `compact`, `full`, `verbose`, `ci`, or `json` |
 | `STRESS_INCLUDE_IGNORED` | Include ignored benchmarks |
 | `STRESS_BASELINE` | Baseline stress artifact |
 | `STRESS_THRESHOLD` | Regression threshold |
@@ -230,14 +230,14 @@ cargo bench --bench storage_stress -- --print-config
 Console modes:
 
 ```bash
-cargo bench --bench storage_stress -- --console default
+cargo bench --bench storage_stress -- --console compact
+cargo bench --bench storage_stress -- --console full
 cargo bench --bench storage_stress -- --console verbose
-cargo bench --bench storage_stress -- --console quiet
+cargo bench --bench storage_stress -- --console ci
 cargo bench --bench storage_stress -- --console json
-cargo bench --bench storage_stress -- --console markdown
 ```
 
-The default console output is a compact decision surface: grouped benchmark rows, `ns/op` for Tier 1 micro rows, optional allocation and overhead columns, wall-clock time per benchmark, quality labels, baseline deltas, summary counts, and a needs-attention block. Throughput percentile columns are sample-throughput percentiles, not operation latency percentiles.
+The default console output is `compact`: one run header, suite PASS/WARN/FAIL lines, attention rows with narrow columns, and one aggregate run summary. Use `full` for every row with narrow columns, `verbose` for diagnostic columns and notes, `ci` for only actionable suites, and `json` for machine-readable stdout.
 
 ## Artifacts
 

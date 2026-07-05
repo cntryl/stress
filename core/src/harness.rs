@@ -115,9 +115,6 @@ impl StressBinaryArgs {
                 "--verbose" | "-v" => {
                     result.console = Some(ConsoleMode::Verbose);
                 }
-                "--quiet" | "-q" => {
-                    result.console = Some(ConsoleMode::Quiet);
-                }
                 "--console" => {
                     index += 1;
                     if let Some(value) = args.get(index).and_then(|value| value.parse().ok()) {
@@ -179,9 +176,8 @@ fn print_help() {
     eprintln!("    --samples <N>                  Measured samples per benchmark");
     eprintln!("    --warmup-samples <N>           Warmup samples");
     eprintln!("    --cooldown-samples <N>         Cooldown samples");
-    eprintln!("    --console <MODE>               default, verbose, quiet, json, or markdown");
+    eprintln!("    --console <MODE>               compact, full, verbose, ci, or json");
     eprintln!("    -v, --verbose                  Shortcut for --console verbose");
-    eprintln!("    -q, --quiet                    Shortcut for --console quiet");
     eprintln!("    --include-ignored              Include ignored benchmarks");
     eprintln!("    --list                         List benchmarks");
     eprintln!("    --print-config                 Print resolved config");
@@ -298,13 +294,13 @@ impl StressRunnerOptions {
         self
     }
 
-    /// Set verbose or quiet console output.
+    /// Set verbose console output.
     #[must_use]
     pub const fn verbose(mut self, value: bool) -> Self {
         self.console = Some(if value {
             ConsoleMode::Verbose
         } else {
-            ConsoleMode::Quiet
+            ConsoleMode::Compact
         });
         self
     }

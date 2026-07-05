@@ -56,7 +56,10 @@ static CNTRYL_STRESS_TEST_ALLOCATOR_INSTALLATION: fn() =
 pub use allocation::StressAllocator;
 pub use config::{ConsoleMode, StressRunnerConfig};
 pub use context::{CorrectnessRecorder, StressContext};
-pub use report::{ConsoleReporter, GitHubActionsReporter, JsonReporter, MultiReporter, Reporter};
+pub use report::{
+    format_console_run, format_console_runs, ConsoleReporter, GitHubActionsReporter, JsonReporter,
+    MultiReporter, Reporter,
+};
 pub use result::{
     BenchmarkBudgets, BenchmarkMode, BenchmarkModeKind, BenchmarkSpec, BenchmarkSummary,
     BudgetResult, ComparisonClass, ComparisonResult, ConfidenceInterval, CorrectnessCounters,
