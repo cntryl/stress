@@ -1,23 +1,23 @@
-use cntryl_stress::{black_box, stress_test, StressContext};
+use cntryl_stress::{black_box, stress, StressContext};
 use std::collections::BTreeMap;
 
-#[stress_test(tier = 1, max_regression_pct = 5, metadata(tier_name = "hot_path"))]
+#[stress(tier = 1, max_regression_pct = 5, metadata(tier_name = "hot_path"))]
 fn tier1_hot_path_header_parse(ctx: &mut StressContext) {
     let header = b"content-type:application/json";
     ctx.parameter("header_len", header.len());
 
-    ctx.measure_micro(|| {
+    ctx.measure("header separator", || {
         let separator = header.iter().position(|byte| *byte == b':');
         black_box(separator)
     });
 }
 
-#[stress_test(tier = 2, metadata(tier_name = "subsystem"))]
+#[stress(tier = 2, metadata(tier_name = "subsystem"))]
 fn tier2_subsystem_index_insert(ctx: &mut StressContext) {
     let mut index = BTreeMap::<u64, u64>::new();
     ctx.parameter("initial_entries", 256);
 
-    ctx.measure(|| {
+    ctx.measure("index insert", || {
         for key in 0_u64..256 {
             index.insert(key, key.rotate_left(5));
         }
@@ -25,12 +25,18 @@ fn tier2_subsystem_index_insert(ctx: &mut StressContext) {
     });
 }
 
-#[stress_test(tier = 3, metadata(tier_name = "system"))]
+#[stress(tier = 2, metadata(tier_name = "subsystem", intent = "async"))]
+async fn tier2_subsystem_ready_future(ctx: &mut StressContext) {
+    ctx.measure_async("ready future", || async { black_box(42_u64) })
+        .await;
+}
+
+#[stress(tier = 3, metadata(tier_name = "system"))]
 fn tier3_system_snapshot_projection(ctx: &mut StressContext) {
     let events = (0_u64..1024).collect::<Vec<_>>();
     ctx.parameter("event_count", events.len());
 
-    let completed = ctx.measure_batch(events.len() as u64, || {
+    let completed = ctx.measure_batch("snapshot projection", events.len() as u64, || {
         let projected = events
             .iter()
             .enumerate()

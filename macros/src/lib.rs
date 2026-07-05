@@ -12,25 +12,23 @@ const MAX_TIER: u32 = 6;
 /// Common usage stays intentionally small:
 ///
 /// ```rust,ignore
-/// use cntryl_stress::{black_box, stress_test, StressContext};
+/// use cntryl_stress::{black_box, stress, StressContext};
 ///
-/// #[stress_test(tier = 1)]
+/// #[stress(tier = 1)]
 /// fn parse_hot_path(ctx: &mut StressContext) {
 ///     let header = b"content-type:application/json";
-///     ctx.measure_micro(|| black_box(header.iter().position(|byte| *byte == b':')));
+///     ctx.measure("colon lookup", || black_box(header.iter().position(|byte| *byte == b':')));
 /// }
 ///
-/// #[stress_test(tier = 2)]
+/// #[stress(tier = 2)]
 /// fn write_batch(ctx: &mut StressContext) {
-///     ctx.parameter("payload_size", 4096);
-///     ctx.measure(|| write_the_batch());
+///     ctx.measure("write batch", || write_the_batch());
 /// }
 /// ```
 ///
 /// Supported attributes:
 ///
 /// - `tier = 1` through `6` (defaults to `2`)
-/// - `mode = "micro"`, `mode = "fixed_operations"`, or `mode = "fixed_duration"` when it matches the tier-derived mode
 /// - `name = "custom_name"`
 /// - `ignore`
 /// - `max_ns_per_op = 1000`
@@ -40,12 +38,13 @@ const MAX_TIER: u32 = 6;
 /// - `max_rsd_pct = 10`
 /// - `metadata(owner = "storage", scenario = "fanout")`
 #[proc_macro_attribute]
-pub fn stress_test(attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn stress(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
     let fn_name = &input.sig.ident;
     let fn_name_str = fn_name.to_string();
+    let is_async = input.sig.asyncness.is_some();
 
-    let attrs = match StressAttrs::parse(attr) {
+    let attrs = match StressAttrs::parse(attr.into()) {
         Ok(attrs) => attrs,
         Err(error) => return error.to_compile_error().into(),
     };
@@ -63,30 +62,7 @@ pub fn stress_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             .to_compile_error()
             .into();
     };
-    let mode_kind = match attrs.mode.as_deref() {
-        Some(mode_name) => {
-            let Some(mode_kind) = parse_mode_kind(mode_name) else {
-                return syn::Error::new_spanned(
-                    fn_name,
-                    format!(
-                        "unsupported stress_test mode '{mode_name}'; expected micro, fixed_operations, or fixed_duration"
-                    ),
-                )
-                .to_compile_error()
-                .into();
-            };
-            if mode_kind != derived_mode {
-                return syn::Error::new_spanned(
-                    fn_name,
-                    tier_mode_mismatch_message(tier, derived_mode, mode_kind),
-                )
-                .to_compile_error()
-                .into();
-            }
-            mode_kind
-        }
-        None => derived_mode,
-    };
+    let mode_kind = derived_mode;
     let mode = mode_kind.tokens();
     let max_ns_per_op = option_f64_tokens(attrs.budgets.ns_per_op);
     let max_allocs_per_op = option_f64_tokens(attrs.budgets.allocs_per_op);
@@ -99,16 +75,36 @@ pub fn stress_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         &format!("__STRESS_BENCH_{}", fn_name_str.to_uppercase()),
         fn_name.span(),
     );
+    let wrapper_ident = syn::Ident::new(
+        &format!("__stress_sync_wrapper_{fn_name_str}"),
+        fn_name.span(),
+    );
+    let wrapper = if is_async {
+        quote! {
+            fn #wrapper_ident(ctx: &mut ::cntryl_stress::StressContext) {
+                ::cntryl_stress::__private::block_on(#fn_name(ctx));
+            }
+        }
+    } else {
+        quote! {}
+    };
+    let func = if is_async {
+        quote! { #wrapper_ident }
+    } else {
+        quote! { #fn_name }
+    };
 
     quote! {
         #input
+        #wrapper
 
         #[allow(non_upper_case_globals)]
         #[::cntryl_stress::__private::linkme::distributed_slice(::cntryl_stress::__private::STRESS_BENCHMARKS)]
         #[linkme(crate = ::cntryl_stress::__private::linkme)]
         static #submit_ident: ::cntryl_stress::__private::BenchmarkEntry = ::cntryl_stress::__private::BenchmarkEntry {
             name: #benchmark_name,
-            func: #fn_name,
+            function_name: #fn_name_str,
+            func: #func,
             ignored: #is_ignored,
             module_path: module_path!(),
             tier: #tier,
@@ -130,7 +126,6 @@ pub fn stress_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 struct StressAttrs {
     name: Option<String>,
     tier: u32,
-    mode: Option<String>,
     ignore: bool,
     budgets: StressBudgets,
     metadata: Vec<(String, String)>,
@@ -150,7 +145,6 @@ impl Default for StressAttrs {
         Self {
             name: None,
             tier: 2,
-            mode: None,
             ignore: false,
             budgets: StressBudgets::default(),
             metadata: Vec::new(),
@@ -159,9 +153,9 @@ impl Default for StressAttrs {
 }
 
 impl StressAttrs {
-    fn parse(attr: TokenStream) -> syn::Result<Self> {
+    fn parse(attr: proc_macro2::TokenStream) -> syn::Result<Self> {
         let parser = syn::punctuated::Punctuated::<Meta, Token![,]>::parse_terminated;
-        let metas = parser.parse(attr)?;
+        let metas = parser.parse2(attr)?;
         let mut attrs = Self::default();
 
         for meta in metas {
@@ -174,7 +168,10 @@ impl StressAttrs {
                     attrs.tier = int_value(&name_value)?;
                 }
                 Meta::NameValue(name_value) if name_value.path.is_ident("mode") => {
-                    attrs.mode = Some(string_value(&name_value)?);
+                    return Err(syn::Error::new_spanned(
+                        name_value,
+                        "mode is not a public stress attribute; choose tier = 1 through 6",
+                    ));
                 }
                 Meta::NameValue(name_value) if name_value.path.is_ident("max_ns_per_op") => {
                     attrs.budgets.ns_per_op = Some(float_value(&name_value)?);
@@ -197,7 +194,7 @@ impl StressAttrs {
                 other => {
                     return Err(syn::Error::new_spanned(
                         other,
-                        "unsupported stress_test attribute",
+                        "unsupported stress attribute",
                     ));
                 }
             }
@@ -285,23 +282,6 @@ impl ModeKind {
             Self::FixedDuration => quote! { ::cntryl_stress::BenchmarkModeKind::FixedDuration },
         }
     }
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Micro => "micro",
-            Self::FixedOperations => "fixed_operations",
-            Self::FixedDuration => "fixed_duration",
-        }
-    }
-}
-
-fn parse_mode_kind(value: &str) -> Option<ModeKind> {
-    match value {
-        "micro" => Some(ModeKind::Micro),
-        "fixed_operations" => Some(ModeKind::FixedOperations),
-        "fixed_duration" => Some(ModeKind::FixedDuration),
-        _ => None,
-    }
 }
 
 const fn mode_for_tier(tier: u32) -> Option<ModeKind> {
@@ -310,23 +290,6 @@ const fn mode_for_tier(tier: u32) -> Option<ModeKind> {
         2 => Some(ModeKind::FixedOperations),
         3..=MAX_TIER => Some(ModeKind::FixedDuration),
         _ => None,
-    }
-}
-
-fn tier_mode_mismatch_message(tier: u32, expected: ModeKind, actual: ModeKind) -> String {
-    format!(
-        "Tier {tier} uses {}; remove mode or use {} for {}.",
-        expected.as_str(),
-        tier_hint_for_mode(actual),
-        actual.as_str()
-    )
-}
-
-const fn tier_hint_for_mode(mode: ModeKind) -> &'static str {
-    match mode {
-        ModeKind::Micro => "tier = 1",
-        ModeKind::FixedOperations => "tier = 2",
-        ModeKind::FixedDuration => "tier = 3",
     }
 }
 
@@ -379,14 +342,12 @@ mod tests {
     }
 
     #[test]
-    fn mode_mismatch_guidance_points_to_matching_tier() {
-        assert_eq!(
-            tier_mode_mismatch_message(3, ModeKind::FixedDuration, ModeKind::FixedOperations),
-            "Tier 3 uses fixed_duration; remove mode or use tier = 2 for fixed_operations."
-        );
-        assert_eq!(
-            tier_mode_mismatch_message(1, ModeKind::Micro, ModeKind::FixedDuration),
-            "Tier 1 uses micro; remove mode or use tier = 3 for fixed_duration."
-        );
+    fn mode_attribute_is_rejected() {
+        let error = StressAttrs::parse(quote::quote! { tier = 1, mode = "micro" })
+            .expect_err("mode is not public");
+
+        assert!(error
+            .to_string()
+            .contains("mode is not a public stress attribute"));
     }
 }

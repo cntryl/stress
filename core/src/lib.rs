@@ -15,19 +15,19 @@
 //! The common benchmark body is intentionally small:
 //!
 //! ```rust,ignore
-//! use cntryl_stress::{black_box, stress_test, StressContext};
+//! use cntryl_stress::{black_box, stress, StressContext};
 //!
-//! #[stress_test(tier = 1)]
+//! #[stress(tier = 1)]
 //! fn parse_hot_path(ctx: &mut StressContext) {
 //!     let header = b"content-type:application/json";
-//!     ctx.measure_micro(|| black_box(header.iter().position(|byte| *byte == b':')));
+//!     ctx.measure("colon lookup", || black_box(header.iter().position(|byte| *byte == b':')));
 //! }
 //!
-//! #[stress_test(tier = 2)]
+//! #[stress(tier = 2)]
 //! fn write_batch(ctx: &mut StressContext) {
 //!     let batch = build_batch();
 //!     ctx.parameter("payload_size", batch.len());
-//!     ctx.measure(|| write_to_system(&batch));
+//!     ctx.measure("write batch", || write_to_system(&batch));
 //! }
 //!
 //! cntryl_stress::stress_main!();
@@ -61,15 +61,16 @@ pub use report::{
     MultiReporter, Reporter,
 };
 pub use result::{
-    BenchmarkBudgets, BenchmarkMode, BenchmarkModeKind, BenchmarkSpec, BenchmarkSummary,
-    BudgetResult, ComparisonClass, ComparisonResult, ConfidenceInterval, CorrectnessCounters,
-    CorrectnessSummary, EnvironmentInfo, PrimaryMetric, ProfileConfig, QualityClass, RunProfile,
-    Sample, SamplePhase, StressRun, SummaryStats, MAX_TIER, SCHEMA_VERSION,
+    BenchmarkBudgets, BenchmarkDiagnostic, BenchmarkMode, BenchmarkModeKind, BenchmarkSpec,
+    BenchmarkSummary, BudgetResult, ComparisonClass, ComparisonResult, ConfidenceInterval,
+    CorrectnessCounters, CorrectnessSummary, DiagnosticSeverity, EnvironmentInfo,
+    MeasurementIntent, PrimaryMetric, ProfileConfig, QualityClass, RunProfile, Sample, SamplePhase,
+    StressRun, SummaryStats, MAX_TIER, SCHEMA_VERSION,
 };
 pub use runner::{evaluate_run_gate, RunGate, StressRunner};
 pub use std::hint::black_box;
 
-pub use cntryl_stress_macros::{stress_main, stress_test};
+pub use cntryl_stress_macros::{stress, stress_main};
 pub use harness::stress_binary_main;
 pub use harness::{benchmark_count, list_benchmarks};
 pub use harness::{
@@ -83,6 +84,36 @@ pub mod __private {
         stress_allocator_installed_marker, STRESS_ALLOCATOR_INSTALLATIONS,
     };
     pub use crate::harness::{linkme, BenchmarkEntry, STRESS_BENCHMARKS};
+
+    /// Run a future to completion without requiring a runtime dependency.
+    pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        use std::pin::pin;
+        use std::sync::Arc;
+        use std::task::{Context, Poll, Wake, Waker};
+        use std::time::Duration;
+
+        struct ThreadWaker(std::thread::Thread);
+
+        impl Wake for ThreadWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+
+        let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+        let mut context = Context::from_waker(&waker);
+        let mut future = pin!(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => std::thread::park_timeout(Duration::from_millis(1)),
+            }
+        }
+    }
 }
 
 /// Install the stress allocation-counting global allocator.
@@ -105,7 +136,7 @@ macro_rules! stress_allocator {
 /// Prelude module for benchmark files.
 pub mod prelude {
     pub use crate::{
-        black_box, stress_allocator, stress_main, stress_test, ConsoleMode, RunProfile,
-        StressContext, StressRunner, StressRunnerConfig, StressRunnerOptions,
+        black_box, stress, stress_allocator, stress_main, ConsoleMode, RunProfile, StressContext,
+        StressRunner, StressRunnerConfig, StressRunnerOptions,
     };
 }

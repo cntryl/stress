@@ -1,11 +1,12 @@
 //! Stress runner that records raw samples and derives current artifacts.
 
 use crate::config::{ConsoleMode, StressRunnerConfig};
-use crate::context::StressContext;
+use crate::context::{MeasurementRecord, StressContext};
 use crate::report::{ConsoleReporter, JsonReporter, Reporter};
 use crate::result::{
-    compare_summaries, summarize_benchmark, BenchmarkModeKind, BenchmarkSpec, ComparisonClass,
-    EnvironmentInfo, Sample, SamplePhase, StressRun, MAX_TIER, SCHEMA_VERSION,
+    attach_regression_diagnostics, compare_summaries, summarize_benchmark, BenchmarkModeKind,
+    BenchmarkSpec, ComparisonClass, EnvironmentInfo, MeasurementIntent, Sample, SamplePhase,
+    StressRun, MAX_TIER, SCHEMA_VERSION,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -127,11 +128,12 @@ impl StressRunner {
             mode: self
                 .config
                 .mode_for_kind(BenchmarkModeKind::FixedOperations),
+            intent: MeasurementIntent::General,
             budgets: crate::result::BenchmarkBudgets::default(),
             parameters: BTreeMap::new(),
             metadata: BTreeMap::new(),
         };
-        self.run_spec(spec, f);
+        self.run_spec(&spec, f);
     }
 
     /// Run a benchmark using a complete spec.
@@ -139,7 +141,7 @@ impl StressRunner {
     /// # Panics
     ///
     /// Panics when `spec.tier` is outside the defined range of 1 through 6.
-    pub fn run_spec<F>(&mut self, mut spec: BenchmarkSpec, f: F)
+    pub fn run_spec<F>(&mut self, spec: &BenchmarkSpec, f: F)
     where
         F: Fn(&mut StressContext),
     {
@@ -155,31 +157,55 @@ impl StressRunner {
                 spec.name
             );
         }
-        if !self.should_run(&spec) {
+        if !self.should_run(spec) {
             return;
         }
 
         let start_sample = self.samples.len();
+        let mut derived_specs = BTreeMap::<String, BenchmarkSpec>::new();
+        let mut spec_order = Vec::<String>::new();
         self.record_phase_samples(
-            &mut spec,
+            spec,
             SamplePhase::Warmup,
             self.config.warmup_samples,
             &f,
+            &mut derived_specs,
+            &mut spec_order,
         );
-        self.record_phase_samples(&mut spec, SamplePhase::Measured, self.config.samples, &f);
         self.record_phase_samples(
-            &mut spec,
+            spec,
+            SamplePhase::Measured,
+            self.config.samples,
+            &f,
+            &mut derived_specs,
+            &mut spec_order,
+        );
+        self.record_phase_samples(
+            spec,
             SamplePhase::Cooldown,
             self.config.cooldown_samples,
             &f,
+            &mut derived_specs,
+            &mut spec_order,
         );
 
-        let summary = summarize_benchmark(&spec, &self.samples[start_sample..]);
-        for reporter in &self.reporters {
-            reporter.bench_end(&summary);
+        assert!(
+            !derived_specs.is_empty(),
+            "Benchmark '{}' did not record a measurement. Call ctx.measure(\"name\", ...) or another named timing helper.",
+            spec.name
+        );
+
+        for spec_id in spec_order {
+            let spec = derived_specs
+                .remove(&spec_id)
+                .expect("spec order contains known ids");
+            let summary = summarize_benchmark(&spec, &self.samples[start_sample..]);
+            for reporter in &self.reporters {
+                reporter.bench_end(&summary);
+            }
+            self.benchmark_specs.push(spec);
+            self.summaries.push(summary);
         }
-        self.benchmark_specs.push(spec);
-        self.summaries.push(summary);
     }
 
     /// Finish the run without a baseline comparison.
@@ -203,7 +229,8 @@ impl StressRunner {
         Ok(self.finish_inner(comparisons))
     }
 
-    fn finish_inner(self, comparisons: Vec<crate::result::ComparisonResult>) -> StressRun {
+    fn finish_inner(mut self, comparisons: Vec<crate::result::ComparisonResult>) -> StressRun {
+        attach_regression_diagnostics(&mut self.summaries, &comparisons);
         let run = StressRun {
             schema_version: SCHEMA_VERSION.to_string(),
             tool_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -241,57 +268,92 @@ impl StressRunner {
 
     fn record_phase_samples<F>(
         &mut self,
-        spec: &mut BenchmarkSpec,
+        base_spec: &BenchmarkSpec,
         phase: SamplePhase,
-        count: usize,
+        default_count: usize,
         f: &F,
+        derived_specs: &mut BTreeMap<String, BenchmarkSpec>,
+        spec_order: &mut Vec<String>,
     ) where
         F: Fn(&mut StressContext),
     {
-        for _ in 0..count {
-            let sample_number = self
-                .samples
-                .iter()
-                .filter(|sample| sample.benchmark_id == spec.id)
-                .count();
-            let sample = self.record_sample(spec, sample_number, phase, f);
-            self.samples.push(sample);
+        if default_count == 0 {
+            return;
+        }
+
+        let mut counts = BTreeMap::<String, usize>::new();
+        loop {
+            let (records, wall_clock) = invoke_benchmark(base_spec, f);
+            assert!(
+                !records.is_empty(),
+                "Benchmark '{}' did not record a measurement. Call ctx.measure(\"name\", ...) or another named timing helper.",
+                base_spec.name
+            );
+
+            let mut needs_more = false;
+            for record in records {
+                let benchmark_id = measurement_id(&base_spec.id, &record.name);
+                let target = record.overrides.target_for_phase(phase, default_count);
+                register_measurement_spec(
+                    base_spec,
+                    &record,
+                    &benchmark_id,
+                    derived_specs,
+                    spec_order,
+                );
+                let current_count = counts.entry(benchmark_id.clone()).or_default();
+                if *current_count >= target {
+                    continue;
+                }
+                let sample_number = self
+                    .samples
+                    .iter()
+                    .filter(|sample| sample.benchmark_id == benchmark_id)
+                    .count();
+                let sample = self.sample_from_record(
+                    &benchmark_id,
+                    sample_number,
+                    phase,
+                    wall_clock,
+                    record,
+                );
+                self.samples.push(sample);
+                *current_count += 1;
+                if *current_count < target {
+                    needs_more = true;
+                }
+            }
+
+            if !needs_more {
+                break;
+            }
         }
     }
 
     #[allow(clippy::cast_precision_loss)]
-    fn record_sample<F>(
-        &mut self,
-        spec: &mut BenchmarkSpec,
+    fn sample_from_record(
+        &self,
+        benchmark_id: &str,
         sample_number: usize,
         phase: SamplePhase,
-        f: &F,
-    ) -> Sample
-    where
-        F: Fn(&mut StressContext),
-    {
-        let mut ctx = StressContext::new(spec.tier, spec.mode.clone());
-        let wall_clock_start = Instant::now();
-        f(&mut ctx);
-        let wall_clock = wall_clock_start.elapsed();
-        let duration = ctx.duration.unwrap_or_else(|| {
-            panic!(
-                "Benchmark '{}' did not record a duration. Call the tier-appropriate timing helper exactly once.",
-                spec.name
-            )
-        });
-
-        spec.metadata.extend(ctx.metadata);
-        let parameters = merge_parameters(&spec.parameters, ctx.parameters);
+        wall_clock: std::time::Duration,
+        record: MeasurementRecord,
+    ) -> Sample {
+        let duration = if record.duration.is_zero() && record.intent != MeasurementIntent::External
+        {
+            std::time::Duration::from_nanos(1)
+        } else {
+            record.duration
+        };
         let elapsed_secs = duration.as_secs_f64();
-        let operations_attempted = ctx.counters.attempted;
-        let operations_completed = ctx.counters.completed;
+        let operations_attempted = record.counters.attempted;
+        let operations_completed = record.counters.completed;
         let throughput = if elapsed_secs > 0.0 {
             operations_completed as f64 / elapsed_secs
         } else {
             0.0
         };
-        let micro = ctx.micro;
+        let micro = record.micro;
         let gross_elapsed_ns = micro.map(|micro| micro.gross_elapsed.as_nanos());
         let overhead_ns = micro.map(|micro| micro.overhead.as_nanos());
         let net_elapsed_ns = micro.map(|micro| micro.net_elapsed.as_nanos());
@@ -302,14 +364,15 @@ impl StressRunner {
             micro.and_then(|micro| ns_per_op(micro.overhead.as_nanos(), micro.iterations));
         let net_ns_per_op =
             micro.and_then(|micro| ns_per_op(micro.net_elapsed.as_nanos(), micro.iterations));
-        let allocation = ctx.allocation;
+        let allocation = record.allocation;
         let allocs = allocation.map(|allocation| allocation.allocs);
         let bytes = allocation.map(|allocation| allocation.bytes);
         let allocs_per_op = allocs.and_then(|allocs| count_per_op(allocs, operations_completed));
         let bytes_per_op = bytes.and_then(|bytes| count_per_op(bytes, operations_completed));
 
         Sample {
-            benchmark_id: spec.id.clone(),
+            benchmark_id: benchmark_id.to_string(),
+            intent: record.intent,
             sample_number,
             phase,
             elapsed_ns: duration.as_nanos(),
@@ -328,12 +391,60 @@ impl StressRunner {
             bytes,
             allocs_per_op,
             bytes_per_op,
-            latency_ns: ctx.latency_ns,
-            parameters,
-            counters: ctx.counters,
+            latency_ns: record.latency_ns,
+            parameters: record.parameters,
+            counters: record.counters,
             environment: self.environment.clone(),
         }
     }
+}
+
+fn invoke_benchmark<F>(spec: &BenchmarkSpec, f: &F) -> (Vec<MeasurementRecord>, std::time::Duration)
+where
+    F: Fn(&mut StressContext),
+{
+    let mut ctx = StressContext::new(spec.tier, spec.mode.clone());
+    let wall_clock_start = Instant::now();
+    f(&mut ctx);
+    let wall_clock = wall_clock_start.elapsed();
+    (ctx.take_measurements(), wall_clock)
+}
+
+fn measurement_id(base_id: &str, measurement_name: &str) -> String {
+    format!("{base_id}/{measurement_name}")
+}
+
+fn register_measurement_spec(
+    base_spec: &BenchmarkSpec,
+    record: &MeasurementRecord,
+    benchmark_id: &str,
+    derived_specs: &mut BTreeMap<String, BenchmarkSpec>,
+    spec_order: &mut Vec<String>,
+) {
+    if let Some(spec) = derived_specs.get_mut(benchmark_id) {
+        spec.metadata.extend(record.metadata.clone());
+        spec.parameters.extend(record.parameters.clone());
+        return;
+    }
+
+    spec_order.push(benchmark_id.to_string());
+    let mut metadata = base_spec.metadata.clone();
+    metadata.extend(record.metadata.clone());
+    let mut parameters = base_spec.parameters.clone();
+    parameters.extend(record.parameters.clone());
+    derived_specs.insert(
+        benchmark_id.to_string(),
+        BenchmarkSpec {
+            id: benchmark_id.to_string(),
+            name: record.name.clone(),
+            tier: base_spec.tier,
+            mode: record.mode.clone(),
+            intent: record.intent,
+            budgets: base_spec.budgets,
+            parameters,
+            metadata,
+        },
+    );
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -348,15 +459,6 @@ fn count_per_op(count: u64, operations: u64) -> Option<f64> {
     (operations != 0)
         .then(|| count as f64 / operations as f64)
         .filter(|value| value.is_finite())
-}
-
-fn merge_parameters(
-    spec: &BTreeMap<String, String>,
-    sample: BTreeMap<String, String>,
-) -> BTreeMap<String, String> {
-    let mut parameters = spec.clone();
-    parameters.extend(sample);
-    parameters
 }
 
 fn capture_environment(config: &StressRunnerConfig) -> EnvironmentInfo {
@@ -496,7 +598,7 @@ mod tests {
 
         runner.run("bench", |ctx| {
             ctx.parameter("client_count", 1);
-            ctx.measure(|| {
+            ctx.measure("lookup", || {
                 std::hint::black_box(1_u64);
             });
         });
@@ -522,7 +624,7 @@ mod tests {
         runner.reporters(Vec::new());
 
         runner.run("tier2", |ctx| {
-            ctx.measure(|| {});
+            ctx.measure("work", || {});
         });
 
         let run = runner.finish();
@@ -542,13 +644,14 @@ mod tests {
             mode: BenchmarkMode::FixedOperations {
                 operations_per_sample: 1,
             },
+            intent: MeasurementIntent::General,
             budgets: crate::result::BenchmarkBudgets::default(),
             parameters: BTreeMap::new(),
             metadata: BTreeMap::new(),
         };
 
-        runner.run_spec(spec, |ctx| {
-            ctx.measure(|| {});
+        runner.run_spec(&spec, |ctx| {
+            ctx.measure("work", || {});
         });
     }
 
@@ -567,13 +670,14 @@ mod tests {
             mode: BenchmarkMode::FixedOperations {
                 operations_per_sample: 1,
             },
+            intent: MeasurementIntent::General,
             budgets: crate::result::BenchmarkBudgets::default(),
             parameters: BTreeMap::new(),
             metadata: BTreeMap::new(),
         };
 
-        runner.run_spec(spec, |ctx| {
-            let _ = ctx.measure_workload(|| {});
+        runner.run_spec(&spec, |ctx| {
+            ctx.measure("work", || {});
         });
     }
 
@@ -587,7 +691,7 @@ mod tests {
         runner.reporters(Vec::new());
 
         runner.run("bench", |ctx| {
-            ctx.measure(|| {});
+            ctx.measure("work", || {});
             let _ = ctx.correctness().attempted(1).completed(0).failures(1);
         });
         let run = runner.finish();
@@ -604,7 +708,7 @@ mod tests {
         runner.reporters(Vec::new());
 
         runner.run("bench", |ctx| {
-            ctx.measure(|| {});
+            ctx.measure("work", || {});
         });
         let run = runner.finish();
 
@@ -618,7 +722,7 @@ mod tests {
         runner.reporters(Vec::new());
 
         runner.run("bench", |ctx| {
-            ctx.measure(|| std::hint::black_box(1_u64));
+            ctx.measure("work", || std::hint::black_box(1_u64));
         });
         let run = runner.finish();
 
@@ -640,19 +744,16 @@ mod tests {
             mode: BenchmarkMode::FixedDuration {
                 sample_duration: Duration::from_millis(1),
             },
+            intent: MeasurementIntent::General,
             budgets: crate::result::BenchmarkBudgets::default(),
             parameters: BTreeMap::new(),
             metadata: BTreeMap::new(),
         };
 
-        runner.run_spec(spec, |ctx| {
-            let operations = ctx.measure_workload(|| {
+        runner.run_spec(&spec, |ctx| {
+            ctx.measure("throughput", || {
                 std::hint::black_box(1_u64);
             });
-            let _ = ctx
-                .correctness()
-                .attempted(operations)
-                .completed(operations);
         });
         let run = runner.finish();
 
@@ -670,17 +771,17 @@ mod tests {
             name: "counted".to_string(),
             tier: 2,
             mode: config.mode_for_kind(BenchmarkModeKind::FixedOperations),
+            intent: MeasurementIntent::General,
             budgets: BenchmarkBudgets::default(),
             parameters: BTreeMap::new(),
             metadata: BTreeMap::new(),
         };
 
-        runner.run_spec(spec, |ctx| {
-            let completed = ctx.measure_counted(|| {
+        runner.run_spec(&spec, |ctx| {
+            let completed = ctx.measure_batch("counted", 768, || {
                 for _ in 0..3 {
                     std::hint::black_box(1_u64);
                 }
-                768
             });
             assert_eq!(completed, 768);
         });
@@ -701,7 +802,7 @@ mod tests {
         runner.reporters(Vec::new());
 
         runner.run("external", |ctx| {
-            ctx.record_external(Duration::from_millis(10), 500);
+            ctx.record_external("remote", Duration::from_millis(10), 500);
         });
         let run = runner.finish();
         let sample = &run.samples[0];
@@ -728,13 +829,14 @@ mod tests {
             name: "hot_path".to_string(),
             tier: 1,
             mode: config.mode_for_kind(BenchmarkModeKind::Micro),
+            intent: MeasurementIntent::General,
             budgets: BenchmarkBudgets::default(),
             parameters: BTreeMap::new(),
             metadata: BTreeMap::new(),
         };
 
-        runner.run_spec(spec, |ctx| {
-            ctx.measure_micro(|| std::hint::black_box(1_u64));
+        runner.run_spec(&spec, |ctx| {
+            ctx.measure("hot_path", || std::hint::black_box(1_u64));
         });
         let run = runner.finish();
         let sample = &run.samples[0];
@@ -759,13 +861,14 @@ mod tests {
             name: "allocating".to_string(),
             tier: 2,
             mode: config.mode_for_kind(BenchmarkModeKind::FixedOperations),
+            intent: MeasurementIntent::General,
             budgets,
             parameters: BTreeMap::new(),
             metadata: BTreeMap::new(),
         };
 
-        runner.run_spec(spec, |ctx| {
-            let _ = ctx.measure_workload(|| {
+        runner.run_spec(&spec, |ctx| {
+            ctx.measure("allocating", || {
                 let data = vec![1_u8; 16];
                 std::hint::black_box(data);
             });
@@ -830,7 +933,7 @@ mod tests {
         runner.reporters(Vec::new());
 
         runner.run("bench", |ctx| {
-            ctx.measure(|| {});
+            ctx.measure("work", || {});
             let _ = ctx.correctness().attempted(5).completed(5);
         });
         let run = runner.finish();

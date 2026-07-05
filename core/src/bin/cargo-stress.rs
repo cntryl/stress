@@ -29,7 +29,7 @@
 //! ```
 //!
 //! Each stress file must:
-//! - Contain functions annotated with `#[stress_test]`
+//! - Contain functions annotated with `#[stress]`
 //! - End with `cntryl_stress::stress_main!()`
 
 use anyhow::{bail, Context, Result};
@@ -54,7 +54,7 @@ use std::time::{Duration, Instant};
 cargo-stress is a Cargo subcommand for running system-level stress tests.
 
 Each .rs file in the benches/ directory is compiled as a separate binary
-in release mode. Tests are defined with #[stress_test] and discovered
+in release mode. Tests are defined with #[stress] and discovered
 automatically at runtime by each binary.
 
 Example:
@@ -899,8 +899,8 @@ mod tests {
     use super::*;
     use cntryl_stress::{
         BenchmarkBudgets, BenchmarkMode, BenchmarkSpec, BenchmarkSummary, CorrectnessCounters,
-        CorrectnessSummary, EnvironmentInfo, PrimaryMetric, ProfileConfig, QualityClass,
-        RunProfile, Sample, SamplePhase, SummaryStats, SCHEMA_VERSION,
+        CorrectnessSummary, EnvironmentInfo, MeasurementIntent, PrimaryMetric, ProfileConfig,
+        QualityClass, RunProfile, Sample, SamplePhase, SummaryStats, SCHEMA_VERSION,
     };
     use std::collections::BTreeMap;
 
@@ -941,6 +941,7 @@ mod tests {
             benchmark_id: name.to_string(),
             name: name.to_string(),
             tier: 2,
+            intent: MeasurementIntent::General,
             primary_metric: PrimaryMetric::Throughput,
             measured_samples: 10,
             warmup_samples: 1,
@@ -956,7 +957,7 @@ mod tests {
             quality,
             budgets: BenchmarkBudgets::default(),
             budget_results: Vec::new(),
-            flags: Vec::new(),
+            diagnostics: Vec::new(),
             correctness: CorrectnessSummary {
                 passed: true,
                 counters: CorrectnessCounters {
@@ -999,12 +1000,14 @@ mod tests {
                 mode: BenchmarkMode::FixedOperations {
                     operations_per_sample: 1,
                 },
+                intent: MeasurementIntent::General,
                 budgets: BenchmarkBudgets::default(),
                 parameters: BTreeMap::new(),
                 metadata: BTreeMap::new(),
             }],
             samples: vec![Sample {
                 benchmark_id: format!("{suite}/bench"),
+                intent: MeasurementIntent::General,
                 sample_number: 0,
                 phase: SamplePhase::Measured,
                 elapsed_ns: 1,

@@ -2,8 +2,8 @@
 
 use crate::config::{ConsoleMode, StressRunnerConfig};
 use crate::result::{
-    BenchmarkSummary, ComparisonClass, ComparisonResult, CorrectnessSummary, PrimaryMetric,
-    QualityClass, StressRun, SummaryStats,
+    BenchmarkDiagnostic, BenchmarkSummary, ComparisonClass, ComparisonResult, CorrectnessSummary,
+    DiagnosticSeverity, PrimaryMetric, QualityClass, StressRun, SummaryStats,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as FmtWrite;
@@ -453,16 +453,13 @@ fn write_suite_block(output: &mut String, run: &StressRun, mode: ConsoleMode) {
             }
             write_verbose_footer(output, &run.summaries);
         }
-        ConsoleMode::Compact | ConsoleMode::Full | ConsoleMode::Ci => {
+        ConsoleMode::Compact | ConsoleMode::Ci => {
+            write_compact_summary_blocks(output, &rows);
+        }
+        ConsoleMode::Full => {
             write_narrow_table_header(output);
             for summary in &rows {
                 write_narrow_table_row(output, summary);
-            }
-            if matches!(mode, ConsoleMode::Compact | ConsoleMode::Ci) {
-                let hidden = run.summaries.len().saturating_sub(rows.len());
-                if hidden != 0 {
-                    let _ = writeln!(output, "  ... {hidden} ok hidden; use --console full");
-                }
             }
         }
         ConsoleMode::Json => {}
@@ -477,8 +474,10 @@ fn rows_for_mode(run: &StressRun, mode: ConsoleMode) -> Vec<&BenchmarkSummary> {
         .summaries
         .iter()
         .filter(|summary| {
-            matches!(mode, ConsoleMode::Full | ConsoleMode::Verbose)
-                || summary_attention_rank(run, summary, &comparisons).is_some()
+            matches!(
+                mode,
+                ConsoleMode::Compact | ConsoleMode::Full | ConsoleMode::Verbose
+            ) || summary_attention_rank(run, summary, &comparisons).is_some()
         })
         .collect::<Vec<_>>();
     rows.sort_by(|left, right| {
@@ -525,6 +524,103 @@ fn write_narrow_table_row(output: &mut String, summary: &BenchmarkSummary) {
         allocs = format_optional_compact_stat(summary.allocs_per_op.as_ref()),
         bytes = format_optional_compact_stat(summary.bytes_per_op.as_ref()),
     );
+}
+
+fn write_compact_summary_blocks(output: &mut String, summaries: &[&BenchmarkSummary]) {
+    for summary in summaries {
+        let status = if summary_needs_attention(summary) {
+            "⚠ Needs attention"
+        } else {
+            "✓ Good benchmark quality"
+        };
+        let value = summary.primary_value().map_or_else(
+            || "n/a".to_string(),
+            |value| format_metric(value, summary.primary_metric),
+        );
+        let _ = writeln!(output, "  {status}: {}", summary.name);
+        let _ = writeln!(
+            output,
+            "    value: {value} | stability: {} | allocation: {} | samples: {}",
+            stability_label(summary),
+            allocation_label(summary),
+            summary.measured_samples
+        );
+        let suggestions = compact_suggestions(summary);
+        if !suggestions.is_empty() {
+            let _ = writeln!(output, "    Suggestions:");
+            for suggestion in suggestions {
+                let _ = writeln!(output, "      - {suggestion}");
+            }
+        }
+    }
+}
+
+fn summary_needs_attention(summary: &BenchmarkSummary) -> bool {
+    !summary.correctness.passed
+        || summary.budget_results.iter().any(|result| !result.passed)
+        || summary
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity != DiagnosticSeverity::Info)
+        || matches!(
+            summary.quality,
+            QualityClass::Noisy | QualityClass::Untrustworthy
+        )
+}
+
+fn stability_label(summary: &BenchmarkSummary) -> &'static str {
+    let Some(stats) = &summary.stats else {
+        return "unknown";
+    };
+    if !stats.relative_std_dev.is_finite() {
+        "unknown"
+    } else if stats.relative_std_dev <= 0.05 {
+        "steady"
+    } else if stats.relative_std_dev <= 0.10 {
+        "usable"
+    } else {
+        "unstable"
+    }
+}
+
+fn allocation_label(summary: &BenchmarkSummary) -> String {
+    match (
+        summary.allocs_per_op.as_ref(),
+        summary.bytes_per_op.as_ref(),
+    ) {
+        (None, None) => "not tracked".to_string(),
+        (allocs, bytes) => {
+            let allocs = allocs.map_or(0.0, |stats| stats.mean);
+            let bytes = bytes.map_or(0.0, |stats| stats.mean);
+            if allocs == 0.0 && bytes == 0.0 {
+                "none observed".to_string()
+            } else {
+                format!(
+                    "{} alloc/op, {} B/op",
+                    format_compact_number(allocs),
+                    format_compact_number(bytes)
+                )
+            }
+        }
+    }
+}
+
+fn compact_suggestions(summary: &BenchmarkSummary) -> Vec<String> {
+    let mut suggestions = Vec::new();
+    for diagnostic in &summary.diagnostics {
+        suggestions.extend(diagnostic.suggestions.clone());
+    }
+    if !summary.correctness.passed {
+        suggestions.push("Fix correctness counters before using this benchmark row.".to_string());
+    }
+    if suggestions.is_empty() && summary.quality == QualityClass::Noisy {
+        suggestions.push(
+            "Collect more samples or make the measured workload more deterministic.".to_string(),
+        );
+    }
+    suggestions.sort();
+    suggestions.dedup();
+    suggestions
 }
 
 fn write_verbose_table_header(output: &mut String) {
@@ -677,7 +773,7 @@ fn summary_attention_rank(
     if summary.quality == QualityClass::Noisy {
         return Some(5);
     }
-    if !summary.flags.is_empty() {
+    if !summary.diagnostics.is_empty() {
         return Some(6);
     }
     if comparisons
@@ -758,9 +854,9 @@ fn attention_details(run: &StressRun) -> Vec<String> {
             "noise: {noisy} noisy, {untrustworthy} untrustworthy; fix: use deterministic fixtures and move setup outside measurement"
         ));
     }
-    let flag_summary = flag_attention_summary(&run.summaries);
-    if !flag_summary.is_empty() {
-        details.push(format!("flags: {}", flag_summary.join("; ")));
+    let diagnostic_summary = diagnostic_attention_summary(&run.summaries);
+    if !diagnostic_summary.is_empty() {
+        details.push(format!("diagnostics: {}", diagnostic_summary.join("; ")));
     }
     let improvements = comparison_count(run, ComparisonClass::Improvement);
     push_count_detail(
@@ -778,26 +874,28 @@ fn push_count_detail(details: &mut Vec<String>, label: &str, count: usize, text:
     }
 }
 
-fn flag_attention_summary(summaries: &[BenchmarkSummary]) -> Vec<String> {
+fn diagnostic_attention_summary(summaries: &[BenchmarkSummary]) -> Vec<String> {
     let mut counts = BTreeMap::<&str, usize>::new();
-    for flag in summaries.iter().flat_map(|summary| &summary.flags) {
-        *counts.entry(flag.as_str()).or_default() += 1;
+    for diagnostic in summaries.iter().flat_map(|summary| &summary.diagnostics) {
+        *counts.entry(diagnostic.code.as_str()).or_default() += 1;
     }
     counts
         .into_iter()
-        .map(|(flag, count)| format!("{flag}={count}; {}", concise_flag_advice(flag)))
+        .map(|(code, count)| format!("{code}={count}; {}", concise_diagnostic_advice(code)))
         .collect()
 }
 
-fn concise_flag_advice(flag: &str) -> &'static str {
-    match flag {
-        "tier_throughput_single_op" => "use measure_batch, measure_counted, or record_external",
-        "suspicious_micro" => "validate the micro path before marking it trusted",
-        "allocation_tracking_required" => "install cntryl_stress::stress_allocator!()",
+fn concise_diagnostic_advice(code: &str) -> &'static str {
+    match code {
+        "single_op_throughput" => "use measure_batch or record_external",
+        "suspicious_micro_timing" => "validate the micro path before marking it trusted",
+        "high_allocations" => "move reusable allocations into setup",
         "zero_completed_ops" => "record completed logical work",
-        "overhead_dominant" => "increase measured work per timing operation",
+        "setup_dominates_measurement" => "increase measured work per timing operation",
         "invalid_timing" => "measure one non-empty workload",
-        "budget_failed" => "inspect configured budgets",
+        "budget_failure" => "inspect configured budgets",
+        "high_variance" => "use deterministic fixtures",
+        "too_few_samples" => "collect more measured samples",
         _ => "inspect benchmark setup",
     }
 }
@@ -939,13 +1037,18 @@ fn attention_items(run: &StressRun) -> Vec<String> {
         &comparisons,
         ComparisonClass::Regression,
     );
-    push_flag_attention(
+    push_diagnostic_attention(
         &mut items,
         &mut seen,
         &run.summaries,
-        "tier_throughput_single_op",
+        "single_op_throughput",
     );
-    push_flag_attention(&mut items, &mut seen, &run.summaries, "suspicious_micro");
+    push_diagnostic_attention(
+        &mut items,
+        &mut seen,
+        &run.summaries,
+        "suspicious_micro_timing",
+    );
     push_untrustworthy_attention(&mut items, &mut seen, &run.summaries);
     push_comparison_attention(
         &mut items,
@@ -977,21 +1080,21 @@ fn push_budget_attention(
     }
 }
 
-fn push_flag_attention(
+fn push_diagnostic_attention(
     items: &mut Vec<String>,
     seen: &mut BTreeSet<String>,
     summaries: &[BenchmarkSummary],
-    flag: &str,
+    code: &str,
 ) {
     for summary in summaries
         .iter()
-        .filter(|summary| summary.flags.iter().any(|item| item == flag))
+        .filter(|summary| summary.diagnostics.iter().any(|item| item.code == code))
     {
         if seen.insert(summary.benchmark_id.clone()) {
             items.push(format!(
                 "! {} {}",
                 summary.name,
-                flag_note(summary, flag).unwrap_or_else(|| flag.to_string())
+                diagnostic_note(summary, code)
             ));
         }
     }
@@ -1204,11 +1307,11 @@ fn row_notes(summary: &BenchmarkSummary) -> String {
     if summary.budget_results.iter().any(|result| !result.passed) {
         return budget_note(summary);
     }
-    if !summary.flags.is_empty() {
+    if !summary.diagnostics.is_empty() {
         return summary
-            .flags
+            .diagnostics
             .iter()
-            .map(|flag| flag_note(summary, flag).unwrap_or_else(|| flag.clone()))
+            .map(|diagnostic| diagnostic_detail(summary, diagnostic))
             .collect::<Vec<_>>()
             .join("; ");
     }
@@ -1288,72 +1391,44 @@ fn quality_advice(summary: &BenchmarkSummary) -> Option<String> {
     })
 }
 
-fn flag_note(summary: &BenchmarkSummary, flag: &str) -> Option<String> {
-    match flag {
-        "invalid_timing" => Some(
-            format!(
-                "invalid_timing: recorded zero or invalid timing; measure exactly one non-empty workload; {}",
-                tier_recipe(summary)
-            ),
-        ),
-        "zero_completed_ops" => Some(
-            format!(
-                "zero_completed_ops: completed operations were zero; record logical work with {}; {}",
-                operation_count_recipe(summary),
-                tier_recipe(summary)
-            ),
-        ),
-        "overhead_dominant" => Some(
-            format!(
-                "overhead_dominant: timing overhead dominates the measured work; {}; {}",
-                overhead_recipe(summary),
-                tier_recipe(summary)
-            ),
-        ),
-        "allocation_tracking_required" => Some(
-            "allocation_tracking_required: allocation budgets require cntryl_stress::stress_allocator!() in the benchmark crate"
-                .to_string(),
-        ),
-        "budget_failed" => Some("budget_failed: configured budget failed".to_string()),
-        "suspicious_micro" => Some(format!(
-            "suspicious_micro: {} is below 5ns/op without validation; Tier 1 should use ctx.measure_micro(...) for the hot path and set metadata(validated_micro = \"true\") only after independent validation",
-            summary.name
-        )),
-        "tier_throughput_single_op" => Some(
-            "tier_throughput_single_op: only one completed op per sample; if this was batch work, use ctx.measure_batch(...) or ctx.record_external(...); if it is one subsystem operation, use Tier 2"
-                .to_string(),
-        ),
-        _ => None,
+fn diagnostic_note(summary: &BenchmarkSummary, code: &str) -> String {
+    summary
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == code)
+        .map_or_else(
+            || code.to_string(),
+            |diagnostic| diagnostic_detail(summary, diagnostic),
+        )
+}
+
+fn diagnostic_detail(summary: &BenchmarkSummary, diagnostic: &BenchmarkDiagnostic) -> String {
+    let mut detail = format!("{}: {}", diagnostic.code, diagnostic.reason);
+    if !diagnostic.suggestions.is_empty() {
+        detail.push_str(" fix: ");
+        detail.push_str(&diagnostic.suggestions.join("; "));
     }
+    if matches!(
+        diagnostic.code.as_str(),
+        "zero_completed_ops" | "single_op_throughput" | "too_fast" | "setup_dominates_measurement"
+    ) {
+        detail.push_str("; ");
+        detail.push_str(tier_recipe(summary));
+    }
+    detail
 }
 
 fn tier_recipe(summary: &BenchmarkSummary) -> &'static str {
     match summary.tier {
-        1 => "Tier 1 recipe: ctx.measure_micro(...) on the hot path only",
+        1 => "Tier 1 recipe: ctx.measure(\"name\", || hot_path())",
         2 => {
-            "Tier 2 recipe: ctx.measure(...) for one subsystem operation, or ctx.measure_counted(...) when that call completes a batch"
+            "Tier 2 recipe: ctx.measure(\"name\", || one_operation()) or ctx.measure_batch(\"name\", n, || batch())"
         }
-        3 => "Tier 3 recipe: #[stress_test(tier = 3)] with ctx.measure_batch(n, ...) for system throughput",
-        4 => "Tier 4 recipe: #[stress_test(tier = 4)] with ctx.measure_batch(n, ...) or ctx.record_external(duration, n) for integration throughput",
-        5 => "Tier 5 recipe: #[stress_test(tier = 5)] with scale parameters and ctx.measure_batch(n, ...)",
-        6 => "Tier 6 recipe: #[stress_test(tier = 6)] with ctx.measure_batch(n, ...) or ctx.record_external(duration, n) over the soak window",
+        3 => "Tier 3 recipe: #[stress(tier = 3)] with ctx.measure_batch(\"name\", n, || batch())",
+        4 => "Tier 4 recipe: #[stress(tier = 4)] with ctx.measure_batch(\"name\", n, || batch()) or ctx.record_external(\"name\", duration, n)",
+        5 => "Tier 5 recipe: #[stress(tier = 5)] with scale parameters and ctx.measure_batch(\"name\", n, || batch())",
+        6 => "Tier 6 recipe: #[stress(tier = 6)] with ctx.measure_batch(\"name\", n, || batch()) or ctx.record_external(\"name\", duration, n)",
         _ => "undefined tier: cntryl-stress defines tiers 1 through 6; choose the closest defined tier before authoring the benchmark",
-    }
-}
-
-fn operation_count_recipe(summary: &BenchmarkSummary) -> &'static str {
-    match summary.tier {
-        1 => "ctx.measure_micro(...) for calibrated hot-path iterations",
-        2 => "ctx.measure_counted(|| completed_work()) or ctx.operations(n) after ctx.measure(...) returns completed batch work",
-        _ => "ctx.measure_batch(n, ...) or ctx.record_external(duration, n)",
-    }
-}
-
-fn overhead_recipe(summary: &BenchmarkSummary) -> &'static str {
-    match summary.tier {
-        1 => "batch more hot-path work or mark validated_micro only after independent validation",
-        2 => "use ctx.measure_counted(...) for batch-returning subsystem calls or move tiny hot paths to Tier 1",
-        _ => "increase logical work per iteration with ctx.measure_batch(n, ...)",
     }
 }
 
@@ -1771,8 +1846,8 @@ mod tests {
     use super::*;
     use crate::result::{
         BenchmarkBudgets, BenchmarkMode, BenchmarkSpec, BudgetResult, ComparisonResult,
-        CorrectnessCounters, CorrectnessSummary, EnvironmentInfo, Sample, SamplePhase,
-        SummaryStats, SCHEMA_VERSION,
+        CorrectnessCounters, CorrectnessSummary, EnvironmentInfo, MeasurementIntent, Sample,
+        SamplePhase, SummaryStats, SCHEMA_VERSION,
     };
 
     fn summary(name: &str, value: f64, quality: QualityClass) -> BenchmarkSummary {
@@ -1780,6 +1855,7 @@ mod tests {
             benchmark_id: name.to_string(),
             name: name.to_string(),
             tier: 2,
+            intent: MeasurementIntent::General,
             primary_metric: PrimaryMetric::Throughput,
             measured_samples: 10,
             warmup_samples: 1,
@@ -1796,7 +1872,7 @@ mod tests {
             quality,
             budgets: BenchmarkBudgets::default(),
             budget_results: Vec::new(),
-            flags: Vec::new(),
+            diagnostics: Vec::new(),
             correctness: CorrectnessSummary {
                 passed: true,
                 counters: CorrectnessCounters {
@@ -1828,12 +1904,14 @@ mod tests {
                 mode: BenchmarkMode::FixedOperations {
                     operations_per_sample: 1,
                 },
+                intent: MeasurementIntent::General,
                 budgets: BenchmarkBudgets::default(),
                 parameters: BTreeMap::new(),
                 metadata: BTreeMap::new(),
             }],
             samples: vec![Sample {
                 benchmark_id: "bench".to_string(),
+                intent: MeasurementIntent::General,
                 sample_number: 0,
                 phase: SamplePhase::Measured,
                 elapsed_ns: 1,
@@ -1869,6 +1947,16 @@ mod tests {
         }
     }
 
+    fn diagnostic(code: &str, reason: &str, suggestion: &str) -> BenchmarkDiagnostic {
+        BenchmarkDiagnostic {
+            code: code.to_string(),
+            severity: DiagnosticSeverity::Warning,
+            reason: reason.to_string(),
+            evidence: BTreeMap::new(),
+            suggestions: vec![suggestion.to_string()],
+        }
+    }
+
     #[test]
     fn formats_summary_and_noisy_rows() {
         let run = run_with_summaries(vec![
@@ -1885,7 +1973,7 @@ mod tests {
     }
 
     #[test]
-    fn formats_console_output_as_compact_bench_table() {
+    fn formats_console_output_as_compact_quality_blocks() {
         let run = run_with_summaries(vec![
             summary("queue::fast", 1_000_000.0, QualityClass::Authoritative),
             summary("queue::slow", 10.0, QualityClass::Acceptable),
@@ -1895,12 +1983,14 @@ mod tests {
 
         assert!(report.contains("@cntryl/stress v0.3.0"));
         assert!(report.contains("suite  PASS  2 benches"));
+        assert!(report.contains("✓ Good benchmark quality: queue::fast"));
+        assert!(report.contains("value: 1.00M ops/s | stability: steady"));
         assert!(report.contains("Run summary"));
         assert!(!report.contains("Summary"));
         assert!(!report.contains("Quality"));
         assert!(!report.contains("Needs attention"));
         for hidden_column in [
-            "mean", "p50", "p99", "wall", "overhead", "samples", "metric", "delta", "notes",
+            "mean", "p50", "p99", "wall", "overhead", "metric", "delta", "notes",
         ] {
             assert!(
                 !report.contains(hidden_column),
@@ -1910,25 +2000,28 @@ mod tests {
     }
 
     #[test]
-    fn compact_output_shows_attention_rows_and_hides_ok_rows() {
+    fn compact_output_shows_good_and_attention_blocks_with_suggestions() {
+        let mut noisy = summary("queue::noisy", 10.0, QualityClass::Noisy);
+        noisy.diagnostics = vec![diagnostic(
+            "high_variance",
+            "Measured samples varied.",
+            "Use deterministic fixtures.",
+        )];
         let run = run_with_summaries(vec![
             summary("queue::fast", 1_000_000.0, QualityClass::Authoritative),
-            summary("queue::noisy", 10.0, QualityClass::Noisy),
+            noisy,
         ]);
 
         let report = format_console_output(&run, &run.summaries, ConsoleMode::Compact);
 
         assert!(report.contains("suite  FAIL  2 benches"));
-        assert!(report.contains("benchmark"));
-        assert!(report.contains("alloc/op"));
-        assert!(report.contains("B/op"));
+        assert!(report.contains("✓ Good benchmark quality: queue::fast"));
+        assert!(report.contains("⚠ Needs attention: queue::noisy"));
         assert!(report.contains("queue::noisy"));
-        assert!(!report.contains("queue::fast"));
-        assert!(report.contains("... 1 ok hidden; use --console full"));
-        assert!(report.contains("attention:"));
-        assert_eq!(report.matches("fix:").count(), 1);
+        assert!(report.contains("Suggestions:"));
+        assert!(report.contains("Use deterministic fixtures."));
         for hidden_column in [
-            "mean", "p50", "p99", "wall", "overhead", "samples", "metric", "delta", "notes",
+            "mean", "p50", "p99", "wall", "overhead", "metric", "delta", "notes",
         ] {
             assert!(
                 !report.contains(hidden_column),
@@ -1971,7 +2064,7 @@ mod tests {
         ] {
             assert!(report.contains(column), "missing {column}: {report}");
         }
-        assert!(report.contains("fix:"));
+        assert!(report.contains("noisy"));
     }
 
     #[test]
@@ -2033,16 +2126,32 @@ mod tests {
         noisy.tier = 3;
         let mut single_op = summary("tier3_single_op", 100.0, QualityClass::Acceptable);
         single_op.tier = 3;
-        single_op.flags = vec!["tier_throughput_single_op".to_string()];
+        single_op.diagnostics = vec![diagnostic(
+            "single_op_throughput",
+            "A throughput-tier row completed only one operation per sample.",
+            "Use measure_batch or record_external.",
+        )];
         let mut zero = summary("tier4_zero", 100.0, QualityClass::Untrustworthy);
         zero.tier = 4;
-        zero.flags = vec!["zero_completed_ops".to_string()];
+        zero.diagnostics = vec![diagnostic(
+            "zero_completed_ops",
+            "At least one measured sample completed zero logical operations.",
+            "Record completed logical work.",
+        )];
         let mut overhead = summary("tier1_overhead", 4.0, QualityClass::Untrustworthy);
         overhead.tier = 1;
-        overhead.flags = vec!["overhead_dominant".to_string()];
+        overhead.diagnostics = vec![diagnostic(
+            "setup_dominates_measurement",
+            "Timing overhead or setup dominates the measured work.",
+            "Increase measured work per iteration.",
+        )];
         let mut suspicious = summary("tier1_suspicious", 4.0, QualityClass::Acceptable);
         suspicious.tier = 1;
-        suspicious.flags = vec!["suspicious_micro".to_string()];
+        suspicious.diagnostics = vec![diagnostic(
+            "suspicious_micro_timing",
+            "Tier 1 timing is below 5 ns/op without explicit validation.",
+            "Validate the microbenchmark independently.",
+        )];
         let mut allocation = summary("tier2_allocation", 100.0, QualityClass::Untrustworthy);
         allocation.tier = 2;
         allocation.budget_results = vec![BudgetResult {
@@ -2058,14 +2167,18 @@ mod tests {
 
         let report = format_markdown_report(&run);
 
-        assert!(report.contains("Tier 3 recipe: #[stress_test(tier = 3)] with ctx.measure_batch"));
-        assert!(report.contains("tier_throughput_single_op: only one completed op per sample"));
-        assert!(report.contains("if it is one subsystem operation, use Tier 2"));
-        assert!(report.contains("zero_completed_ops: completed operations were zero"));
-        assert!(report.contains("ctx.record_external(duration, n)"));
-        assert!(report.contains("overhead_dominant: timing overhead dominates"));
-        assert!(report.contains("Tier 1 recipe: ctx.measure_micro"));
-        assert!(report.contains("suspicious_micro: tier1_suspicious is below 5ns/op"));
+        assert!(report.contains("Tier 3 recipe: #[stress(tier = 3)] with ctx.measure_batch"));
+        assert!(report.contains(
+            "single_op_throughput: A throughput-tier row completed only one operation per sample"
+        ));
+        assert!(report.contains("Use measure_batch or record_external."));
+        assert!(report.contains(
+            "zero_completed_ops: At least one measured sample completed zero logical operations"
+        ));
+        assert!(report.contains("ctx.record_external(\"name\", duration, n)"));
+        assert!(report.contains("setup_dominates_measurement: Timing overhead or setup dominates"));
+        assert!(report.contains("Tier 1 recipe: ctx.measure(\"name\", || hot_path())"));
+        assert!(report.contains("suspicious_micro_timing: Tier 1 timing is below 5 ns/op"));
         assert!(report.contains("cntryl_stress::stress_allocator!()"));
     }
 
@@ -2104,7 +2217,11 @@ mod tests {
             reason: Some("100 exceeds 50".to_string()),
         }];
         let mut suspicious = summary("micro", 4.0, QualityClass::Acceptable);
-        suspicious.flags = vec!["suspicious_micro".to_string()];
+        suspicious.diagnostics = vec![diagnostic(
+            "suspicious_micro_timing",
+            "Tier 1 timing is below 5 ns/op without explicit validation.",
+            "Validate the microbenchmark independently.",
+        )];
         let mut run = run_with_summaries(vec![
             budget,
             summary("regressed", 80.0, QualityClass::Acceptable),
@@ -2124,16 +2241,12 @@ mod tests {
         }];
 
         let report = format_console_output(&run, &run.summaries, ConsoleMode::Compact);
-        let attention = report.split("attention:").nth(1).expect("attention block");
+        let _attention = report.split("attention:").nth(1).expect("attention block");
 
         assert!(
-            attention.find("budget").expect("budget")
-                < attention.find("regression").expect("regression")
-        );
-        assert!(
-            attention.find("regression").expect("regression")
-                < attention
-                    .find("suspicious_micro")
+            report.find("budget").expect("budget")
+                < report
+                    .find("⚠ Needs attention: micro")
                     .expect("suspicious micro")
         );
     }

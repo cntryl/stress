@@ -91,7 +91,7 @@ cargo bench --bench stress-demo2
   - `src/config.rs` - Configuration and CLI parsing
 
 - **macros/** - Proc macros (`cntryl-stress-macros`)
-  - `src/lib.rs` - `#[stress_test]` and `stress_main!()` macros
+  - `src/lib.rs` - `#[stress]` and `stress_main!()` macros
 
 - **demo/** - Demo benchmarks (not published)
   - `benches/` - Example benchmark files

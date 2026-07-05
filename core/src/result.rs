@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Authoritative JSON schema version for current cntryl-stress artifacts.
-pub const SCHEMA_VERSION: &str = "cntryl-stress.v1";
+pub const SCHEMA_VERSION: &str = "cntryl-stress.v2";
 
 /// Highest defined benchmark tier.
 pub const MAX_TIER: u32 = 6;
@@ -52,7 +52,7 @@ impl std::str::FromStr for RunProfile {
     }
 }
 
-/// Static mode family from `#[stress_test(mode = "...")]`.
+/// Static mode family derived from `#[stress(tier = N)]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum BenchmarkModeKind {
@@ -227,6 +227,69 @@ pub enum PrimaryMetric {
     LatencyP95,
     /// Net nanoseconds per completed operation. Lower is better.
     NsPerOp,
+}
+
+/// Benchmark authoring intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MeasurementIntent {
+    /// General measured work.
+    #[default]
+    General,
+    /// Batched logical operations.
+    Batch,
+    /// Async work awaited by the benchmark.
+    Async,
+    /// Threaded or parallel work.
+    Threaded,
+    /// Pipeline-style work.
+    Pipeline,
+    /// I/O style work.
+    Io,
+    /// Externally timed work.
+    External,
+}
+
+impl fmt::Display for MeasurementIntent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::General => f.write_str("general"),
+            Self::Batch => f.write_str("batch"),
+            Self::Async => f.write_str("async"),
+            Self::Threaded => f.write_str("threaded"),
+            Self::Pipeline => f.write_str("pipeline"),
+            Self::Io => f.write_str("io"),
+            Self::External => f.write_str("external"),
+        }
+    }
+}
+
+/// Diagnostic severity for benchmark summaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticSeverity {
+    /// Informational guidance.
+    Info,
+    /// Actionable warning that does not necessarily fail the row.
+    Warning,
+    /// Error that makes the row untrustworthy or fails an explicit gate.
+    Error,
+}
+
+/// Structured benchmark diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BenchmarkDiagnostic {
+    /// Stable diagnostic code.
+    pub code: String,
+    /// Diagnostic severity.
+    pub severity: DiagnosticSeverity,
+    /// Human-readable reason.
+    pub reason: String,
+    /// Machine-readable evidence.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub evidence: BTreeMap<String, String>,
+    /// Concrete next actions.
+    pub suggestions: Vec<String>,
 }
 
 impl PrimaryMetric {
@@ -560,6 +623,9 @@ pub struct BenchmarkSpec {
     pub tier: u32,
     /// Concrete execution mode.
     pub mode: BenchmarkMode,
+    /// Authoring intent for this measurement.
+    #[serde(default)]
+    pub intent: MeasurementIntent,
     /// Budget gates for this benchmark.
     #[serde(default)]
     pub budgets: BenchmarkBudgets,
@@ -574,6 +640,9 @@ pub struct BenchmarkSpec {
 pub struct Sample {
     /// Benchmark id matching `BenchmarkSpec::id`.
     pub benchmark_id: String,
+    /// Authoring intent for this sample.
+    #[serde(default)]
+    pub intent: MeasurementIntent,
     /// Zero-based sample number within the benchmark.
     pub sample_number: usize,
     /// Sample phase.
@@ -672,6 +741,9 @@ pub struct BenchmarkSummary {
     pub name: String,
     /// Numeric tier.
     pub tier: u32,
+    /// Authoring intent for this measurement.
+    #[serde(default)]
+    pub intent: MeasurementIntent,
     /// Primary metric used for comparison.
     pub primary_metric: PrimaryMetric,
     /// Measured sample count.
@@ -711,9 +783,9 @@ pub struct BenchmarkSummary {
     /// Budget results derived from measured samples.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub budget_results: Vec<BudgetResult>,
-    /// Machine-readable quality and attention flags.
+    /// Structured diagnostics and next actions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub flags: Vec<String>,
+    pub diagnostics: Vec<BenchmarkDiagnostic>,
     /// Correctness summary from measured samples.
     pub correctness: CorrectnessSummary,
     /// Structured parameters.
@@ -776,7 +848,7 @@ pub struct ComparisonResult {
 /// Complete current run artifact.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StressRun {
-    /// Schema version. Always `cntryl-stress.v1` for new artifacts.
+    /// Schema version. Always [`SCHEMA_VERSION`] for new artifacts.
     pub schema_version: String,
     /// cntryl-stress version.
     pub tool_version: String,
@@ -913,19 +985,23 @@ pub fn summarize_benchmark(spec: &BenchmarkSpec, samples: &[Sample]) -> Benchmar
         allocs_per_op.as_ref(),
         bytes_per_op.as_ref(),
     );
-    let flags = summary_flags(
+    let diagnostics = summary_diagnostics(DiagnosticInputs {
         spec,
-        &measured,
-        ns_per_op.as_ref(),
-        overhead_ns_per_op.as_ref(),
-        &budget_results,
-    );
+        samples: &measured,
+        stats: stats.as_ref(),
+        ns_per_op: ns_per_op.as_ref(),
+        overhead_ns_per_op: overhead_ns_per_op.as_ref(),
+        allocs_per_op: allocs_per_op.as_ref(),
+        bytes_per_op: bytes_per_op.as_ref(),
+        budget_results: &budget_results,
+        correctness_passed: correctness.passed,
+    });
     let quality = classify_quality(
         measured.len(),
         stats.as_ref(),
         correctness.passed,
         &measured,
-        &flags,
+        &diagnostics,
         &budget_results,
     );
 
@@ -933,6 +1009,7 @@ pub fn summarize_benchmark(spec: &BenchmarkSpec, samples: &[Sample]) -> Benchmar
         benchmark_id: spec.id.clone(),
         name: spec.name.clone(),
         tier: spec.tier,
+        intent: spec.intent,
         primary_metric,
         measured_samples: measured.len(),
         warmup_samples,
@@ -948,7 +1025,7 @@ pub fn summarize_benchmark(spec: &BenchmarkSpec, samples: &[Sample]) -> Benchmar
         quality,
         budgets: spec.budgets,
         budget_results,
-        flags,
+        diagnostics,
         correctness,
         parameters: merged_parameters(spec, &measured),
         metadata: spec.metadata.clone(),
@@ -981,6 +1058,43 @@ pub fn compare_summaries(
             compare_one_summary(summary, baseline_summary, threshold)
         })
         .collect()
+}
+
+/// Add regression diagnostics to summaries after baseline comparison.
+pub fn attach_regression_diagnostics(
+    summaries: &mut [BenchmarkSummary],
+    comparisons: &[ComparisonResult],
+) {
+    let regressions = comparisons
+        .iter()
+        .filter(|comparison| comparison.classification == ComparisonClass::Regression)
+        .collect::<Vec<_>>();
+    for summary in summaries {
+        let Some(comparison) = regressions
+            .iter()
+            .find(|comparison| comparison.benchmark_id == summary.benchmark_id)
+        else {
+            continue;
+        };
+        summary.diagnostics.push(BenchmarkDiagnostic {
+            code: "regression".to_string(),
+            severity: DiagnosticSeverity::Error,
+            reason: "The row regressed against the selected baseline.".to_string(),
+            evidence: BTreeMap::from([
+                (
+                    "change_percent".to_string(),
+                    comparison
+                        .change_percent
+                        .map_or_else(|| "unknown".to_string(), |value| format!("{value:.4}")),
+                ),
+                ("threshold".to_string(), comparison.threshold.to_string()),
+            ]),
+            suggestions: vec![
+                "Compare the same benchmark row before updating baselines.".to_string()
+            ],
+        });
+        summary.quality = QualityClass::Untrustworthy;
+    }
 }
 
 fn compare_one_summary(
@@ -1237,41 +1351,169 @@ fn push_max_budget(
     });
 }
 
-fn summary_flags(
-    spec: &BenchmarkSpec,
-    samples: &[&Sample],
-    ns_per_op: Option<&SummaryStats>,
-    overhead_ns_per_op: Option<&SummaryStats>,
-    budget_results: &[BudgetResult],
-) -> Vec<String> {
-    let mut flags = Vec::new();
+#[derive(Clone, Copy)]
+struct DiagnosticInputs<'a> {
+    spec: &'a BenchmarkSpec,
+    samples: &'a [&'a Sample],
+    stats: Option<&'a SummaryStats>,
+    ns_per_op: Option<&'a SummaryStats>,
+    overhead_ns_per_op: Option<&'a SummaryStats>,
+    allocs_per_op: Option<&'a SummaryStats>,
+    bytes_per_op: Option<&'a SummaryStats>,
+    budget_results: &'a [BudgetResult],
+    correctness_passed: bool,
+}
+
+#[allow(clippy::too_many_lines)]
+fn summary_diagnostics(input: DiagnosticInputs<'_>) -> Vec<BenchmarkDiagnostic> {
+    let mut diagnostics = Vec::new();
+    let DiagnosticInputs {
+        spec,
+        samples,
+        stats,
+        ns_per_op,
+        overhead_ns_per_op,
+        allocs_per_op,
+        bytes_per_op,
+        budget_results,
+        correctness_passed,
+    } = input;
     if samples.iter().any(|sample| !sample.has_valid_timing()) {
-        flags.push("invalid_timing".to_string());
+        diagnostics.push(diagnostic(
+            "invalid_timing",
+            DiagnosticSeverity::Error,
+            "At least one measured sample recorded zero or invalid timing.",
+            [("invalid_samples", invalid_timing_count(samples).to_string())],
+            ["Measure exactly one non-empty workload for this row."],
+        ));
     }
     if samples
         .iter()
         .any(|sample| sample.operations_completed == 0)
     {
-        flags.push("zero_completed_ops".to_string());
+        diagnostics.push(diagnostic(
+            "zero_completed_ops",
+            DiagnosticSeverity::Error,
+            "At least one measured sample completed zero logical operations.",
+            [(
+                "zero_completed_samples",
+                zero_completed_count(samples).to_string(),
+            )],
+            ["Record completed logical work with measure_batch, operations, or record_external."],
+        ));
+    }
+    if !correctness_passed {
+        diagnostics.push(diagnostic(
+            "correctness_failure",
+            DiagnosticSeverity::Error,
+            "Correctness counters did not pass for this benchmark row.",
+            [],
+            ["Inspect correctness counters before using this performance number."],
+        ));
+    }
+    if samples.len() < 5 {
+        diagnostics.push(diagnostic(
+            "too_few_samples",
+            if samples.len() < 2 {
+                DiagnosticSeverity::Error
+            } else {
+                DiagnosticSeverity::Warning
+            },
+            "The row has too few measured samples to make a stable decision.",
+            [("measured_samples", samples.len().to_string())],
+            ["Collect at least five measured samples, or use the release profile for gate-quality rows."],
+        ));
+    }
+    if stats.is_some_and(|stats| stats.relative_std_dev > 0.10) {
+        diagnostics.push(diagnostic(
+            "high_variance",
+            DiagnosticSeverity::Warning,
+            "Measured samples varied enough that this row needs attention.",
+            [(
+                "relative_std_dev",
+                stats
+                    .map(|stats| stats.relative_std_dev.to_string())
+                    .unwrap_or_default(),
+            )],
+            ["Use deterministic fixtures and move setup outside the measured work."],
+        ));
+    }
+    if too_fast_sample(samples, ns_per_op, spec.mode.kind()) {
+        diagnostics.push(diagnostic(
+            "too_fast",
+            DiagnosticSeverity::Warning,
+            "The measured work is too small for a useful timing sample.",
+            [(
+                "min_elapsed_ns",
+                samples
+                    .iter()
+                    .map(|sample| sample.elapsed_ns)
+                    .min()
+                    .unwrap_or_default()
+                    .to_string(),
+            )],
+            ["Batch more logical work per measurement or use Tier 1 for hot-path micro timing."],
+        ));
     }
     if has_overhead_dominant_sample(samples, overhead_ns_per_op) {
-        flags.push("overhead_dominant".to_string());
+        diagnostics.push(diagnostic(
+            "setup_dominates_measurement",
+            DiagnosticSeverity::Error,
+            "Timing overhead or setup dominates the measured work.",
+            overhead_evidence(overhead_ns_per_op),
+            ["Increase measured work per iteration and keep setup outside the measurement closure."],
+        ));
     }
     if spec.budgets.requires_allocation_tracking()
         && samples
             .iter()
             .any(|sample| sample.allocs_per_op.is_none() || sample.bytes_per_op.is_none())
     {
-        flags.push("allocation_tracking_required".to_string());
+        diagnostics.push(diagnostic(
+            "budget_failure",
+            DiagnosticSeverity::Error,
+            "An allocation budget was configured but allocation tracking is unavailable.",
+            [("budget", "allocation".to_string())],
+            ["Install cntryl_stress::stress_allocator!() in the benchmark crate."],
+        ));
     }
     if budget_results.iter().any(|result| !result.passed) {
-        flags.push("budget_failed".to_string());
+        diagnostics.push(diagnostic_with_evidence(
+            "budget_failure",
+            DiagnosticSeverity::Error,
+            "One or more explicit benchmark budgets failed.",
+            budget_failure_evidence(budget_results),
+            vec!["Inspect the failing budget, then either reduce measured cost or intentionally update the budget.".to_string()],
+        ));
+    }
+    if high_allocation_stats(allocs_per_op, bytes_per_op) {
+        diagnostics.push(diagnostic_with_evidence(
+            "high_allocations",
+            DiagnosticSeverity::Warning,
+            "The benchmark allocated during measured work.",
+            allocation_evidence(allocs_per_op, bytes_per_op),
+            vec![
+                "Move reusable allocations into setup or make the allocation budget explicit."
+                    .to_string(),
+            ],
+        ));
     }
     if spec.mode.kind() == BenchmarkModeKind::Micro
         && !micro_is_validated(spec)
         && ns_per_op.is_some_and(|stats| stats.mean < 5.0)
     {
-        flags.push("suspicious_micro".to_string());
+        diagnostics.push(diagnostic(
+            "suspicious_micro_timing",
+            DiagnosticSeverity::Warning,
+            "Tier 1 timing is below 5 ns/op without explicit validation.",
+            [(
+                "mean_ns_per_op",
+                ns_per_op
+                    .map(|stats| stats.mean.to_string())
+                    .unwrap_or_default(),
+            )],
+            ["Validate the microbenchmark independently before trusting this row, or batch more work."],
+        ));
     }
     if (3..=MAX_TIER).contains(&spec.tier)
         && !samples.is_empty()
@@ -1279,9 +1521,133 @@ fn summary_flags(
             .iter()
             .all(|sample| sample.operations_completed == 1)
     {
-        flags.push("tier_throughput_single_op".to_string());
+        diagnostics.push(diagnostic(
+            "single_op_throughput",
+            DiagnosticSeverity::Warning,
+            "A throughput-tier row completed only one operation per sample.",
+            [("tier", spec.tier.to_string())],
+            ["Use measure_batch or record_external for throughput work, or move a single-operation row to Tier 2."],
+        ));
     }
-    flags
+    if spec.intent == MeasurementIntent::Async
+        && samples
+            .iter()
+            .all(|sample| sample.wall_clock_ns <= sample.elapsed_ns.saturating_add(100))
+    {
+        diagnostics.push(diagnostic(
+            "async_misuse",
+            DiagnosticSeverity::Info,
+            "Async measurement did not show observable scheduling or await overhead.",
+            [("intent", spec.intent.to_string())],
+            ["Make sure the measured future awaits the real async operation instead of spawning detached work."],
+        ));
+    }
+    diagnostics
+}
+
+fn diagnostic<const E: usize, const S: usize>(
+    code: &'static str,
+    severity: DiagnosticSeverity,
+    reason: &'static str,
+    evidence: [(&'static str, String); E],
+    suggestions: [&'static str; S],
+) -> BenchmarkDiagnostic {
+    BenchmarkDiagnostic {
+        code: code.to_string(),
+        severity,
+        reason: reason.to_string(),
+        evidence: evidence
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect(),
+        suggestions: suggestions.into_iter().map(str::to_string).collect(),
+    }
+}
+
+fn diagnostic_with_evidence(
+    code: &'static str,
+    severity: DiagnosticSeverity,
+    reason: &'static str,
+    evidence: BTreeMap<String, String>,
+    suggestions: Vec<String>,
+) -> BenchmarkDiagnostic {
+    BenchmarkDiagnostic {
+        code: code.to_string(),
+        severity,
+        reason: reason.to_string(),
+        evidence,
+        suggestions,
+    }
+}
+
+fn invalid_timing_count(samples: &[&Sample]) -> usize {
+    samples
+        .iter()
+        .filter(|sample| !sample.has_valid_timing())
+        .count()
+}
+
+fn zero_completed_count(samples: &[&Sample]) -> usize {
+    samples
+        .iter()
+        .filter(|sample| sample.operations_completed == 0)
+        .count()
+}
+
+fn too_fast_sample(
+    samples: &[&Sample],
+    ns_per_op: Option<&SummaryStats>,
+    mode: BenchmarkModeKind,
+) -> bool {
+    mode != BenchmarkModeKind::Micro
+        && samples
+            .iter()
+            .any(|sample| sample.elapsed_ns < 1_000 && sample.operations_completed <= 1)
+        || mode == BenchmarkModeKind::Micro && ns_per_op.is_some_and(|stats| stats.mean < 1.0)
+}
+
+fn overhead_evidence(overhead_ns_per_op: Option<&SummaryStats>) -> [(&'static str, String); 1] {
+    [(
+        "overhead_ns_per_op",
+        overhead_ns_per_op.map_or_else(|| "unknown".to_string(), |stats| stats.mean.to_string()),
+    )]
+}
+
+fn budget_failure_evidence(budget_results: &[BudgetResult]) -> BTreeMap<String, String> {
+    budget_results
+        .iter()
+        .filter(|result| !result.passed)
+        .map(|result| {
+            (
+                result.metric.clone(),
+                result
+                    .actual
+                    .map_or_else(|| "unavailable".to_string(), |actual| actual.to_string()),
+            )
+        })
+        .collect()
+}
+
+fn high_allocation_stats(
+    allocs_per_op: Option<&SummaryStats>,
+    bytes_per_op: Option<&SummaryStats>,
+) -> bool {
+    allocs_per_op.is_some_and(|stats| stats.mean > 0.0)
+        || bytes_per_op.is_some_and(|stats| stats.mean > 0.0)
+}
+
+fn allocation_evidence(
+    allocs_per_op: Option<&SummaryStats>,
+    bytes_per_op: Option<&SummaryStats>,
+) -> BTreeMap<String, String> {
+    let mut evidence = BTreeMap::new();
+    if let Some(stats) = allocs_per_op {
+        evidence.insert("allocs_per_op".to_string(), stats.mean.to_string());
+    }
+    if let Some(stats) = bytes_per_op {
+        evidence.insert("bytes_per_op".to_string(), stats.mean.to_string());
+    }
+    evidence
 }
 
 fn has_overhead_dominant_sample(
@@ -1314,22 +1680,15 @@ fn classify_quality(
     stats: Option<&SummaryStats>,
     correctness_passed: bool,
     samples: &[&Sample],
-    flags: &[String],
+    diagnostics: &[BenchmarkDiagnostic],
     budget_results: &[BudgetResult],
 ) -> QualityClass {
     if !correctness_passed
         || measured_samples < 2
         || budget_results.iter().any(|result| !result.passed)
-        || flags.iter().any(|flag| {
-            matches!(
-                flag.as_str(),
-                "invalid_timing"
-                    | "zero_completed_ops"
-                    | "overhead_dominant"
-                    | "allocation_tracking_required"
-                    | "budget_failed"
-            )
-        })
+        || diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
         || samples.iter().any(|sample| {
             !sample.has_valid_timing()
                 || sample.operations_completed == 0
@@ -1422,6 +1781,7 @@ mod tests {
             mode: BenchmarkMode::FixedOperations {
                 operations_per_sample: 1,
             },
+            intent: MeasurementIntent::General,
             budgets: BenchmarkBudgets::default(),
             parameters: BTreeMap::new(),
             metadata: BTreeMap::new(),
@@ -1436,6 +1796,7 @@ mod tests {
             mode: BenchmarkMode::Micro {
                 target_sample_duration: Duration::from_millis(100),
             },
+            intent: MeasurementIntent::General,
             budgets: BenchmarkBudgets::default(),
             parameters: BTreeMap::new(),
             metadata: BTreeMap::new(),
@@ -1450,6 +1811,7 @@ mod tests {
             mode: BenchmarkMode::FixedDuration {
                 sample_duration: Duration::from_millis(100),
             },
+            intent: MeasurementIntent::General,
             budgets: BenchmarkBudgets::default(),
             parameters: BTreeMap::new(),
             metadata: BTreeMap::new(),
@@ -1466,6 +1828,7 @@ mod tests {
         };
         Sample {
             benchmark_id: id.to_string(),
+            intent: MeasurementIntent::General,
             sample_number,
             phase,
             elapsed_ns,
@@ -1580,7 +1943,7 @@ mod tests {
     }
 
     #[test]
-    fn micro_summary_uses_net_ns_per_op_and_flags_suspicious_rows() {
+    fn micro_summary_uses_net_ns_per_op_and_diagnoses_suspicious_rows() {
         let spec = micro_spec("hot_path");
         let samples = (0..5)
             .map(|i| micro_sample("hot_path", i, 4))
@@ -1591,7 +1954,10 @@ mod tests {
         assert_eq!(summary.primary_metric, PrimaryMetric::NsPerOp);
         assert_close(summary.primary_value().expect("value"), 4.0);
         assert_eq!(summary.quality, QualityClass::Acceptable);
-        assert!(summary.flags.contains(&"suspicious_micro".to_string()));
+        assert!(summary
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "suspicious_micro_timing"));
         assert_close(summary.overhead_ns_per_op.expect("overhead").mean, 2.0);
     }
 
@@ -1649,8 +2015,9 @@ mod tests {
 
         assert_eq!(summary.quality, QualityClass::Acceptable);
         assert!(summary
-            .flags
-            .contains(&"tier_throughput_single_op".to_string()));
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "single_op_throughput"));
     }
 
     #[test]
@@ -1664,7 +2031,10 @@ mod tests {
         let summary = summarize_benchmark(&spec, &samples);
 
         assert_eq!(summary.quality, QualityClass::Untrustworthy);
-        assert!(summary.flags.contains(&"budget_failed".to_string()));
+        assert!(summary
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "budget_failure"));
         assert_eq!(summary.budget_results.len(), 1);
         assert!(!summary.budget_results[0].passed);
     }
@@ -1681,8 +2051,9 @@ mod tests {
 
         assert_eq!(summary.quality, QualityClass::Untrustworthy);
         assert!(summary
-            .flags
-            .contains(&"allocation_tracking_required".to_string()));
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "budget_failure"));
         assert!(summary
             .budget_results
             .iter()

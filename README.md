@@ -19,22 +19,22 @@ harness = false
 ```
 
 ```rust
-use cntryl_stress::{black_box, stress_main, stress_test, StressContext};
+use cntryl_stress::{black_box, stress, stress_main, StressContext};
 
 cntryl_stress::stress_allocator!();
 
-#[stress_test(tier = 1, max_allocs_per_op = 0, max_bytes_per_op = 0)]
+#[stress(tier = 1, max_allocs_per_op = 0, max_bytes_per_op = 0)]
 fn parse_route_hot_path(ctx: &mut StressContext) {
     let route = b"tenant-a.queue.primary";
-    ctx.measure_micro(|| black_box(route.iter().position(|byte| *byte == b'.')));
+    ctx.measure("dot lookup", || black_box(route.iter().position(|byte| *byte == b'.')));
 }
 
-#[stress_test(tier = 2, metadata(component = "storage"))]
+#[stress(tier = 2, metadata(component = "storage"))]
 fn write_batch(ctx: &mut StressContext) {
     let batch = vec![0_u8; 4096];
 
     ctx.parameter("payload_size", batch.len());
-    ctx.measure(|| {
+    ctx.measure("write temp file", || {
         std::fs::write("target/stress-write.tmp", &batch).unwrap();
     });
 
@@ -70,12 +70,12 @@ cargo stress --baseline target/stress/storage_stress/latest.json
 - The `default` profile is the normal day-to-day run: useful per-tier signal without paying the exhaustive lab cost.
 - Use `lab` for deeper exploratory runs with more samples and longer sample windows.
 - Use `release` for the trustworthy release-quality gate: quality enforcement and regression enforcement when a baseline is supplied.
-- JSON artifacts use `schema_version: "cntryl-stress.v1"`.
-- Raw `Sample` rows are authoritative; summaries, quality, and comparisons are derived from measured samples only.
+- JSON artifacts use `schema_version: "cntryl-stress.v2"`.
+- Raw `Sample` rows are authoritative; summaries, diagnostics, quality, and comparisons are derived from measured samples only.
 - Warmup and cooldown samples are retained in JSON and excluded from summary statistics and baseline comparison.
-- Tier drives benchmark mode: Tier 1 uses `micro`, Tier 2 uses `fixed_operations`, and Tiers 3-6 use `fixed_duration`.
-- `mode = "..."` is optional compatibility syntax and must match the tier-derived mode.
-- Console rows include a `wall` column with total wall-clock time spent running that benchmark method across warmup, measured, and cooldown samples.
+- Tier drives benchmark mode: Tier 1 uses micro timing, Tier 2 uses fixed operations, and Tiers 3-6 use fixed duration.
+- `mode = "..."` is not public API; choose `#[stress(tier = 1..6)]`.
+- Compact console output shows good-quality rows, rows needing attention, concrete facts, and suggestions. Verbose output includes the deeper diagnostic columns.
 
 ## Tier Recipes
 
@@ -83,51 +83,52 @@ Pick the tier first, then use the matching timing shape. The detailed copy-paste
 
 | Tier | Scope | Recipe |
 |------|-------|--------|
-| 1 | Hot path | `ctx.measure_micro(|| hot_path())` |
-| 2 | Subsystem operation | `ctx.measure(|| one_operation())` or `ctx.measure_counted(|| completed_batch())` |
-| 3 | System throughput | `#[stress_test(tier = 3)]` plus `ctx.measure_batch(n, || batch())` |
-| 4 | Integration throughput | Fixed-duration `ctx.measure_batch(n, ...)` or `ctx.record_external(duration, n)` |
-| 5 | Saturation/scaling | Fixed-duration `ctx.measure_batch(n, ...)` with scale parameters |
-| 6 | Soak/endurance | Fixed-duration `ctx.measure_batch(n, ...)` or `ctx.record_external(duration, n)` over the soak window |
+| 1 | Hot path | `ctx.measure("parse", || hot_path())` |
+| 2 | Subsystem operation | `ctx.measure("write", || one_operation())` or `ctx.measure_batch("flush", n, || batch())` |
+| 3 | System throughput | `#[stress(tier = 3)]` plus `ctx.measure_batch("fanout", n, || batch())` |
+| 4 | Integration throughput | Fixed-duration `ctx.measure_batch("round trip", n, ...)` or `ctx.record_external("round trip", duration, n)` |
+| 5 | Saturation/scaling | Fixed-duration `ctx.measure_batch("fanout", n, ...)` with scale parameters |
+| 6 | Soak/endurance | Fixed-duration `ctx.measure_batch("churn", n, ...)` or `ctx.record_external("soak", duration, n)` over the soak window |
 
 ## Benchmark API
 
 The common case stays small:
 
 ```rust
-#[stress_test(tier = 1)]
+#[stress(tier = 1)]
 fn parse_document_header(ctx: &mut StressContext) {
     let document = load_document();
     ctx.parameter("payload_size", document.len());
-    ctx.measure_micro(|| parse_header(&document));
+    ctx.measure("parse header", || parse_header(&document));
 }
 
-#[stress_test(tier = 2)]
+#[stress(tier = 2)]
 fn write_batch(ctx: &mut StressContext) {
     let batch = build_batch();
     ctx.parameter("payload_size", batch.len());
-    ctx.measure(|| write(&batch));
+    ctx.measure("write batch", || write(&batch));
 }
 ```
 
-Use `measure_counted` when one Tier 2 subsystem call returns logical work completed:
+Use `measure_batch` when one measured call completes multiple logical operations:
 
 ```rust
-#[stress_test(tier = 2)]
+#[stress(tier = 2)]
 fn flush_ready_entries(ctx: &mut StressContext) {
-    let _completed = ctx.measure_counted(|| flush_ready_entries_once());
+    let ready = ready_entry_count();
+    let _completed = ctx.measure_batch("flush ready entries", ready, || flush_ready_entries_once());
 }
 ```
 
 Use `measure_batch` when each framework iteration performs many logical operations:
 
 ```rust
-#[stress_test(tier = 3)]
+#[stress(tier = 3)]
 fn fanout(ctx: &mut StressContext) {
     let clients = 16_u64;
     ctx.parameter("client_count", clients);
 
-    let _completed = ctx.measure_batch(clients, || {
+    let _completed = ctx.measure_batch("client fanout", clients, || {
         for client in 0..clients {
             send_one_request(client);
         }
@@ -138,11 +139,29 @@ fn fanout(ctx: &mut StressContext) {
 Use `record_external` when another harness owns timing:
 
 ```rust
-#[stress_test(tier = 4)]
+#[stress(tier = 4)]
 fn external_round_trip(ctx: &mut StressContext) {
     let report = run_external_harness();
-    ctx.record_external(report.duration, report.completed_operations);
+    ctx.record_external("round trip", report.duration, report.completed_operations);
 }
+```
+
+Use `measure_async` inside an async benchmark function when the measured work is a future:
+
+```rust
+#[stress(tier = 2)]
+async fn async_lookup(ctx: &mut StressContext) {
+    ctx.measure_async("lookup", || async { lookup_once().await }).await;
+}
+```
+
+Use the builder path when one row needs local run-shape overrides:
+
+```rust
+ctx.benchmark("large fanout")
+    .samples(20)
+    .warmup(2)
+    .measure_batch(client_count, || run_fanout_once());
 ```
 
 Useful context methods:
@@ -153,29 +172,28 @@ ctx.metadata("scenario", "fanout");
 ctx.record_latency(duration);
 ctx.correctness().attempted(n).completed(n).failures(0);
 ctx.operations(n);
-ctx.measure_micro(|| work());
-ctx.measure(|| work());
-ctx.measure_counted(|| work_count());
-ctx.measure_batch(n, || work());
-ctx.measure_workload(|| work());
-ctx.record_external(duration, n);
+ctx.measure("name", || work());
+ctx.measure_batch("name", n, || work());
+ctx.measure_async("name", || async { work().await }).await;
+ctx.measure_threaded("name", || work());
+ctx.measure_pipeline("name", || work());
+ctx.measure_io("name", || work());
+ctx.record_external("name", duration, n);
 ```
 
 ## Attributes
 
 ```rust
-#[stress_test]
-#[stress_test(tier = 1)]
-#[stress_test(tier = 1, mode = "micro")]
-#[stress_test(tier = 2, mode = "fixed_operations")]
-#[stress_test(tier = 4)]
-#[stress_test(tier = 1, max_ns_per_op = 250, max_regression_pct = 5)]
-#[stress_test(max_allocs_per_op = 0, max_bytes_per_op = 0, max_rsd_pct = 10)]
-#[stress_test(name = "custom_name", ignore)]
-#[stress_test(metadata(component = "queue", scenario = "fanout"))]
+#[stress]
+#[stress(tier = 1)]
+#[stress(tier = 4)]
+#[stress(tier = 1, max_ns_per_op = 250, max_regression_pct = 5)]
+#[stress(max_allocs_per_op = 0, max_bytes_per_op = 0, max_rsd_pct = 10)]
+#[stress(name = "custom_name", ignore)]
+#[stress(metadata(component = "queue", scenario = "fanout"))]
 ```
 
-Tiers are defined as 1 through 6. The macro rejects `tier = 0`, `tier > 6`, and any explicit `mode` that does not match the tier.
+Tiers are defined as 1 through 6. The macro rejects `tier = 0`, `tier > 6`, and any explicit `mode`.
 
 ## Run Policy
 
@@ -194,7 +212,7 @@ Quality classes:
 - `untrustworthy`: too few samples, zero completed ops, invalid timing, or correctness failure
 
 Baseline regressions are meaningful only when the primary metric moves past threshold and 95% confidence intervals do not overlap.
-Benchmark budgets fail the run when exceeded. Micro rows below 5 ns/op are marked `suspicious_micro` unless the benchmark metadata includes `validated_micro = "true"`.
+Benchmark budgets fail the run when exceeded. Diagnostics are structured on each summary with `code`, `severity`, `reason`, `evidence`, and `suggestions`.
 
 ## Configuration
 
@@ -237,7 +255,7 @@ cargo bench --bench storage_stress -- --console ci
 cargo bench --bench storage_stress -- --console json
 ```
 
-The default console output is `compact`: one run header, suite PASS/WARN/FAIL lines, attention rows with narrow columns, and one aggregate run summary. Use `full` for every row with narrow columns, `verbose` for diagnostic columns and notes, `ci` for only actionable suites, and `json` for machine-readable stdout.
+The default console output is `compact`: one run header, suite PASS/WARN/FAIL lines, per-row good-quality or needs-attention blocks, suggestions, and one aggregate run summary. Use `full` for every row with narrow columns, `verbose` for diagnostic columns and notes, `ci` for only actionable suites, and `json` for machine-readable stdout.
 
 ## Artifacts
 
@@ -247,7 +265,7 @@ Files are written under `target/stress/{suite}/`:
 - `{timestamp}.txt` and `latest.txt`
 - `{timestamp}.md` and `latest.md`
 
-The JSON artifact contains tool version, run profile, environment, benchmark specs, raw samples, summaries, quality, and comparisons. Unknown environment fields are explicit `"unknown"` or `null`.
+The JSON artifact contains tool version, run profile, environment, benchmark specs, raw samples, summaries, diagnostics, quality, and comparisons. Unknown environment fields are explicit `"unknown"` or `null`.
 
 ## Programmatic Runner
 
@@ -260,7 +278,7 @@ let mut runner = StressRunner::with_config("storage", config);
 runner.run("write_batch", |ctx| {
     let batch = vec![0_u8; 4096];
     ctx.parameter("payload_size", batch.len());
-    ctx.measure(|| write_batch(&batch));
+    ctx.measure("write batch", || write_batch(&batch));
 });
 let run = runner.finish();
 ```

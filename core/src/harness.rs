@@ -12,6 +12,8 @@ use std::path::PathBuf;
 pub struct BenchmarkEntry {
     /// Benchmark name.
     pub name: &'static str,
+    /// Rust function name used for stable ids.
+    pub function_name: &'static str,
     /// Benchmark function.
     pub func: fn(&mut StressContext),
     /// Whether this benchmark is ignored by default.
@@ -471,8 +473,9 @@ fn run_with_resolved_config(resolved: ResolvedStressConfig) {
         StressRunner::with_config_and_metadata(&suite_name, resolved.config, resolved.metadata);
 
     for entry in benchmarks {
-        let name = format!("{}::{}", entry.module_path, entry.name);
-        let id = format!("{suite_name}/{name}");
+        let stable_name = format!("{}::{}", entry.module_path, entry.function_name);
+        let display_name = format!("{}::{}", entry.module_path, entry.name);
+        let id = format!("{suite_name}/{stable_name}");
         let metadata = entry
             .metadata
             .iter()
@@ -480,14 +483,15 @@ fn run_with_resolved_config(resolved: ResolvedStressConfig) {
             .collect::<BTreeMap<_, _>>();
         let spec = BenchmarkSpec {
             id,
-            name,
+            name: display_name,
             tier: entry.tier,
             mode: config_for_specs.mode_for_kind(entry.mode),
+            intent: crate::result::MeasurementIntent::General,
             budgets: entry.budgets,
             parameters: BTreeMap::new(),
             metadata,
         };
-        runner.run_spec(spec, entry.func);
+        runner.run_spec(&spec, entry.func);
     }
 
     let run_result = if let Some(baseline_path) = resolved.baseline {
@@ -515,7 +519,7 @@ fn empty_selection_error(resolved: &ResolvedStressConfig) -> &'static str {
     if resolved.workload.is_some() {
         "No benchmarks matched the workload pattern"
     } else {
-        "No benchmarks registered. Add #[stress_test] to benchmark functions."
+        "No benchmarks registered. Add #[stress] to benchmark functions."
     }
 }
 
