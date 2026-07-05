@@ -493,70 +493,133 @@ fn suite_issue_bullets(
     push_diagnostic_issue(&mut issues, summaries, "high_variance", variance_issue);
     push_sample_count_issue(&mut issues, summaries);
     push_quality_issue(&mut issues, summaries);
+    push_shape_issues(&mut issues, summaries);
+    push_validity_issues(&mut issues, summaries);
+    push_comparison_issues(&mut issues, summaries, comparisons);
+    issues
+}
+
+fn push_shape_issues(issues: &mut Vec<String>, summaries: &[&BenchmarkSummary]) {
+    push_diagnostic_issue(issues, summaries, "suspicious_micro_timing", |summary| {
+        issue_with_fix(
+                format!("{} is suspiciously fast for a microbenchmark.", summary.name),
+                diagnostic_fix(
+                    summary,
+                    "suspicious_micro_timing",
+                    "Validate the microbenchmark independently before trusting this row, or batch more work.",
+                ),
+            )
+    });
+    push_diagnostic_issue(issues, summaries, "too_fast", |summary| {
+        issue_with_fix(
+            format!("{} is too small for stable timing.", summary.name),
+            diagnostic_fix(
+                summary,
+                "too_fast",
+                "Batch more logical work per measurement or use Tier 1 for hot-path micro timing.",
+            ),
+        )
+    });
     push_diagnostic_issue(
-        &mut issues,
+        issues,
         summaries,
-        "suspicious_micro_timing",
+        "setup_dominates_measurement",
         |summary| {
-            format!(
-                "{} is suspiciously fast for a microbenchmark.",
-                summary.name
+            issue_with_fix(
+                format!("{} is dominated by setup or timing overhead.", summary.name),
+                diagnostic_fix(
+                    summary,
+                    "setup_dominates_measurement",
+                    "Increase measured work per iteration and keep setup outside the measurement closure.",
+                ),
             )
         },
     );
-    push_diagnostic_issue(&mut issues, summaries, "too_fast", |summary| {
-        format!("{} is too small for stable timing.", summary.name)
-    });
-    push_diagnostic_issue(
-        &mut issues,
-        summaries,
-        "setup_dominates_measurement",
-        |summary| format!("{} is dominated by setup or timing overhead.", summary.name),
-    );
-    push_diagnostic_issue(&mut issues, summaries, "single_op_throughput", |summary| {
-        format!(
-            "{} is a throughput-tier benchmark but records one operation per sample.",
-            summary.name
+    push_diagnostic_issue(issues, summaries, "single_op_throughput", |summary| {
+        issue_with_fix(
+            format!(
+                "{} is a throughput-tier benchmark but records one operation per sample.",
+                summary.name
+            ),
+            diagnostic_fix(
+                summary,
+                "single_op_throughput",
+                "Use measure_batch or record_external for throughput work, or move a single-operation row to Tier 2.",
+            ),
         )
     });
-    push_diagnostic_issue(&mut issues, summaries, "zero_completed_ops", |summary| {
-        format!(
-            "{} completed zero logical operations in at least one sample.",
-            summary.name
+}
+
+fn push_validity_issues(issues: &mut Vec<String>, summaries: &[&BenchmarkSummary]) {
+    push_diagnostic_issue(issues, summaries, "zero_completed_ops", |summary| {
+        issue_with_fix(
+            format!(
+                "{} completed zero logical operations in at least one sample.",
+                summary.name
+            ),
+            diagnostic_fix(
+                summary,
+                "zero_completed_ops",
+                "Record completed logical work with measure_batch, operations, or record_external.",
+            ),
         )
     });
-    push_diagnostic_issue(&mut issues, summaries, "invalid_timing", |summary| {
-        format!("{} recorded invalid timing.", summary.name)
+    push_diagnostic_issue(issues, summaries, "invalid_timing", |summary| {
+        issue_with_fix(
+            format!("{} recorded invalid timing.", summary.name),
+            diagnostic_fix(
+                summary,
+                "invalid_timing",
+                "Measure exactly one non-empty workload for this row.",
+            ),
+        )
     });
     for summary in summaries
         .iter()
         .copied()
         .filter(|summary| !summary.correctness.passed)
     {
-        issues.push(format!("{} failed correctness checks.", summary.name));
+        issues.push(issue_with_fix(
+            format!("{} failed correctness checks.", summary.name),
+            diagnostic_fix(
+                summary,
+                "correctness_failure",
+                "Inspect correctness counters before using this performance number.",
+            ),
+        ));
     }
     for summary in summaries
         .iter()
         .copied()
         .filter(|summary| summary.budget_results.iter().any(|result| !result.passed))
     {
-        issues.push(format!(
-            "{} failed budget checks: {}.",
-            summary.name,
-            budget_note(summary)
+        issues.push(issue_with_fix(
+            format!("{} failed budget checks: {}.", summary.name, budget_note(summary)),
+            diagnostic_fix(
+                summary,
+                "budget_failure",
+                "Inspect the failing budget, then either reduce measured cost or intentionally update the budget.",
+            ),
         ));
     }
+}
+
+fn push_comparison_issues(
+    issues: &mut Vec<String>,
+    summaries: &[&BenchmarkSummary],
+    comparisons: &BTreeMap<&str, &ComparisonResult>,
+) {
     for summary in summaries {
         if let Some(comparison) = comparisons.get(summary.benchmark_id.as_str()).copied() {
             match comparison.classification {
                 ComparisonClass::Regression => issues.push(format!(
-                    "{} regressed against baseline ({}).",
+                    "{} regressed against baseline ({}). Fix: Inspect the same benchmark row before updating the baseline.",
                     summary.name,
                     format_delta_cell(comparison)
                 )),
                 ComparisonClass::Improvement if comparison_is_trustworthy(comparison) => {
                     issues.push(format!(
-                        "{} improved against baseline ({}).",
+                        "{} improved against baseline ({}). Fix: Update baselines only when the improvement is intentional.",
                         summary.name,
                         format_delta_cell(comparison)
                     ));
@@ -567,7 +630,6 @@ fn suite_issue_bullets(
             }
         }
     }
-    issues
 }
 
 fn push_allocation_issue(issues: &mut Vec<String>, summaries: &[&BenchmarkSummary]) {
@@ -579,10 +641,24 @@ fn push_allocation_issue(issues: &mut Vec<String>, summaries: &[&BenchmarkSummar
         .collect::<Vec<_>>();
     match names.as_slice() {
         [] => {}
-        [name] => issues.push(format!("{name} allocates memory during measurement.")),
-        _ => issues.push(format!(
-            "{} benchmarks allocate memory during measurement.",
-            names.len()
+        [name] => issues.push(issue_with_fix(
+            format!("{name} allocates memory during measurement."),
+            first_diagnostic_fix(
+                summaries,
+                "high_allocations",
+                "Move reusable allocations into setup or make the allocation budget explicit.",
+            ),
+        )),
+        _ => issues.push(issue_with_fix(
+            format!(
+                "{} benchmarks allocate memory during measurement.",
+                names.len()
+            ),
+            first_diagnostic_fix(
+                summaries,
+                "high_allocations",
+                "Move reusable allocations into setup or make the allocation budget explicit.",
+            ),
         )),
     }
 }
@@ -596,10 +672,21 @@ fn push_sample_count_issue(issues: &mut Vec<String>, summaries: &[&BenchmarkSumm
         .collect::<Vec<_>>();
     match names.as_slice() {
         [] => {}
-        [name] => issues.push(format!("{name} has too few measured samples.")),
-        _ => issues.push(format!(
-            "{} benchmarks have too few measured samples.",
-            names.len()
+        [name] => issues.push(issue_with_fix(
+            format!("{name} has too few measured samples."),
+            first_diagnostic_fix(
+                summaries,
+                "too_few_samples",
+                "Collect at least five measured samples, or use the release profile for gate-quality rows.",
+            ),
+        )),
+        _ => issues.push(issue_with_fix(
+            format!("{} benchmarks have too few measured samples.", names.len()),
+            first_diagnostic_fix(
+                summaries,
+                "too_few_samples",
+                "Collect at least five measured samples, or use the release profile for gate-quality rows.",
+            ),
         )),
     }
 }
@@ -613,9 +700,15 @@ fn push_quality_issue(issues: &mut Vec<String>, summaries: &[&BenchmarkSummary])
         })
         .count();
     if noisy == 1 {
-        issues.push("1 benchmark has noisy results.".to_string());
+        issues.push(issue_with_fix(
+            "1 benchmark has noisy results.",
+            "Collect more samples or make the measured workload more deterministic.",
+        ));
     } else if noisy > 1 {
-        issues.push(format!("{noisy} benchmarks have noisy results."));
+        issues.push(issue_with_fix(
+            format!("{noisy} benchmarks have noisy results."),
+            "Collect more samples or make the measured workload more deterministic.",
+        ));
     }
 
     let untrustworthy = summaries
@@ -633,10 +726,14 @@ fn push_quality_issue(issues: &mut Vec<String>, summaries: &[&BenchmarkSummary])
         })
         .count();
     if untrustworthy == 1 {
-        issues.push("1 benchmark has untrustworthy results.".to_string());
+        issues.push(issue_with_fix(
+            "1 benchmark has untrustworthy results.",
+            "Inspect diagnostics and increase measurement reliability before using this row.",
+        ));
     } else if untrustworthy > 1 {
-        issues.push(format!(
-            "{untrustworthy} benchmarks have untrustworthy results."
+        issues.push(issue_with_fix(
+            format!("{untrustworthy} benchmarks have untrustworthy results."),
+            "Inspect diagnostics and increase measurement reliability before using these rows.",
         ));
     }
 }
@@ -663,7 +760,38 @@ fn variance_issue(summary: &BenchmarkSummary) -> String {
         || "unknown".to_string(),
         |stats| format_percent(stats.relative_std_dev),
     );
-    format!("{} has elevated variance (RSD {rsd}).", summary.name)
+    issue_with_fix(
+        format!("{} has elevated variance (RSD {rsd}).", summary.name),
+        diagnostic_fix(
+            summary,
+            "high_variance",
+            "Use deterministic fixtures and move setup outside the measured work.",
+        ),
+    )
+}
+
+fn issue_with_fix(issue: impl Into<String>, fix: impl AsRef<str>) -> String {
+    format!("{} Fix: {}", issue.into(), fix.as_ref())
+}
+
+fn diagnostic_fix(summary: &BenchmarkSummary, code: &str, fallback: &str) -> String {
+    summary
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == code)
+        .and_then(|diagnostic| diagnostic.suggestions.first())
+        .map_or_else(|| fallback.to_string(), Clone::clone)
+}
+
+fn first_diagnostic_fix(summaries: &[&BenchmarkSummary], code: &str, fallback: &str) -> String {
+    summaries
+        .iter()
+        .copied()
+        .find(|summary| has_diagnostic(summary, code))
+        .map_or_else(
+            || fallback.to_string(),
+            |summary| diagnostic_fix(summary, code, fallback),
+        )
 }
 
 fn has_diagnostic(summary: &BenchmarkSummary, code: &str) -> bool {
@@ -1715,6 +1843,7 @@ mod tests {
         assert!(report.contains("queue::noisy"));
         assert!(report.contains("issues"));
         assert!(report.contains("• queue::noisy has elevated variance"));
+        assert!(report.contains("Fix: Use deterministic fixtures."));
         assert!(!report.contains("issue   "));
     }
 
@@ -1731,6 +1860,9 @@ mod tests {
         assert!(report.contains("queue::row_0"));
         assert!(report.contains("issues"));
         assert!(report.contains("6 benchmarks have noisy results."));
+        assert!(report.contains(
+            "Fix: Collect more samples or make the measured workload more deterministic."
+        ));
         assert!(!report.contains("summary: gate"));
         assert!(!report.contains("attention:"));
     }
@@ -1896,6 +2028,11 @@ mod tests {
         assert!(report.contains("budget failed"));
         assert!(report.contains("regression"));
         assert!(report.contains("micro is suspiciously fast"));
+        assert!(report.contains("Fix: Inspect the failing budget"));
+        assert!(
+            report.contains("Fix: Inspect the same benchmark row before updating the baseline.")
+        );
+        assert!(report.contains("Fix: Validate the microbenchmark independently."));
     }
 
     #[test]
