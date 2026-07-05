@@ -434,14 +434,7 @@ fn write_human_table(
     for summary in summaries {
         write_human_table_row(output, summary);
     }
-    let issues = suite_issue_bullets(summaries, comparisons);
-    if !issues.is_empty() {
-        let _ = writeln!(output);
-        let _ = writeln!(output, "issues");
-        for issue in issues {
-            let _ = writeln!(output, "  • {issue}");
-        }
-    }
+    write_issue_groups(output, &suite_issue_groups(summaries, comparisons));
 }
 
 fn write_human_table_header(output: &mut String) {
@@ -484,142 +477,197 @@ fn write_human_table_row(output: &mut String, summary: &BenchmarkSummary) {
     );
 }
 
-fn suite_issue_bullets(
-    summaries: &[&BenchmarkSummary],
-    comparisons: &BTreeMap<&str, &ComparisonResult>,
-) -> Vec<String> {
-    let mut issues = Vec::new();
-    push_allocation_issue(&mut issues, summaries);
-    push_diagnostic_issue(&mut issues, summaries, "high_variance", variance_issue);
-    push_sample_count_issue(&mut issues, summaries);
-    push_quality_issue(&mut issues, summaries);
-    push_shape_issues(&mut issues, summaries);
-    push_validity_issues(&mut issues, summaries);
-    push_comparison_issues(&mut issues, summaries, comparisons);
-    issues
+fn write_issue_groups(output: &mut String, groups: &[IssueGroup]) {
+    if groups.is_empty() {
+        return;
+    }
+
+    let _ = writeln!(output);
+    let _ = writeln!(output, "issues");
+    for (index, group) in groups.iter().enumerate() {
+        if index > 0 {
+            let _ = writeln!(output);
+        }
+        let _ = writeln!(output, "  {}", group.title);
+        for item in &group.items {
+            let _ = writeln!(output, "    • {item}");
+        }
+        if let Some(fix) = &group.fix {
+            let _ = writeln!(output, "    Fix: {fix}");
+        }
+    }
 }
 
-fn push_shape_issues(issues: &mut Vec<String>, summaries: &[&BenchmarkSummary]) {
-    push_diagnostic_issue(issues, summaries, "suspicious_micro_timing", |summary| {
-        issue_with_fix(
-                format!("{} is suspiciously fast for a microbenchmark.", summary.name),
-                diagnostic_fix(
-                    summary,
-                    "suspicious_micro_timing",
-                    "Validate the microbenchmark independently before trusting this row, or batch more work.",
-                ),
-            )
-    });
-    push_diagnostic_issue(issues, summaries, "too_fast", |summary| {
-        issue_with_fix(
-            format!("{} is too small for stable timing.", summary.name),
-            diagnostic_fix(
-                summary,
-                "too_fast",
-                "Batch more logical work per measurement or use Tier 1 for hot-path micro timing.",
-            ),
-        )
-    });
-    push_diagnostic_issue(
-        issues,
+#[derive(Debug)]
+struct IssueGroup {
+    title: &'static str,
+    items: Vec<String>,
+    fix: Option<String>,
+}
+
+impl IssueGroup {
+    const fn new(title: &'static str) -> Self {
+        Self {
+            title,
+            items: Vec::new(),
+            fix: None,
+        }
+    }
+
+    fn with_fix(title: &'static str, fix: impl Into<String>) -> Self {
+        Self {
+            title,
+            items: Vec::new(),
+            fix: Some(fix.into()),
+        }
+    }
+
+    fn push(&mut self, item: impl Into<String>) {
+        self.items.push(item.into());
+    }
+}
+
+fn suite_issue_groups(
+    summaries: &[&BenchmarkSummary],
+    comparisons: &BTreeMap<&str, &ComparisonResult>,
+) -> Vec<IssueGroup> {
+    let mut groups = Vec::new();
+    push_allocation_issue(&mut groups, summaries);
+    push_variance_issues(&mut groups, summaries);
+    push_sample_count_issue(&mut groups, summaries);
+    push_quality_issue(&mut groups, summaries);
+    push_shape_issues(&mut groups, summaries);
+    push_validity_issues(&mut groups, summaries);
+    push_comparison_issues(&mut groups, summaries, comparisons);
+    groups
+}
+
+fn push_shape_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSummary]) {
+    push_diagnostic_group(
+        groups,
+        "Micro timing",
         summaries,
-        "setup_dominates_measurement",
+        "suspicious_micro_timing",
+        "Validate the microbenchmark independently before trusting this row, or batch more work.",
         |summary| {
-            issue_with_fix(
-                format!("{} is dominated by setup or timing overhead.", summary.name),
-                diagnostic_fix(
-                    summary,
-                    "setup_dominates_measurement",
-                    "Increase measured work per iteration and keep setup outside the measurement closure.",
-                ),
+            format!(
+                "{} is suspiciously fast for a microbenchmark.",
+                summary.name
             )
         },
     );
-    push_diagnostic_issue(issues, summaries, "single_op_throughput", |summary| {
-        issue_with_fix(
+    push_diagnostic_group(
+        groups,
+        "Too fast",
+        summaries,
+        "too_fast",
+        "Batch more logical work per measurement or use Tier 1 for hot-path micro timing.",
+        |summary| format!("{} is too small for stable timing.", summary.name),
+    );
+    push_diagnostic_group(
+        groups,
+        "Setup",
+        summaries,
+        "setup_dominates_measurement",
+        "Increase measured work per iteration and keep setup outside the measurement closure.",
+        |summary| format!("{} is dominated by setup or timing overhead.", summary.name),
+    );
+    push_diagnostic_group(
+        groups,
+        "Throughput shape",
+        summaries,
+        "single_op_throughput",
+        "Use measure_batch or record_external for throughput work, or move a single-operation row to Tier 2.",
+        |summary| {
             format!(
                 "{} is a throughput-tier benchmark but records one operation per sample.",
                 summary.name
-            ),
-            diagnostic_fix(
-                summary,
-                "single_op_throughput",
-                "Use measure_batch or record_external for throughput work, or move a single-operation row to Tier 2.",
-            ),
-        )
-    });
+            )
+        },
+    );
 }
 
-fn push_validity_issues(issues: &mut Vec<String>, summaries: &[&BenchmarkSummary]) {
-    push_diagnostic_issue(issues, summaries, "zero_completed_ops", |summary| {
-        issue_with_fix(
+fn push_validity_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSummary]) {
+    push_diagnostic_group(
+        groups,
+        "Operations",
+        summaries,
+        "zero_completed_ops",
+        "Record completed logical work with measure_batch, operations, or record_external.",
+        |summary| {
             format!(
                 "{} completed zero logical operations in at least one sample.",
                 summary.name
-            ),
-            diagnostic_fix(
-                summary,
-                "zero_completed_ops",
-                "Record completed logical work with measure_batch, operations, or record_external.",
-            ),
-        )
-    });
-    push_diagnostic_issue(issues, summaries, "invalid_timing", |summary| {
-        issue_with_fix(
-            format!("{} recorded invalid timing.", summary.name),
-            diagnostic_fix(
-                summary,
-                "invalid_timing",
-                "Measure exactly one non-empty workload for this row.",
-            ),
-        )
-    });
+            )
+        },
+    );
+    push_diagnostic_group(
+        groups,
+        "Timing",
+        summaries,
+        "invalid_timing",
+        "Measure exactly one non-empty workload for this row.",
+        |summary| format!("{} recorded invalid timing.", summary.name),
+    );
+    let mut correctness = IssueGroup::with_fix(
+        "Correctness",
+        "Inspect correctness counters before using this performance number.",
+    );
     for summary in summaries
         .iter()
         .copied()
         .filter(|summary| !summary.correctness.passed)
     {
-        issues.push(issue_with_fix(
-            format!("{} failed correctness checks.", summary.name),
-            diagnostic_fix(
-                summary,
-                "correctness_failure",
-                "Inspect correctness counters before using this performance number.",
-            ),
-        ));
+        correctness.push(format!("{} failed correctness checks.", summary.name));
     }
+    push_issue_group(groups, correctness);
+
+    let mut budget = IssueGroup::new("Budget");
     for summary in summaries
         .iter()
         .copied()
         .filter(|summary| summary.budget_results.iter().any(|result| !result.passed))
     {
-        issues.push(issue_with_fix(
-            format!("{} failed budget checks: {}.", summary.name, budget_note(summary)),
-            diagnostic_fix(
+        if budget.fix.is_none() {
+            budget.fix = Some(diagnostic_fix(
                 summary,
                 "budget_failure",
                 "Inspect the failing budget, then either reduce measured cost or intentionally update the budget.",
-            ),
+            ));
+        }
+        budget.push(format!(
+            "{} failed budget checks: {}.",
+            summary.name,
+            budget_note(summary)
         ));
     }
+    push_issue_group(groups, budget);
 }
 
 fn push_comparison_issues(
-    issues: &mut Vec<String>,
+    groups: &mut Vec<IssueGroup>,
     summaries: &[&BenchmarkSummary],
     comparisons: &BTreeMap<&str, &ComparisonResult>,
 ) {
+    let mut regressions = IssueGroup::with_fix(
+        "Regression",
+        "Inspect the same benchmark row before updating the baseline.",
+    );
+    let mut improvements = IssueGroup::with_fix(
+        "Improvement",
+        "Update baselines only when the improvement is intentional.",
+    );
     for summary in summaries {
         if let Some(comparison) = comparisons.get(summary.benchmark_id.as_str()).copied() {
             match comparison.classification {
-                ComparisonClass::Regression => issues.push(format!(
-                    "{} regressed against baseline ({}). Fix: Inspect the same benchmark row before updating the baseline.",
+                ComparisonClass::Regression => regressions.push(format!(
+                    "{} regressed against baseline ({}).",
                     summary.name,
                     format_delta_cell(comparison)
                 )),
                 ComparisonClass::Improvement if comparison_is_trustworthy(comparison) => {
-                    issues.push(format!(
-                        "{} improved against baseline ({}). Fix: Update baselines only when the improvement is intentional.",
+                    improvements.push(format!(
+                        "{} improved against baseline ({}).",
                         summary.name,
                         format_delta_cell(comparison)
                     ));
@@ -630,68 +678,84 @@ fn push_comparison_issues(
             }
         }
     }
+    push_issue_group(groups, regressions);
+    push_issue_group(groups, improvements);
 }
 
-fn push_allocation_issue(issues: &mut Vec<String>, summaries: &[&BenchmarkSummary]) {
+fn push_allocation_issue(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSummary]) {
     let names = summaries
         .iter()
         .copied()
         .filter(|summary| has_diagnostic(summary, "high_allocations"))
         .map(|summary| summary.name.as_str())
         .collect::<Vec<_>>();
+    let mut group = IssueGroup::with_fix(
+        "Allocation",
+        first_diagnostic_fix(
+            summaries,
+            "high_allocations",
+            "Move reusable allocations into setup or make the allocation budget explicit.",
+        ),
+    );
     match names.as_slice() {
         [] => {}
-        [name] => issues.push(issue_with_fix(
-            format!("{name} allocates memory during measurement."),
-            first_diagnostic_fix(
-                summaries,
-                "high_allocations",
-                "Move reusable allocations into setup or make the allocation budget explicit.",
-            ),
-        )),
-        _ => issues.push(issue_with_fix(
-            format!(
-                "{} benchmarks allocate memory during measurement.",
-                names.len()
-            ),
-            first_diagnostic_fix(
-                summaries,
-                "high_allocations",
-                "Move reusable allocations into setup or make the allocation budget explicit.",
-            ),
+        [name] => group.push(format!("{name} allocates during measurement.")),
+        _ => group.push(format!(
+            "{} benchmarks allocate during measurement.",
+            names.len()
         )),
     }
+    push_issue_group(groups, group);
 }
 
-fn push_sample_count_issue(issues: &mut Vec<String>, summaries: &[&BenchmarkSummary]) {
+fn push_variance_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSummary]) {
+    push_diagnostic_group(
+        groups,
+        "Variance",
+        summaries,
+        "high_variance",
+        "Use deterministic fixtures and move setup outside the measured work.",
+        |summary| {
+            let rsd = summary.stats.as_ref().map_or_else(
+                || "unknown".to_string(),
+                |stats| format_percent(stats.relative_std_dev),
+            );
+            format!("{} ({rsd})", summary.name)
+        },
+    );
+}
+
+fn push_sample_count_issue(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSummary]) {
     let names = summaries
         .iter()
         .copied()
         .filter(|summary| has_diagnostic(summary, "too_few_samples"))
         .map(|summary| summary.name.as_str())
         .collect::<Vec<_>>();
+    let mut group = IssueGroup::with_fix(
+        "Samples",
+        first_diagnostic_fix(
+            summaries,
+            "too_few_samples",
+            "Collect at least five measured samples, or use the release profile for gate-quality rows.",
+        ),
+    );
     match names.as_slice() {
         [] => {}
-        [name] => issues.push(issue_with_fix(
-            format!("{name} has too few measured samples."),
-            first_diagnostic_fix(
-                summaries,
-                "too_few_samples",
-                "Collect at least five measured samples, or use the release profile for gate-quality rows.",
-            ),
-        )),
-        _ => issues.push(issue_with_fix(
-            format!("{} benchmarks have too few measured samples.", names.len()),
-            first_diagnostic_fix(
-                summaries,
-                "too_few_samples",
-                "Collect at least five measured samples, or use the release profile for gate-quality rows.",
-            ),
+        [name] => group.push(format!("{name} has too few measured samples.")),
+        _ => group.push(format!(
+            "{} benchmarks have too few measured samples.",
+            names.len()
         )),
     }
+    push_issue_group(groups, group);
 }
 
-fn push_quality_issue(issues: &mut Vec<String>, summaries: &[&BenchmarkSummary]) {
+fn push_quality_issue(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSummary]) {
+    let mut group = IssueGroup::with_fix(
+        "Quality",
+        "Collect more samples or make the measured workload more deterministic.",
+    );
     let noisy = summaries
         .iter()
         .copied()
@@ -700,15 +764,9 @@ fn push_quality_issue(issues: &mut Vec<String>, summaries: &[&BenchmarkSummary])
         })
         .count();
     if noisy == 1 {
-        issues.push(issue_with_fix(
-            "1 benchmark has noisy results.",
-            "Collect more samples or make the measured workload more deterministic.",
-        ));
+        group.push("1 benchmark has noisy results.");
     } else if noisy > 1 {
-        issues.push(issue_with_fix(
-            format!("{noisy} benchmarks have noisy results."),
-            "Collect more samples or make the measured workload more deterministic.",
-        ));
+        group.push(format!("{noisy} benchmarks have noisy results."));
     }
 
     let untrustworthy = summaries
@@ -726,52 +784,49 @@ fn push_quality_issue(issues: &mut Vec<String>, summaries: &[&BenchmarkSummary])
         })
         .count();
     if untrustworthy == 1 {
-        issues.push(issue_with_fix(
-            "1 benchmark has untrustworthy results.",
-            "Inspect diagnostics and increase measurement reliability before using this row.",
-        ));
+        group.push("1 benchmark has untrustworthy results.");
+        group.fix = Some(
+            "Inspect diagnostics and increase measurement reliability before using this row."
+                .to_string(),
+        );
     } else if untrustworthy > 1 {
-        issues.push(issue_with_fix(
-            format!("{untrustworthy} benchmarks have untrustworthy results."),
-            "Inspect diagnostics and increase measurement reliability before using these rows.",
+        group.push(format!(
+            "{untrustworthy} benchmarks have untrustworthy results."
         ));
+        group.fix = Some(
+            "Inspect diagnostics and increase measurement reliability before using these rows."
+                .to_string(),
+        );
     }
+    push_issue_group(groups, group);
 }
 
-fn push_diagnostic_issue<F>(
-    issues: &mut Vec<String>,
+fn push_diagnostic_group<F>(
+    groups: &mut Vec<IssueGroup>,
+    title: &'static str,
     summaries: &[&BenchmarkSummary],
     code: &str,
-    format_issue: F,
+    fallback_fix: &str,
+    format_item: F,
 ) where
     F: Fn(&BenchmarkSummary) -> String,
 {
+    let mut group =
+        IssueGroup::with_fix(title, first_diagnostic_fix(summaries, code, fallback_fix));
     for summary in summaries
         .iter()
         .copied()
         .filter(|summary| has_diagnostic(summary, code))
     {
-        issues.push(format_issue(summary));
+        group.push(format_item(summary));
     }
+    push_issue_group(groups, group);
 }
 
-fn variance_issue(summary: &BenchmarkSummary) -> String {
-    let rsd = summary.stats.as_ref().map_or_else(
-        || "unknown".to_string(),
-        |stats| format_percent(stats.relative_std_dev),
-    );
-    issue_with_fix(
-        format!("{} has elevated variance (RSD {rsd}).", summary.name),
-        diagnostic_fix(
-            summary,
-            "high_variance",
-            "Use deterministic fixtures and move setup outside the measured work.",
-        ),
-    )
-}
-
-fn issue_with_fix(issue: impl Into<String>, fix: impl AsRef<str>) -> String {
-    format!("{} Fix: {}", issue.into(), fix.as_ref())
+fn push_issue_group(groups: &mut Vec<IssueGroup>, group: IssueGroup) {
+    if !group.items.is_empty() {
+        groups.push(group);
+    }
 }
 
 fn diagnostic_fix(summary: &BenchmarkSummary, code: &str, fallback: &str) -> String {
@@ -1842,8 +1897,10 @@ mod tests {
 
         assert!(report.contains("queue::noisy"));
         assert!(report.contains("issues"));
-        assert!(report.contains("• queue::noisy has elevated variance"));
+        assert!(report.contains("  Variance"));
+        assert!(report.contains("    • queue::noisy ("));
         assert!(report.contains("Fix: Use deterministic fixtures."));
+        assert!(!report.contains("has elevated variance"));
         assert!(!report.contains("issue   "));
     }
 
@@ -1859,12 +1916,37 @@ mod tests {
 
         assert!(report.contains("queue::row_0"));
         assert!(report.contains("issues"));
-        assert!(report.contains("6 benchmarks have noisy results."));
+        assert!(report.contains("  Quality"));
+        assert!(report.contains("    • 6 benchmarks have noisy results."));
         assert!(report.contains(
             "Fix: Collect more samples or make the measured workload more deterministic."
         ));
         assert!(!report.contains("summary: gate"));
         assert!(!report.contains("attention:"));
+    }
+
+    #[test]
+    fn human_console_groups_allocation_issues() {
+        let mut first = summary("alloc_a", 100.0, QualityClass::Acceptable);
+        first.diagnostics = vec![diagnostic(
+            "high_allocations",
+            "The benchmark allocated during measurement.",
+            "Move reusable allocations into setup.",
+        )];
+        let mut second = summary("alloc_b", 100.0, QualityClass::Acceptable);
+        second.diagnostics = vec![diagnostic(
+            "high_allocations",
+            "The benchmark allocated during measurement.",
+            "Move reusable allocations into setup.",
+        )];
+        let run = run_with_summaries(vec![first, second]);
+
+        let report = format_console_output(&run);
+
+        assert!(report.contains("  Allocation"));
+        assert!(report.contains("    • 2 benchmarks allocate during measurement."));
+        assert!(report.contains("    Fix: Move reusable allocations into setup."));
+        assert!(!report.contains("alloc,noise"));
     }
 
     #[test]
@@ -2025,8 +2107,11 @@ mod tests {
 
         let report = format_console_output(&run);
 
+        assert!(report.contains("  Budget"));
         assert!(report.contains("budget failed"));
-        assert!(report.contains("regression"));
+        assert!(report.contains("  Regression"));
+        assert!(report.contains("regressed against baseline"));
+        assert!(report.contains("  Micro timing"));
         assert!(report.contains("micro is suspiciously fast"));
         assert!(report.contains("Fix: Inspect the failing budget"));
         assert!(
