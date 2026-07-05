@@ -1,7 +1,18 @@
 //! # cntryl-stress
 //!
-//! A raw-sample-first stress benchmarking framework for Tier 1 through Tier 6
-//! performance work.
+//! Benchmarks for engineers optimizing real code.
+//!
+//! cntryl-stress is an opinionated benchmarking framework focused on making
+//! performance work simple, repeatable, and trustworthy. It encourages
+//! deterministic, low-ceremony benchmarks and highlights common benchmark
+//! authoring mistakes automatically.
+//!
+//! The framework is designed around the questions developers ask every day:
+//!
+//! - Is this change faster?
+//! - Is the measurement stable?
+//! - Is the benchmark measuring the code I intended?
+//! - Can I trust this result?
 //!
 //! Tier labels:
 //!

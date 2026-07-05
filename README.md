@@ -4,7 +4,92 @@
 [![docs.rs](https://docs.rs/cntryl-stress/badge.svg)](https://docs.rs/cntryl-stress)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-Raw-sample-first benchmarking for Tier 1 hot paths through Tier 6 workload and system performance work.
+Benchmarks for engineers optimizing real code.
+
+`@cntryl/stress` is an opinionated benchmarking framework focused on making performance work simple, repeatable, and trustworthy.
+
+It is designed around the questions developers ask every day:
+
+- Is this change faster?
+- Is the measurement stable?
+- Is the benchmark measuring the code I intended?
+- Can I trust this result?
+
+stress encourages deterministic, low-ceremony benchmarks and highlights common benchmark authoring mistakes automatically.
+
+## Philosophy
+
+Writing a benchmark should be almost as easy as writing a unit test.
+
+A good benchmark should:
+
+- measure one thing
+- be deterministic
+- isolate setup from measured work
+- produce trustworthy numbers
+- make regressions obvious
+
+The framework should help you achieve those goals by default with minimal configuration.
+
+## Opinionated by Design
+
+stress is intentionally opinionated.
+
+It prefers convention over configuration and encourages benchmark practices that lead to reliable performance measurements.
+
+The default output focuses on the information most useful during optimization:
+
+- execution time
+- latency distribution, including p50, p95, and p99
+- variance, reported as RSD
+- allocations per operation
+- bytes allocated per operation
+- benchmark diagnostics when results may not be trustworthy
+
+When the benchmark itself needs improvement, stress tells you.
+
+## Built for Performance Engineering
+
+stress is designed for the iterative workflow of performance optimization:
+
+1. Write a benchmark.
+2. Verify the benchmark is trustworthy.
+3. Optimize the implementation.
+4. Measure again.
+5. Repeat.
+
+The framework helps distinguish problems in your code from problems in your benchmark.
+
+## Tiered Benchmarking
+
+stress encourages organizing benchmarks by intent rather than by size.
+
+- Tier 1: Hot paths and microbenchmarks
+- Tier 2: Subsystems
+- Tier 3: System behavior
+- Tier 4: Integration workloads
+- Tier 5: Production scenarios
+- Tier 6: Long-running stress and endurance testing
+
+Each tier represents a different level of confidence, isolation, and realism while using a consistent API and reporting model.
+
+## Low Ceremony
+
+Performance work should stay focused on the system under test.
+
+The API is intentionally small.
+
+The output is intentionally dense.
+
+The defaults are intentionally opinionated.
+
+You spend your time improving software, not configuring benchmarks.
+
+## Focused Scope
+
+stress is intentionally focused.
+
+It is built for engineers who spend significant time optimizing systems and want a fast feedback loop with minimal ceremony. It favors practical engineering decisions, clear benchmark shape, and a workflow optimized for day-to-day performance development.
 
 ## Quick Start
 
