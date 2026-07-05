@@ -391,6 +391,7 @@ fn format_human_console_runs(runs: &[StressRun]) -> String {
         write_suite_block(&mut output, run);
         wrote_suite = true;
     }
+    write_final_result_line(&mut output, runs);
     output
 }
 
@@ -439,10 +440,9 @@ fn write_human_table(
 
 fn write_human_table_header(output: &mut String) {
     let header = format!(
-        "{benchmark:<HUMAN_TABLE_NAME_WIDTH$} {value:>HUMAN_TABLE_VALUE_WIDTH$} {mean:>HUMAN_TABLE_VALUE_WIDTH$} {p50:>HUMAN_TABLE_VALUE_WIDTH$} {p95:>HUMAN_TABLE_VALUE_WIDTH$} {p99:>HUMAN_TABLE_VALUE_WIDTH$} {rsd:>7} {allocs:>HUMAN_TABLE_ALLOC_WIDTH$} {bytes:>HUMAN_TABLE_ALLOC_WIDTH$}",
+        "{benchmark:<HUMAN_TABLE_NAME_WIDTH$} {value:>HUMAN_TABLE_VALUE_WIDTH$} {p50:>HUMAN_TABLE_VALUE_WIDTH$} {p95:>HUMAN_TABLE_VALUE_WIDTH$} {p99:>HUMAN_TABLE_VALUE_WIDTH$} {rsd:>7} {allocs:>HUMAN_TABLE_ALLOC_WIDTH$} {bytes:>HUMAN_TABLE_ALLOC_WIDTH$}",
         benchmark = "benchmark",
         value = "value",
-        mean = "mean",
         p50 = "p50",
         p95 = "p95",
         p99 = "p99",
@@ -461,7 +461,6 @@ fn write_human_table_row(output: &mut String, summary: &BenchmarkSummary) {
         |value| format_metric_value(value, summary.primary_metric),
     );
     let stats = summary.stats.as_ref();
-    let mean = format_metric_stat(stats, summary.primary_metric, |stats| stats.mean);
     let p50 = format_metric_stat(stats, summary.primary_metric, |stats| stats.p50);
     let p95 = format_metric_stat(stats, summary.primary_metric, |stats| stats.p95);
     let p99 = format_metric_stat(stats, summary.primary_metric, |stats| stats.p99);
@@ -471,10 +470,40 @@ fn write_human_table_row(output: &mut String, summary: &BenchmarkSummary) {
     );
     let _ = writeln!(
         output,
-        "{name:<HUMAN_TABLE_NAME_WIDTH$} {value:>HUMAN_TABLE_VALUE_WIDTH$} {mean:>HUMAN_TABLE_VALUE_WIDTH$} {p50:>HUMAN_TABLE_VALUE_WIDTH$} {p95:>HUMAN_TABLE_VALUE_WIDTH$} {p99:>HUMAN_TABLE_VALUE_WIDTH$} {rsd:>7} {allocs:>HUMAN_TABLE_ALLOC_WIDTH$} {bytes:>HUMAN_TABLE_ALLOC_WIDTH$}",
+        "{name:<HUMAN_TABLE_NAME_WIDTH$} {value:>HUMAN_TABLE_VALUE_WIDTH$} {p50:>HUMAN_TABLE_VALUE_WIDTH$} {p95:>HUMAN_TABLE_VALUE_WIDTH$} {p99:>HUMAN_TABLE_VALUE_WIDTH$} {rsd:>7} {allocs:>HUMAN_TABLE_ALLOC_WIDTH$} {bytes:>HUMAN_TABLE_ALLOC_WIDTH$}",
         allocs = format_optional_scaled_stat(summary.allocs_per_op.as_ref()),
         bytes = format_optional_scaled_stat(summary.bytes_per_op.as_ref()),
     );
+}
+
+fn write_final_result_line(output: &mut String, runs: &[StressRun]) {
+    let Some(line) = final_result_line(runs) else {
+        return;
+    };
+    let _ = writeln!(output);
+    let _ = writeln!(output, "{line}");
+}
+
+fn final_result_line(runs: &[StressRun]) -> Option<String> {
+    if runs.is_empty() {
+        return None;
+    }
+
+    let failures = runs
+        .iter()
+        .filter_map(|run| {
+            let status = gate_status(run);
+            (status != "passed").then(|| format!("{}: {status}", run.suite))
+        })
+        .collect::<Vec<_>>();
+    match failures.as_slice() {
+        [] => Some("result: passed".to_string()),
+        [failure] => Some(format!("result: failed ({failure})")),
+        [first, ..] => Some(format!(
+            "result: failed ({} suites failed; first {first})",
+            failures.len()
+        )),
+    }
 }
 
 fn write_issue_groups(output: &mut String, groups: &[IssueGroup]) {
@@ -1471,10 +1500,16 @@ fn truncate_name_to_width(name: &str, width: usize) -> String {
     if chars.len() <= width {
         return name.to_string();
     }
+    if width <= 2 {
+        return chars.into_iter().take(width).collect();
+    }
 
     let keep = width.saturating_sub(2);
-    let tail = chars[chars.len() - keep..].iter().collect::<String>();
-    format!("..{tail}")
+    let head_len = keep.div_ceil(2);
+    let tail_len = keep / 2;
+    let head = chars[..head_len].iter().collect::<String>();
+    let tail = chars[chars.len() - tail_len..].iter().collect::<String>();
+    format!("{head}..{tail}")
 }
 
 fn format_metric_value(value: f64, metric: PrimaryMetric) -> String {
@@ -1863,21 +1898,38 @@ mod tests {
 
         assert!(report.contains("@cntryl/stress v0.3.0"));
         assert!(report.contains("suite"));
-        assert!(report.contains("benchmark"));
-        assert!(report.contains("value"));
-        assert!(report.contains("mean"));
-        assert!(report.contains("p50"));
-        assert!(report.contains("p95"));
-        assert!(report.contains("p99"));
-        assert!(report.contains("rsd"));
-        assert!(report.contains("alloc/op"));
-        assert!(report.contains("B/op"));
+        let header = report
+            .lines()
+            .find(|line| line.starts_with("benchmark"))
+            .expect("human table header");
+        assert_eq!(
+            header.split_whitespace().collect::<Vec<_>>(),
+            vec![
+                "benchmark",
+                "value",
+                "p50",
+                "p95",
+                "p99",
+                "rsd",
+                "alloc/op",
+                "B/op"
+            ]
+        );
         assert!(report.contains("queue::fast"));
         assert!(report.contains("1.00M"));
         assert!(!report.contains("Summary"));
         assert!(!report.contains("Quality"));
         assert!(!report.contains("issues"));
         assert!(!report.contains("Run summary"));
+        assert!(report.trim_end().ends_with("result: passed"));
+    }
+
+    #[test]
+    fn human_console_middle_truncates_long_names() {
+        assert_eq!(
+            truncate_name_to_width("abcdefghijklmnopqrstuvwx", 10),
+            "abcd..uvwx"
+        );
     }
 
     #[test]
@@ -1902,6 +1954,7 @@ mod tests {
         assert!(report.contains("Fix: Use deterministic fixtures."));
         assert!(!report.contains("has elevated variance"));
         assert!(!report.contains("issue   "));
+        assert!(report.find("issues").expect("issues") < report.find("result:").expect("result"));
     }
 
     #[test]
@@ -2118,6 +2171,9 @@ mod tests {
             report.contains("Fix: Inspect the same benchmark row before updating the baseline.")
         );
         assert!(report.contains("Fix: Validate the microbenchmark independently."));
+        assert!(report
+            .trim_end()
+            .ends_with("result: failed (suite: failed budget)"));
     }
 
     #[test]

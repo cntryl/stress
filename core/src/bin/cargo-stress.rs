@@ -1056,6 +1056,8 @@ mod tests {
         assert!(output.contains("suite-a"));
         assert!(output.contains("suite-b"));
         assert_eq!(output.matches("benchmark").count(), 2);
+        assert_eq!(output.matches("result:").count(), 1);
+        assert!(output.trim_end().ends_with("result: passed"));
         assert!(!output.contains("summary: gate"));
     }
 
