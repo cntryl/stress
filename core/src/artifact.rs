@@ -960,6 +960,9 @@ pub struct ComparisonResult {
     pub confidence_intervals_overlap: Option<bool>,
     /// Comparison classification.
     pub classification: ComparisonClass,
+    /// Human-readable reason when the comparison is intentionally inconclusive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Complete current run artifact.
@@ -1225,7 +1228,7 @@ pub(crate) fn attach_regression_diagnostics(
         .iter()
         .filter(|comparison| comparison.classification == ComparisonClass::Regression)
         .collect::<Vec<_>>();
-    for summary in summaries {
+    for summary in &mut *summaries {
         let Some(comparison) = regressions
             .iter()
             .find(|comparison| comparison.benchmark_id == summary.benchmark_id)
@@ -1251,6 +1254,30 @@ pub(crate) fn attach_regression_diagnostics(
         });
         summary.quality = QualityClass::Untrustworthy;
     }
+
+    for comparison in comparisons.iter().filter(|comparison| {
+        comparison.classification == ComparisonClass::Inconclusive && comparison.reason.is_some()
+    }) {
+        let Some(summary) = summaries
+            .iter_mut()
+            .find(|summary| summary.benchmark_id == comparison.benchmark_id)
+        else {
+            continue;
+        };
+        summary.diagnostics.push(BenchmarkDiagnostic {
+            code: "baseline_semantics_changed".to_string(),
+            severity: DiagnosticSeverity::Warning,
+            reason: comparison
+                .reason
+                .clone()
+                .unwrap_or_else(|| "The row semantics changed relative to baseline.".to_string()),
+            evidence: BTreeMap::new(),
+            suggestions: vec![
+                "Refresh the baseline after confirming the semantic change is intentional."
+                    .to_string(),
+            ],
+        });
+    }
 }
 
 fn compare_one_summary(
@@ -1274,6 +1301,7 @@ fn compare_one_summary(
             threshold,
             confidence_intervals_overlap: None,
             classification: ComparisonClass::MissingBaseline,
+            reason: None,
         };
     };
     let baseline_value = baseline.primary_value();
@@ -1281,6 +1309,21 @@ fn compare_one_summary(
     let change_percent = baseline_value
         .zip(current_value)
         .map(|(base, current)| ((current / base) - 1.0) * 100.0);
+    if let Some(reason) = ns_per_op_basis_change_reason(current, baseline) {
+        return ComparisonResult {
+            benchmark_id: current.benchmark_id.clone(),
+            current_quality: current.quality,
+            baseline_quality: Some(baseline.quality),
+            primary_metric: current.primary_metric,
+            baseline_value,
+            current_value,
+            change_percent,
+            threshold,
+            confidence_intervals_overlap: None,
+            classification: ComparisonClass::Inconclusive,
+            reason: Some(reason),
+        };
+    }
     let confidence_intervals_overlap =
         baseline
             .stats
@@ -1309,7 +1352,23 @@ fn compare_one_summary(
         threshold,
         confidence_intervals_overlap,
         classification,
+        reason: None,
     }
+}
+
+fn ns_per_op_basis_change_reason(
+    current: &BenchmarkSummary,
+    baseline: &BenchmarkSummary,
+) -> Option<String> {
+    let current_basis = current.metadata.get("ns_per_op_basis");
+    let baseline_basis = baseline.metadata.get("ns_per_op_basis");
+    (current_basis != baseline_basis).then(|| {
+        format!(
+            "ns_per_op_basis changed from {} to {}; refresh the baseline after confirming the row semantics.",
+            baseline_basis.map_or("<unset>", String::as_str),
+            current_basis.map_or("<unset>", String::as_str)
+        )
+    })
 }
 
 fn classify_comparison(
@@ -1642,13 +1701,10 @@ fn summary_diagnostics(input: DiagnosticInputs<'_>) -> Vec<BenchmarkDiagnostic> 
     if high_allocation_stats(allocs_per_op, bytes_per_op) {
         diagnostics.push(diagnostic_with_evidence(
             "high_allocations",
-            DiagnosticSeverity::Warning,
+            high_allocation_severity(spec),
             "The benchmark allocated during measured work.",
-            allocation_evidence(allocs_per_op, bytes_per_op),
-            vec![
-                "Move reusable allocations into setup or make the allocation budget explicit."
-                    .to_string(),
-            ],
+            allocation_evidence(spec, allocs_per_op, bytes_per_op),
+            high_allocation_suggestions(spec),
         ));
     }
     if spec.mode.kind() == BenchmarkModeKind::Micro
@@ -1931,7 +1987,36 @@ fn high_allocation_stats(
         || bytes_per_op.is_some_and(|stats| stats.mean > 0.0)
 }
 
+fn high_allocation_severity(spec: &BenchmarkSpec) -> DiagnosticSeverity {
+    if is_allocation_context(spec) {
+        DiagnosticSeverity::Info
+    } else {
+        DiagnosticSeverity::Warning
+    }
+}
+
+fn high_allocation_suggestions(spec: &BenchmarkSpec) -> Vec<String> {
+    if is_allocation_context(spec) {
+        vec![
+            "Treat this as allocation context unless an explicit allocation budget fails."
+                .to_string(),
+        ]
+    } else {
+        vec![
+            "Move reusable allocations into setup or make the allocation budget explicit."
+                .to_string(),
+        ]
+    }
+}
+
+fn is_allocation_context(spec: &BenchmarkSpec) -> bool {
+    spec.metadata
+        .get("row_class")
+        .is_some_and(|value| matches!(value.as_str(), "construction" | "parsing" | "allocation"))
+}
+
 fn allocation_evidence(
+    spec: &BenchmarkSpec,
     allocs_per_op: Option<&SummaryStats>,
     bytes_per_op: Option<&SummaryStats>,
 ) -> BTreeMap<String, String> {
@@ -1941,6 +2026,9 @@ fn allocation_evidence(
     }
     if let Some(stats) = bytes_per_op {
         evidence.insert("bytes_per_op".to_string(), stats.mean.to_string());
+    }
+    if let Some(row_class) = spec.metadata.get("row_class") {
+        evidence.insert("row_class".to_string(), row_class.clone());
     }
     evidence
 }
@@ -2277,6 +2365,34 @@ mod tests {
     }
 
     #[test]
+    fn row_class_downgrades_high_allocation_diagnostic_to_info() {
+        let mut spec = spec("parser");
+        spec.metadata
+            .insert("row_class".to_string(), "parsing".to_string());
+        let samples = (0..5)
+            .map(|i| {
+                let mut sample = completed_sample("parser", i, 1_000, 1);
+                sample.allocs_per_op = Some(1.0);
+                sample.bytes_per_op = Some(64.0);
+                sample
+            })
+            .collect::<Vec<_>>();
+
+        let summary = summarize_benchmark(&spec, &samples);
+        let diagnostic = summary
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "high_allocations")
+            .expect("allocation diagnostic");
+
+        assert_eq!(diagnostic.severity, DiagnosticSeverity::Info);
+        assert_eq!(
+            diagnostic.evidence.get("row_class"),
+            Some(&"parsing".to_string())
+        );
+    }
+
+    #[test]
     fn benchmark_mode_kind_is_derived_from_tier() {
         assert_eq!(
             BenchmarkModeKind::for_tier(1),
@@ -2539,6 +2655,37 @@ mod tests {
             compare_summaries(&[current], &[baseline], 0.05)[0].classification,
             ComparisonClass::Inconclusive
         );
+    }
+
+    #[test]
+    fn comparison_treats_ns_per_op_basis_mismatch_as_semantic_change() {
+        let baseline = summarize_benchmark(
+            &micro_spec("hot_path"),
+            &(0..10)
+                .map(|i| micro_sample("hot_path", i, 100))
+                .collect::<Vec<_>>(),
+        );
+        let mut current = summarize_benchmark(
+            &micro_spec("hot_path"),
+            &(0..10)
+                .map(|i| micro_sample("hot_path", i, 200))
+                .collect::<Vec<_>>(),
+        );
+        current.metadata.insert(
+            "ns_per_op_basis".to_string(),
+            "logical_completed_operation".to_string(),
+        );
+
+        let comparison = compare_summaries(&[current], &[baseline], 0.05)
+            .into_iter()
+            .next()
+            .expect("comparison");
+
+        assert_eq!(comparison.classification, ComparisonClass::Inconclusive);
+        assert!(comparison
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("ns_per_op_basis changed")));
     }
 
     #[test]

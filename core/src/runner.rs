@@ -62,7 +62,7 @@ impl StressRunner {
     pub fn with_config_and_metadata(
         suite: &str,
         config: StressRunnerConfig,
-        metadata: BTreeMap<String, String>,
+        mut metadata: BTreeMap<String, String>,
     ) -> Self {
         let validation_errors = config.validation_errors();
         assert!(
@@ -72,6 +72,12 @@ impl StressRunner {
         );
 
         let environment = capture_environment(&config);
+        if let Some(run_id) = std::env::var("STRESS_RUN_ID")
+            .ok()
+            .filter(|value| !value.is_empty())
+        {
+            metadata.entry("run_id".to_string()).or_insert(run_id);
+        }
         let mut reporters: Vec<Box<dyn Reporter>> = vec![Box::new(
             JsonReporter::new(config.output_dir.clone()).announce(false),
         )];
@@ -404,11 +410,11 @@ impl StressRunner {
         let net_elapsed_ns = micro.map(|micro| micro.net_elapsed.as_nanos());
         let calibrated_iterations = micro.map(|micro| micro.iterations);
         let gross_ns_per_op =
-            micro.and_then(|micro| ns_per_op(micro.gross_elapsed.as_nanos(), micro.iterations));
+            micro.and_then(|micro| ns_per_op(micro.gross_elapsed.as_nanos(), operations_completed));
         let overhead_ns_per_op =
-            micro.and_then(|micro| ns_per_op(micro.overhead.as_nanos(), micro.iterations));
+            micro.and_then(|micro| ns_per_op(micro.overhead.as_nanos(), operations_completed));
         let net_ns_per_op =
-            micro.and_then(|micro| ns_per_op(micro.net_elapsed.as_nanos(), micro.iterations));
+            micro.and_then(|micro| ns_per_op(micro.net_elapsed.as_nanos(), operations_completed));
         let allocation = record.allocation;
         let allocs = allocation.map(|allocation| allocation.allocs);
         let bytes = allocation.map(|allocation| allocation.bytes);
@@ -469,12 +475,26 @@ fn register_measurement_spec(
     if let Some(spec) = derived_specs.get_mut(benchmark_id) {
         spec.metadata.extend(record.metadata.clone());
         spec.parameters.extend(record.parameters.clone());
+        if record.mode.kind() == BenchmarkModeKind::Micro
+            && record.intent == MeasurementIntent::Batch
+        {
+            spec.metadata.insert(
+                "ns_per_op_basis".to_string(),
+                "logical_completed_operation".to_string(),
+            );
+        }
         return;
     }
 
     spec_order.push(benchmark_id.to_string());
     let mut metadata = base_spec.metadata.clone();
     metadata.extend(record.metadata.clone());
+    if record.mode.kind() == BenchmarkModeKind::Micro && record.intent == MeasurementIntent::Batch {
+        metadata.insert(
+            "ns_per_op_basis".to_string(),
+            "logical_completed_operation".to_string(),
+        );
+    }
     let mut parameters = base_spec.parameters.clone();
     parameters.extend(record.parameters.clone());
     derived_specs.insert(
@@ -637,7 +657,10 @@ mod tests {
         BenchmarkBudgets, BenchmarkMode, BenchmarkModeKind, ComparisonClass, ComparisonResult,
         CorrectnessCounters, DiagnosticSeverity, PrimaryMetric, QualityClass, RunProfile,
     };
+    use std::sync::Mutex;
     use std::time::Duration;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn records_raw_samples_and_summarizes_measured_only() {
@@ -889,6 +912,7 @@ mod tests {
             threshold: 0.05,
             confidence_intervals_overlap: Some(false),
             classification: ComparisonClass::Regression,
+            reason: None,
         });
 
         assert_eq!(evaluate_run_gate(&run), RunGate::RegressionFailed);
@@ -1023,6 +1047,68 @@ mod tests {
         assert!(sample.net_ns_per_op.expect("ns/op") >= 0.0);
         assert_eq!(summary.primary_metric, PrimaryMetric::NsPerOp);
         assert!(summary.ns_per_op.is_some());
+    }
+
+    #[test]
+    fn tier1_batch_ns_per_op_uses_logical_completed_operations() {
+        let config = StressRunnerConfig::for_profile(RunProfile::Smoke)
+            .micro_sample_duration(Duration::from_millis(1));
+        let mut runner = StressRunner::with_config("suite", config.clone());
+        runner.reporters(Vec::new());
+        let spec = BenchmarkSpec {
+            id: "suite/batch".to_string(),
+            name: "batch".to_string(),
+            tier: 1,
+            mode: config.mode_for_kind(BenchmarkModeKind::Micro),
+            intent: MeasurementIntent::General,
+            budgets: BenchmarkBudgets::default(),
+            parameters: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+        };
+
+        runner.run_spec(&spec, |ctx| {
+            let completed = ctx.measure_batch("batch", 8, || std::hint::black_box(1_u64));
+            assert!(completed >= 8);
+        });
+        let run = runner.finish();
+        let sample = &run.samples[0];
+
+        assert!(sample.calibrated_iterations.expect("iterations") > 0);
+        assert_eq!(
+            sample.operations_completed,
+            sample.calibrated_iterations.expect("iterations") * 8
+        );
+        assert_eq!(
+            run.summaries[0].metadata.get("ns_per_op_basis"),
+            Some(&"logical_completed_operation".to_string())
+        );
+        assert_eq!(
+            sample.net_ns_per_op,
+            sample
+                .net_elapsed_ns
+                .and_then(|elapsed| ns_per_op(elapsed, sample.operations_completed))
+        );
+    }
+
+    #[test]
+    fn runner_records_stress_run_id_metadata_from_env() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let previous = std::env::var("STRESS_RUN_ID").ok();
+        std::env::set_var("STRESS_RUN_ID", "run-123");
+        let mut runner = StressRunner::with_config("suite", StressRunnerConfig::new());
+        runner.reporters(Vec::new());
+
+        runner.run("bench", |ctx| {
+            ctx.measure("work", || std::hint::black_box(1_u64));
+        });
+        let run = runner.finish();
+        if let Some(previous) = previous {
+            std::env::set_var("STRESS_RUN_ID", previous);
+        } else {
+            std::env::remove_var("STRESS_RUN_ID");
+        }
+
+        assert_eq!(run.metadata.get("run_id"), Some(&"run-123".to_string()));
     }
 
     fn run_allocating_fixed_operation(budgets: BenchmarkBudgets) -> StressRun {

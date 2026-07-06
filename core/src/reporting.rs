@@ -841,6 +841,10 @@ fn push_comparison_issues(
         "Improvement",
         "Update baselines only when the improvement is intentional.",
     );
+    let mut semantic_changes = IssueGroup::with_fix(
+        "Baseline semantics",
+        "Refresh the baseline after confirming the semantic change is intentional.",
+    );
     for summary in summaries {
         if let Some(comparison) = comparisons.get(summary.benchmark_id.as_str()).copied() {
             match comparison.classification {
@@ -856,6 +860,13 @@ fn push_comparison_issues(
                         format_delta_cell(comparison)
                     ));
                 }
+                ComparisonClass::Inconclusive if comparison.reason.is_some() => {
+                    semantic_changes.push(format!(
+                        "{} changed comparison semantics: {}",
+                        summary.name,
+                        comparison.reason.as_deref().unwrap_or("unknown")
+                    ));
+                }
                 ComparisonClass::Inconclusive
                 | ComparisonClass::Improvement
                 | ComparisonClass::MissingBaseline => {}
@@ -864,6 +875,7 @@ fn push_comparison_issues(
     }
     push_issue_group(groups, regressions);
     push_issue_group(groups, improvements);
+    push_issue_group(groups, semantic_changes);
 }
 
 fn push_allocation_issue(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSummary]) {
@@ -1390,8 +1402,14 @@ fn comparison_by_benchmark(run: &StressRun) -> BTreeMap<&str, &ComparisonResult>
 
 fn format_delta_cell(comparison: &ComparisonResult) -> String {
     let Some(change) = comparison.change_percent else {
+        if comparison.reason.is_some() {
+            return "semantic change".to_string();
+        }
         return "-".to_string();
     };
+    if comparison.reason.is_some() {
+        return format!("{change:+.1}% semantic change");
+    }
     if !comparison_is_trustworthy(comparison) {
         return format!("{change:+.1}% noisy");
     }
@@ -2360,6 +2378,7 @@ mod tests {
             threshold: 0.05,
             confidence_intervals_overlap: Some(false),
             classification: ComparisonClass::Regression,
+            reason: None,
         }];
 
         let report = format_markdown_report(&run);
@@ -2401,6 +2420,7 @@ mod tests {
             threshold: 0.05,
             confidence_intervals_overlap: Some(false),
             classification: ComparisonClass::Regression,
+            reason: None,
         }];
 
         let report = format_console_output(&run);
@@ -2436,6 +2456,7 @@ mod tests {
                 threshold: 0.05,
                 confidence_intervals_overlap: Some(false),
                 classification: ComparisonClass::Regression,
+                reason: None,
             },
             ComparisonResult {
                 benchmark_id: "improved".to_string(),
@@ -2448,6 +2469,7 @@ mod tests {
                 threshold: 0.05,
                 confidence_intervals_overlap: Some(false),
                 classification: ComparisonClass::Improvement,
+                reason: None,
             },
         ];
 

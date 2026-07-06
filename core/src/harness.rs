@@ -674,33 +674,122 @@ fn run_with_resolved_config(resolved: ResolvedStressConfig) {
     }
 }
 
-fn empty_selection_error(resolved: &ResolvedStressConfig) -> &'static str {
-    if resolved.workload.is_some() {
-        "No benchmarks matched the workload pattern"
+fn empty_selection_error(resolved: &ResolvedStressConfig) -> String {
+    if let Some(workload) = &resolved.workload {
+        let suggestions = workload_suggestions_for_entries(workload, candidate_entries(resolved));
+        if suggestions.is_empty() {
+            format!("No benchmarks matched workload pattern '{workload}'")
+        } else {
+            format!(
+                "No benchmarks matched workload pattern '{workload}'. Did you mean: {}?",
+                suggestions.join(", ")
+            )
+        }
     } else {
-        "No benchmarks registered. Add #[stress] to benchmark functions."
+        "No benchmarks registered. Add #[stress] to benchmark functions.".to_string()
     }
 }
 
 fn selected_benchmarks(resolved: &ResolvedStressConfig) -> Vec<&'static BenchmarkEntry> {
-    STRESS_BENCHMARKS
-        .iter()
+    candidate_entries(resolved)
         .filter(|entry| {
-            if entry.ignored && !resolved.include_ignored {
-                return false;
-            }
-            if let Some(tier) = resolved.config.tier {
-                if entry.tier != tier {
-                    return false;
-                }
-            }
             if let Some(pattern) = &resolved.workload {
-                matches_glob(entry.name, pattern) || matches_glob(entry.module_path, pattern)
+                entry_matches_workload(entry, pattern)
             } else {
                 true
             }
         })
         .collect()
+}
+
+fn candidate_entries(
+    resolved: &ResolvedStressConfig,
+) -> impl Iterator<Item = &'static BenchmarkEntry> + '_ {
+    STRESS_BENCHMARKS.iter().filter(|entry| {
+        if entry.ignored && !resolved.include_ignored {
+            return false;
+        }
+        if let Some(tier) = resolved.config.tier {
+            if entry.tier != tier {
+                return false;
+            }
+        }
+        true
+    })
+}
+
+fn entry_matches_workload(entry: &BenchmarkEntry, pattern: &str) -> bool {
+    workload_candidates(entry)
+        .iter()
+        .any(|candidate| matches_glob(candidate, pattern))
+}
+
+fn workload_candidates(entry: &BenchmarkEntry) -> Vec<String> {
+    let mut candidates = vec![
+        entry.name.to_string(),
+        entry.function_name.to_string(),
+        entry.module_path.to_string(),
+        format!("{}::{}", entry.module_path, entry.function_name),
+        format!("{}::{}", entry.module_path, entry.name),
+    ];
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn workload_suggestions_for_entries<'a>(
+    pattern: &str,
+    entries: impl IntoIterator<Item = &'a BenchmarkEntry>,
+) -> Vec<String> {
+    let normalized_pattern = normalize_workload_pattern(pattern);
+    if normalized_pattern.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scored = entries
+        .into_iter()
+        .flat_map(workload_candidates)
+        .map(|candidate| {
+            let score = levenshtein_distance(&normalized_pattern, &candidate.to_lowercase());
+            (score, candidate)
+        })
+        .filter(|(score, candidate)| {
+            let threshold = normalized_pattern.len().max(candidate.len()) / 2;
+            *score <= threshold.max(3)
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    scored.dedup_by(|left, right| left.1 == right.1);
+    scored
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .take(5)
+        .collect()
+}
+
+fn normalize_workload_pattern(pattern: &str) -> String {
+    pattern
+        .chars()
+        .filter(|char| *char != '*')
+        .collect::<String>()
+        .to_lowercase()
+}
+
+fn levenshtein_distance(left: &str, right: &str) -> usize {
+    let right_chars = right.chars().collect::<Vec<_>>();
+    let mut costs = (0..=right_chars.len()).collect::<Vec<_>>();
+    for (left_index, left_char) in left.chars().enumerate() {
+        let mut previous_diagonal = left_index;
+        costs[0] = left_index + 1;
+        for (right_index, right_char) in right_chars.iter().enumerate() {
+            let substitution = previous_diagonal + usize::from(left_char != *right_char);
+            previous_diagonal = costs[right_index + 1];
+            costs[right_index + 1] = (costs[right_index] + 1)
+                .min(costs[right_index + 1] + 1)
+                .min(substitution);
+        }
+    }
+    costs[right_chars.len()]
 }
 
 fn print_benchmark_list() {
@@ -970,6 +1059,48 @@ mod tests {
         assert!(!matches_glob("foo_bar_baz", "qux*"));
     }
 
+    fn noop(_: &mut StressContext) {}
+
+    fn benchmark_entry() -> BenchmarkEntry {
+        BenchmarkEntry {
+            name: "Header Parse",
+            function_name: "parse_header",
+            func: noop,
+            ignored: false,
+            module_path: "parser::hot_path",
+            tier: 1,
+            mode: BenchmarkModeKind::Micro,
+            budgets: BenchmarkBudgets::default(),
+            metadata: &[],
+        }
+    }
+
+    #[test]
+    fn workload_matching_uses_rust_function_and_qualified_names() {
+        let entry = benchmark_entry();
+
+        assert!(entry_matches_workload(&entry, "parse_header"));
+        assert!(entry_matches_workload(&entry, "parser::hot_path"));
+        assert!(entry_matches_workload(
+            &entry,
+            "parser::hot_path::parse_header"
+        ));
+        assert!(entry_matches_workload(
+            &entry,
+            "parser::hot_path::Header Parse"
+        ));
+        assert!(entry_matches_workload(&entry, "header parse"));
+        assert!(!entry_matches_workload(&entry, "serializer"));
+    }
+
+    #[test]
+    fn workload_suggestions_include_registered_candidates() {
+        let entry = benchmark_entry();
+        let suggestions = workload_suggestions_for_entries("parse_headr", [&entry]);
+
+        assert!(suggestions.iter().any(|item| item == "parse_header"));
+    }
+
     #[test]
     fn parse_args_uses_new_sample_names() {
         let args = vec![
@@ -1141,7 +1272,7 @@ mod tests {
         assert!(selected_benchmarks(&resolved).is_empty());
         assert_eq!(
             empty_selection_error(&resolved),
-            "No benchmarks matched the workload pattern"
+            "No benchmarks matched workload pattern 'definitely_no_such_benchmark'"
         );
     }
 

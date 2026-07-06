@@ -432,12 +432,14 @@ fn run_stress(args: &StressArgs) -> Result<()> {
     }
 
     // Step 4: Run stress binaries
+    let run_id = shared_run_id();
     let results = run_stress_binaries(
         &stress_files,
         args,
         &temp_target_dir,
         verbosity,
         passthrough_json,
+        &run_id,
     )?;
 
     // Step 5: Report results
@@ -657,6 +659,7 @@ fn run_stress_binaries(
     target_dir_parent: &Path,
     verbosity: Verbosity,
     passthrough_json: bool,
+    run_id: &str,
 ) -> Result<Vec<StressRunResult>> {
     let target_dir = target_dir_parent.join(if args.dev { "debug" } else { "release" });
 
@@ -680,7 +683,7 @@ fn run_stress_binaries(
             continue;
         }
 
-        let result = run_single_binary(file, &binary_path, args, passthrough_json)?;
+        let result = run_single_binary(file, &binary_path, args, passthrough_json, run_id)?;
 
         let failed = !result.success();
         results.push(result);
@@ -700,8 +703,10 @@ fn run_single_binary(
     binary_path: &Path,
     args: &StressArgs,
     passthrough_json: bool,
+    run_id: &str,
 ) -> Result<StressRunResult> {
     let mut cmd = Command::new(binary_path);
+    apply_run_id_env(&mut cmd, run_id);
 
     // Pass through all relevant arguments to the stress binary
     // These are handled by the stress_main!() macro via clap parsing
@@ -736,6 +741,25 @@ fn run_single_binary(
     };
 
     Ok(output)
+}
+
+fn shared_run_id() -> String {
+    std::env::var("STRESS_RUN_ID")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(generate_run_id)
+}
+
+fn generate_run_id() -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!("stress-{millis}-{}", std::process::id())
+}
+
+fn apply_run_id_env(cmd: &mut Command, run_id: &str) {
+    cmd.env("STRESS_RUN_ID", run_id);
 }
 
 /// Build arguments to pass through to the stress binary.
@@ -996,6 +1020,17 @@ mod tests {
             no_build: false,
             no_fail_fast: false,
         }
+    }
+
+    #[test]
+    fn applies_shared_run_id_to_child_command() {
+        let mut cmd = Command::new("stress-child");
+
+        apply_run_id_env(&mut cmd, "shared-run");
+
+        assert!(cmd.get_envs().any(|(key, value)| {
+            key == "STRESS_RUN_ID" && value == Some(std::ffi::OsStr::new("shared-run"))
+        }));
     }
 
     #[cfg(unix)]
