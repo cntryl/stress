@@ -141,6 +141,14 @@ struct StressArgs {
     #[arg(long)]
     output_dir: Option<PathBuf>,
 
+    /// Human console benchmark-name mode: compact or full
+    #[arg(long)]
+    names: Option<String>,
+
+    /// Disable stderr progress from child stress binaries
+    #[arg(long)]
+    no_progress: bool,
+
     // ========================================================================
     // Regression Detection
     // ========================================================================
@@ -148,9 +156,25 @@ struct StressArgs {
     #[arg(long)]
     baseline: Option<PathBuf>,
 
+    /// Baseline directory for latest/save conventions
+    #[arg(long)]
+    baseline_dir: Option<PathBuf>,
+
+    /// Save passed runs as baselines
+    #[arg(long)]
+    save_baseline: bool,
+
     /// Regression threshold percentage (falls back to `STRESS_THRESHOLD`, then 5%)
     #[arg(long)]
     threshold: Option<f64>,
+
+    /// Fail on warning-or-error diagnostics
+    #[arg(long)]
+    fail_on_issues: bool,
+
+    /// Fail on diagnostics at info, warning, or error
+    #[arg(long)]
+    deny_diagnostics: Option<String>,
 
     // ========================================================================
     // Build Options
@@ -765,14 +789,38 @@ fn build_passthrough_args(cmd: &mut Command, args: &StressArgs, passthrough_json
         cmd.arg("--output-dir").arg(dir);
     }
 
+    if let Some(ref names) = args.names {
+        cmd.arg("--names").arg(names);
+    }
+
+    if args.no_progress {
+        cmd.arg("--no-progress");
+    }
+
     // Baseline comparison
     if let Some(ref baseline) = args.baseline {
         cmd.arg("--baseline").arg(baseline);
     }
 
+    if let Some(ref baseline_dir) = args.baseline_dir {
+        cmd.arg("--baseline-dir").arg(baseline_dir);
+    }
+
+    if args.save_baseline {
+        cmd.arg("--save-baseline");
+    }
+
     // Threshold
     if let Some(threshold) = args.threshold {
         cmd.arg("--threshold").arg(threshold.to_string());
+    }
+
+    if args.fail_on_issues {
+        cmd.arg("--fail-on-issues");
+    }
+
+    if let Some(ref deny_diagnostics) = args.deny_diagnostics {
+        cmd.arg("--deny-diagnostics").arg(deny_diagnostics);
     }
 }
 
@@ -892,9 +940,9 @@ fn report_child_failures(results: &[StressRunResult]) {
 mod tests {
     use super::*;
     use cntryl_stress::artifact::{
-        BenchmarkBudgets, BenchmarkMode, BenchmarkSpec, BenchmarkSummary, CorrectnessCounters,
-        CorrectnessSummary, EnvironmentInfo, MeasurementIntent, PrimaryMetric, ProfileConfig,
-        QualityClass, RunProfile, Sample, SamplePhase, SummaryStats, SCHEMA_VERSION,
+        BenchmarkBudgets, BenchmarkMode, BenchmarkSpec, BenchmarkSummary, ConsoleNameMode,
+        CorrectnessCounters, CorrectnessSummary, EnvironmentInfo, MeasurementIntent, PrimaryMetric,
+        ProfileConfig, QualityClass, RunProfile, Sample, SamplePhase, SummaryStats, SCHEMA_VERSION,
     };
     use std::collections::BTreeMap;
 
@@ -915,6 +963,38 @@ mod tests {
             stderr: String::new(),
             run: Some(run),
             parse_error: None,
+        }
+    }
+
+    fn stress_args() -> StressArgs {
+        StressArgs {
+            workload: None,
+            include_ignored: false,
+            list: false,
+            print_config: false,
+            bin: None,
+            profile: None,
+            tier: None,
+            samples: None,
+            warmup_samples: None,
+            cooldown_samples: None,
+            quiet: false,
+            json: false,
+            output_dir: None,
+            names: None,
+            no_progress: false,
+            baseline: None,
+            baseline_dir: None,
+            save_baseline: false,
+            threshold: None,
+            fail_on_issues: false,
+            deny_diagnostics: None,
+            dev: false,
+            cargo_args: None,
+            package: None,
+            manifest_path: None,
+            no_build: false,
+            no_fail_fast: false,
         }
     }
 
@@ -975,11 +1055,14 @@ mod tests {
             min_quality: QualityClass::Acceptable,
             fail_on_quality: true,
             fail_on_regression: true,
+            deny_diagnostics: None,
             regression_threshold: 0.05,
             sample_duration: Duration::from_secs(1),
             operations_per_sample: 1,
             micro_sample_duration: Duration::from_millis(100),
             report_depth: "gated".to_string(),
+            console_names: ConsoleNameMode::Compact,
+            progress: true,
         };
         StressRun {
             schema_version: SCHEMA_VERSION.to_string(),
@@ -1031,6 +1114,7 @@ mod tests {
             }],
             summaries,
             comparisons: Vec::new(),
+            diagnostics_summary: Vec::new(),
             started_at: "123".to_string(),
             total_elapsed_ns: 1_000,
             metadata: BTreeMap::new(),
@@ -1100,5 +1184,43 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].suite, "suite-a");
         assert_eq!(parsed[1].suite, "suite-b");
+    }
+
+    #[test]
+    fn cargo_stress_passes_new_flags_to_child_binaries() {
+        let stress_cli_args = StressArgs {
+            names: Some("full".to_string()),
+            no_progress: true,
+            baseline: Some(PathBuf::from("latest")),
+            baseline_dir: Some(PathBuf::from("target/custom-baselines")),
+            save_baseline: true,
+            fail_on_issues: true,
+            deny_diagnostics: Some("error".to_string()),
+            ..stress_args()
+        };
+        let mut cmd = Command::new("stress-child");
+
+        build_passthrough_args(&mut cmd, &stress_cli_args, true);
+
+        let child_args = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(child_args
+            .windows(2)
+            .any(|window| window[0] == "--names" && window[1] == "full"));
+        assert!(child_args.contains(&"--no-progress".to_string()));
+        assert!(child_args
+            .windows(2)
+            .any(|window| window[0] == "--baseline" && window[1] == "latest"));
+        assert!(child_args
+            .windows(2)
+            .any(|window| window[0] == "--baseline-dir" && window[1] == "target/custom-baselines"));
+        assert!(child_args.contains(&"--save-baseline".to_string()));
+        assert!(child_args.contains(&"--fail-on-issues".to_string()));
+        assert!(child_args
+            .windows(2)
+            .any(|window| window[0] == "--deny-diagnostics" && window[1] == "error"));
+        assert!(child_args.contains(&"--json".to_string()));
     }
 }

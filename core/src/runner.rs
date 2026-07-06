@@ -1,13 +1,16 @@
 //! Stress runner that records raw samples and derives current artifacts.
 
 use crate::artifact::{
-    attach_regression_diagnostics, compare_summaries, summarize_benchmark, BenchmarkModeKind,
-    BenchmarkSpec, ComparisonClass, EnvironmentInfo, MeasurementIntent, Sample, SamplePhase,
-    StressRun, MAX_TIER, SCHEMA_VERSION,
+    attach_regression_diagnostics, compare_summaries, diagnostic_summary_for_run,
+    summarize_benchmark, BenchmarkModeKind, BenchmarkSpec, ComparisonClass, EnvironmentInfo,
+    MeasurementIntent, Sample, SamplePhase, StressRun, MAX_TIER, SCHEMA_VERSION,
 };
 use crate::config::StressRunnerConfig;
 use crate::context::{MeasurementRecord, StressContext};
-use crate::reporting::{ConsoleReporter, JsonReporter, JsonStdoutReporter, Reporter};
+use crate::reporting::{
+    ConsoleReporter, JsonReporter, JsonStdoutReporter, Reporter, SampleProgress,
+    StderrProgressReporter,
+};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
@@ -76,6 +79,9 @@ impl StressRunner {
             reporters.insert(0, Box::new(JsonStdoutReporter::new()));
         } else {
             reporters.insert(0, Box::new(ConsoleReporter::new()));
+            if config.progress {
+                reporters.push(Box::new(StderrProgressReporter::new()));
+            }
         }
 
         let runner = Self {
@@ -161,6 +167,10 @@ impl StressRunner {
             return;
         }
 
+        for reporter in &self.reporters {
+            reporter.bench_start(spec);
+        }
+
         let start_sample = self.samples.len();
         let mut derived_specs = BTreeMap::<String, BenchmarkSpec>::new();
         let mut spec_order = Vec::<String>::new();
@@ -231,6 +241,7 @@ impl StressRunner {
 
     fn finish_inner(mut self, comparisons: Vec<crate::artifact::ComparisonResult>) -> StressRun {
         attach_regression_diagnostics(&mut self.summaries, &comparisons);
+        let diagnostics_summary = diagnostic_summary_for_run(&self.suite, &self.summaries);
         let run = StressRun {
             schema_version: SCHEMA_VERSION.to_string(),
             tool_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -241,6 +252,7 @@ impl StressRunner {
             samples: self.samples,
             summaries: self.summaries,
             comparisons,
+            diagnostics_summary,
             started_at: chrono_timestamp(),
             total_elapsed_ns: self.suite_start.elapsed().as_nanos(),
             metadata: self.metadata,
@@ -301,6 +313,9 @@ impl StressRunner {
                     derived_specs,
                     spec_order,
                 );
+                let progress_name = derived_specs
+                    .get(&benchmark_id)
+                    .map_or_else(|| record.name.clone(), |spec| spec.name.clone());
                 let current_count = counts.entry(benchmark_id.clone()).or_default();
                 if *current_count >= target {
                     continue;
@@ -319,6 +334,14 @@ impl StressRunner {
                 );
                 self.samples.push(sample);
                 *current_count += 1;
+                self.emit_sample_progress(
+                    &benchmark_id,
+                    &progress_name,
+                    base_spec.tier,
+                    phase,
+                    *current_count,
+                    target,
+                );
                 if *current_count < target {
                     needs_more = true;
                 }
@@ -327,6 +350,28 @@ impl StressRunner {
             if !needs_more {
                 break;
             }
+        }
+    }
+
+    fn emit_sample_progress(
+        &self,
+        benchmark_id: &str,
+        name: &str,
+        tier: u32,
+        phase: SamplePhase,
+        completed_samples: usize,
+        target_samples: usize,
+    ) {
+        let progress = SampleProgress {
+            benchmark_id: benchmark_id.to_string(),
+            name: name.to_string(),
+            tier,
+            phase,
+            completed_samples,
+            target_samples,
+        };
+        for reporter in &self.reporters {
+            reporter.sample_progress(&progress);
         }
     }
 
@@ -549,6 +594,8 @@ pub enum RunGate {
     QualityFailed,
     /// Meaningful regression policy failed.
     RegressionFailed,
+    /// Strict diagnostic policy failed.
+    DiagnosticsFailed,
     /// At least one configured benchmark budget failed.
     BudgetFailed,
 }
@@ -563,9 +610,6 @@ pub fn evaluate_run_gate(run: &StressRun) -> RunGate {
         return RunGate::BudgetFailed;
     }
     let profile_config = &run.environment.profile_config;
-    if profile_config.fail_on_quality && !run.meets_min_quality(profile_config.min_quality) {
-        return RunGate::QualityFailed;
-    }
     if profile_config.fail_on_regression
         && run
             .comparisons
@@ -574,6 +618,15 @@ pub fn evaluate_run_gate(run: &StressRun) -> RunGate {
     {
         return RunGate::RegressionFailed;
     }
+    if profile_config
+        .deny_diagnostics
+        .is_some_and(|threshold| !run.diagnostics_passed(threshold))
+    {
+        return RunGate::DiagnosticsFailed;
+    }
+    if profile_config.fail_on_quality && !run.meets_min_quality(profile_config.min_quality) {
+        return RunGate::QualityFailed;
+    }
     RunGate::Passed
 }
 
@@ -581,8 +634,8 @@ pub fn evaluate_run_gate(run: &StressRun) -> RunGate {
 mod tests {
     use super::*;
     use crate::artifact::{
-        BenchmarkBudgets, BenchmarkMode, BenchmarkModeKind, CorrectnessCounters, PrimaryMetric,
-        RunProfile,
+        BenchmarkBudgets, BenchmarkMode, BenchmarkModeKind, ComparisonClass, ComparisonResult,
+        CorrectnessCounters, DiagnosticSeverity, PrimaryMetric, QualityClass, RunProfile,
     };
     use std::time::Duration;
 
@@ -709,6 +762,136 @@ mod tests {
         let run = runner.finish();
 
         assert_eq!(evaluate_run_gate(&run), RunGate::QualityFailed);
+    }
+
+    fn warning_diagnostic_run(threshold: Option<DiagnosticSeverity>) -> StressRun {
+        let mut config = StressRunnerConfig::new()
+            .samples(2)
+            .warmup_samples(0)
+            .cooldown_samples(0);
+        config.deny_diagnostics = threshold;
+        let mut runner = StressRunner::with_config("suite", config);
+        runner.reporters(Vec::new());
+
+        runner.run("bench", |ctx| {
+            ctx.parameter("clients", 4);
+            ctx.measure("work", || std::hint::black_box(1_u64));
+        });
+        runner.finish()
+    }
+
+    #[test]
+    fn strict_diagnostics_gate_uses_configured_threshold() {
+        assert_eq!(
+            evaluate_run_gate(&warning_diagnostic_run(None)),
+            RunGate::Passed
+        );
+        assert_eq!(
+            evaluate_run_gate(&warning_diagnostic_run(Some(DiagnosticSeverity::Info))),
+            RunGate::DiagnosticsFailed
+        );
+        assert_eq!(
+            evaluate_run_gate(&warning_diagnostic_run(Some(DiagnosticSeverity::Warning))),
+            RunGate::DiagnosticsFailed
+        );
+        assert_eq!(
+            evaluate_run_gate(&warning_diagnostic_run(Some(DiagnosticSeverity::Error))),
+            RunGate::Passed
+        );
+    }
+
+    #[test]
+    fn diagnostics_summary_mirrors_summary_diagnostics() {
+        let run = warning_diagnostic_run(None);
+        let summary = &run.summaries[0];
+
+        assert_eq!(run.diagnostics_summary.len(), summary.diagnostics.len());
+        assert!(run.diagnostics_summary.iter().any(|diagnostic| {
+            diagnostic.suite == "suite"
+                && diagnostic.benchmark_id == summary.benchmark_id
+                && diagnostic.name == summary.name
+                && diagnostic.tier == summary.tier
+                && diagnostic.quality == summary.quality
+                && diagnostic.parameters.get("clients") == Some(&"4".to_string())
+                && diagnostic.code == "too_few_samples"
+        }));
+    }
+
+    fn external_throughput_runner(completed_operations: u64) -> StressRunner {
+        let config = StressRunnerConfig::new()
+            .samples(10)
+            .warmup_samples(0)
+            .cooldown_samples(0);
+        let mut runner = StressRunner::with_config("suite", config);
+        runner.reporters(Vec::new());
+        runner.run("bench", |ctx| {
+            ctx.record_external("work", Duration::from_millis(10), completed_operations);
+        });
+        runner
+    }
+
+    #[test]
+    fn diagnostics_summary_includes_regression_diagnostics() {
+        let baseline = external_throughput_runner(1_000).finish();
+        let baseline_path = unique_temp_path("stress-baseline-regression.json");
+        std::fs::write(
+            &baseline_path,
+            serde_json::to_string(&baseline).expect("serialize baseline"),
+        )
+        .expect("write baseline");
+
+        let run = external_throughput_runner(100)
+            .finish_with_baseline(&baseline_path)
+            .expect("finish with baseline");
+
+        assert!(run
+            .comparisons
+            .iter()
+            .any(|comparison| comparison.classification == ComparisonClass::Regression));
+        assert!(run
+            .summaries
+            .iter()
+            .flat_map(|summary| &summary.diagnostics)
+            .any(|diagnostic| diagnostic.code == "regression"));
+        assert!(run
+            .diagnostics_summary
+            .iter()
+            .any(|diagnostic| diagnostic.code == "regression"
+                && diagnostic.severity == DiagnosticSeverity::Error));
+
+        let _ = std::fs::remove_file(&baseline_path);
+    }
+
+    fn unique_temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "{}-{}-{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn regression_gate_precedes_diagnostics_gate() {
+        let mut run = warning_diagnostic_run(Some(DiagnosticSeverity::Warning));
+        run.environment.profile_config.fail_on_regression = true;
+        run.comparisons.push(ComparisonResult {
+            benchmark_id: run.summaries[0].benchmark_id.clone(),
+            current_quality: QualityClass::Acceptable,
+            baseline_quality: Some(QualityClass::Acceptable),
+            primary_metric: PrimaryMetric::Throughput,
+            baseline_value: Some(100.0),
+            current_value: Some(50.0),
+            change_percent: Some(-50.0),
+            threshold: 0.05,
+            confidence_intervals_overlap: Some(false),
+            classification: ComparisonClass::Regression,
+        });
+
+        assert_eq!(evaluate_run_gate(&run), RunGate::RegressionFailed);
     }
 
     #[test]
@@ -915,6 +1098,10 @@ mod tests {
                     .reason
                     .as_deref()
                     .is_some_and(|reason| reason.contains("exceeds"))));
+        assert!(failing
+            .diagnostics_summary
+            .iter()
+            .any(|diagnostic| diagnostic.code == "budget_failure"));
         assert_eq!(evaluate_run_gate(&failing), RunGate::BudgetFailed);
     }
 

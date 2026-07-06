@@ -1,7 +1,8 @@
 //! Configuration and profile resolution for stress runs.
 
 use crate::artifact::{
-    BenchmarkMode, BenchmarkModeKind, ProfileConfig, QualityClass, RunProfile, MAX_TIER,
+    BenchmarkMode, BenchmarkModeKind, ConsoleNameMode, DiagnosticSeverity, ProfileConfig,
+    QualityClass, RunProfile, MAX_TIER,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -26,6 +27,7 @@ impl EnvConfigResolution {
 
 /// Configuration for one stress suite run.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct StressRunnerConfig {
     /// Selected run profile.
     pub profile: RunProfile,
@@ -59,10 +61,16 @@ pub struct StressRunnerConfig {
     pub fail_on_quality: bool,
     /// Whether meaningful regressions fail the run.
     pub fail_on_regression: bool,
+    /// Optional strict diagnostic gate threshold.
+    pub deny_diagnostics: Option<DiagnosticSeverity>,
     /// Regression/improvement threshold.
     pub threshold: f64,
     /// Human-readable report depth label.
     pub report_depth: String,
+    /// Human console benchmark-name mode.
+    pub console_names: ConsoleNameMode,
+    /// Whether human runs emit stderr progress.
+    pub progress: bool,
 }
 
 impl Default for StressRunnerConfig {
@@ -90,11 +98,14 @@ impl StressRunnerConfig {
                 min_quality: QualityClass::Noisy,
                 fail_on_quality: false,
                 fail_on_regression: false,
+                deny_diagnostics: None,
                 regression_threshold: 0.05,
                 sample_duration: Duration::from_millis(500),
                 operations_per_sample: 1,
                 micro_sample_duration: Duration::from_millis(25),
                 report_depth: "default".to_string(),
+                console_names: ConsoleNameMode::Compact,
+                progress: true,
             },
             RunProfile::Smoke => ProfileConfig {
                 profile,
@@ -104,11 +115,14 @@ impl StressRunnerConfig {
                 min_quality: QualityClass::Untrustworthy,
                 fail_on_quality: false,
                 fail_on_regression: false,
+                deny_diagnostics: None,
                 regression_threshold: 0.05,
                 sample_duration: Duration::from_millis(10),
                 operations_per_sample: 1,
                 micro_sample_duration: Duration::from_millis(5),
                 report_depth: "summary".to_string(),
+                console_names: ConsoleNameMode::Compact,
+                progress: true,
             },
             RunProfile::Release => ProfileConfig {
                 profile,
@@ -118,11 +132,14 @@ impl StressRunnerConfig {
                 min_quality: QualityClass::Acceptable,
                 fail_on_quality: true,
                 fail_on_regression: true,
+                deny_diagnostics: None,
                 regression_threshold: 0.05,
                 sample_duration: Duration::from_secs(1),
                 operations_per_sample: 1,
                 micro_sample_duration: Duration::from_millis(100),
                 report_depth: "gated".to_string(),
+                console_names: ConsoleNameMode::Compact,
+                progress: true,
             },
             RunProfile::Lab => ProfileConfig {
                 profile,
@@ -132,11 +149,14 @@ impl StressRunnerConfig {
                 min_quality: QualityClass::Noisy,
                 fail_on_quality: false,
                 fail_on_regression: false,
+                deny_diagnostics: None,
                 regression_threshold: 0.05,
                 sample_duration: Duration::from_secs(5),
                 operations_per_sample: 1,
                 micro_sample_duration: Duration::from_millis(200),
                 report_depth: "deep".to_string(),
+                console_names: ConsoleNameMode::Compact,
+                progress: true,
             },
         };
         Self::from_profile_config(profile_config)
@@ -160,8 +180,11 @@ impl StressRunnerConfig {
             min_quality: profile_config.min_quality,
             fail_on_quality: profile_config.fail_on_quality,
             fail_on_regression: profile_config.fail_on_regression,
+            deny_diagnostics: profile_config.deny_diagnostics,
             threshold: profile_config.regression_threshold,
             report_depth: profile_config.report_depth,
+            console_names: profile_config.console_names,
+            progress: profile_config.progress,
         }
     }
 
@@ -244,11 +267,14 @@ impl StressRunnerConfig {
             min_quality: self.min_quality,
             fail_on_quality: self.fail_on_quality,
             fail_on_regression: self.fail_on_regression,
+            deny_diagnostics: self.deny_diagnostics,
             regression_threshold: self.threshold,
             sample_duration: self.sample_duration,
             operations_per_sample: self.operations_per_sample,
             micro_sample_duration: self.micro_sample_duration,
             report_depth: self.report_depth.clone(),
+            console_names: self.console_names,
+            progress: self.progress,
         }
     }
 
@@ -284,6 +310,9 @@ impl StressRunnerConfig {
         next.tier = self.tier;
         next.git_sha = self.git_sha;
         next.timeout = self.timeout;
+        next.deny_diagnostics = self.deny_diagnostics;
+        next.console_names = self.console_names;
+        next.progress = self.progress;
         next
     }
 
@@ -391,6 +420,45 @@ impl StressRunnerConfig {
         self.threshold = value;
         self
     }
+
+    /// Set strict diagnostic gate threshold.
+    #[must_use]
+    pub const fn deny_diagnostics(mut self, threshold: DiagnosticSeverity) -> Self {
+        self.deny_diagnostics = Some(threshold);
+        self
+    }
+
+    /// Clear strict diagnostic gating.
+    #[must_use]
+    pub const fn allow_diagnostics(mut self) -> Self {
+        self.deny_diagnostics = None;
+        self
+    }
+
+    /// Alias for denying warning-or-higher diagnostics.
+    #[must_use]
+    pub const fn fail_on_issues(mut self, value: bool) -> Self {
+        self.deny_diagnostics = if value {
+            Some(DiagnosticSeverity::Warning)
+        } else {
+            None
+        };
+        self
+    }
+
+    /// Set human console benchmark-name mode.
+    #[must_use]
+    pub const fn console_names(mut self, mode: ConsoleNameMode) -> Self {
+        self.console_names = mode;
+        self
+    }
+
+    /// Set whether human runs emit stderr progress.
+    #[must_use]
+    pub const fn progress(mut self, value: bool) -> Self {
+        self.progress = value;
+        self
+    }
 }
 
 fn resolve_profile<F>(
@@ -425,6 +493,7 @@ where
     apply_sample_env_overrides(get_var, resolution);
     apply_selection_env_overrides(get_var, resolution);
     apply_execution_env_overrides(get_var, resolution);
+    apply_diagnostic_env_overrides(get_var, resolution);
 }
 
 fn apply_sample_env_overrides<F>(get_var: &F, resolution: &mut EnvConfigResolution)
@@ -501,6 +570,22 @@ where
         |value| value.parse::<u32>().ok(),
         |config, value| config.tier = Some(value),
     );
+    parse_env(
+        &get_var,
+        resolution,
+        "STRESS_CONSOLE_NAMES",
+        "console_names",
+        |value| value.parse::<ConsoleNameMode>().ok(),
+        |config, value| config.console_names = value,
+    );
+    parse_env(
+        &get_var,
+        resolution,
+        "STRESS_PROGRESS",
+        "progress",
+        parse_bool_env,
+        |config, value| config.progress = value,
+    );
 }
 
 fn apply_execution_env_overrides<F>(get_var: &F, resolution: &mut EnvConfigResolution)
@@ -549,6 +634,48 @@ where
     );
 }
 
+fn apply_diagnostic_env_overrides<F>(get_var: &F, resolution: &mut EnvConfigResolution)
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(value) = get_var("STRESS_FAIL_ON_ISSUES") {
+        match parse_bool_env(&value) {
+            Some(true) => {
+                resolution.config.deny_diagnostics = Some(DiagnosticSeverity::Warning);
+                resolution.metadata.insert(
+                    "deny_diagnostics_src".to_string(),
+                    "env STRESS_FAIL_ON_ISSUES".to_string(),
+                );
+            }
+            Some(false) => {
+                resolution.config.deny_diagnostics = None;
+                resolution.metadata.insert(
+                    "deny_diagnostics_src".to_string(),
+                    "env STRESS_FAIL_ON_ISSUES".to_string(),
+                );
+            }
+            None => resolution
+                .warnings
+                .push("invalid STRESS_FAIL_ON_ISSUES, using profile/default value".to_string()),
+        }
+    }
+
+    if let Some(value) = get_var("STRESS_DENY_DIAGNOSTICS") {
+        match value.parse::<DiagnosticSeverity>() {
+            Ok(threshold) => {
+                resolution.config.deny_diagnostics = Some(threshold);
+                resolution.metadata.insert(
+                    "deny_diagnostics_src".to_string(),
+                    "env STRESS_DENY_DIAGNOSTICS".to_string(),
+                );
+            }
+            Err(_) => resolution
+                .warnings
+                .push("invalid STRESS_DENY_DIAGNOSTICS, using profile/default value".to_string()),
+        }
+    }
+}
+
 fn parse_env<F, T, P, A>(
     get_var: &F,
     resolution: &mut EnvConfigResolution,
@@ -588,6 +715,9 @@ fn apply_default_sources(metadata: &mut HashMap<String, String>) {
         "filter_src",
         "tier_src",
         "git_sha_src",
+        "deny_diagnostics_src",
+        "console_names_src",
+        "progress_src",
         "timeout_secs_src",
         "sample_duration_src",
         "operations_per_sample_src",

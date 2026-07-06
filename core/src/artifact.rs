@@ -276,6 +276,79 @@ pub enum DiagnosticSeverity {
     Error,
 }
 
+impl DiagnosticSeverity {
+    /// Return the severity ordering used by strict diagnostic gates.
+    #[must_use]
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Info => 0,
+            Self::Warning => 1,
+            Self::Error => 2,
+        }
+    }
+
+    /// Return whether this severity is at or above `threshold`.
+    #[must_use]
+    pub const fn at_least(self, threshold: Self) -> bool {
+        self.rank() >= threshold.rank()
+    }
+}
+
+impl fmt::Display for DiagnosticSeverity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Info => f.write_str("info"),
+            Self::Warning => f.write_str("warning"),
+            Self::Error => f.write_str("error"),
+        }
+    }
+}
+
+impl std::str::FromStr for DiagnosticSeverity {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "info" => Ok(Self::Info),
+            "warning" => Ok(Self::Warning),
+            "error" => Ok(Self::Error),
+            other => Err(format!("unknown diagnostic severity '{other}'")),
+        }
+    }
+}
+
+/// Console benchmark-name presentation mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleNameMode {
+    /// Compact table names with suffix preservation and parameter hints.
+    #[default]
+    Compact,
+    /// Full names with a dynamically widened benchmark column.
+    Full,
+}
+
+impl fmt::Display for ConsoleNameMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Compact => f.write_str("compact"),
+            Self::Full => f.write_str("full"),
+        }
+    }
+}
+
+impl std::str::FromStr for ConsoleNameMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "compact" => Ok(Self::Compact),
+            "full" => Ok(Self::Full),
+            other => Err(format!("unknown console name mode '{other}'")),
+        }
+    }
+}
+
 /// Structured benchmark diagnostic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BenchmarkDiagnostic {
@@ -290,6 +363,34 @@ pub struct BenchmarkDiagnostic {
     pub evidence: BTreeMap<String, String>,
     /// Concrete next actions.
     pub suggestions: Vec<String>,
+}
+
+/// Query-friendly row in the run-level diagnostic ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticSummary {
+    /// Suite that emitted the diagnostic.
+    pub suite: String,
+    /// Stable benchmark id.
+    pub benchmark_id: String,
+    /// Display name.
+    pub name: String,
+    /// Numeric tier.
+    pub tier: u32,
+    /// Stable diagnostic code.
+    pub code: String,
+    /// Diagnostic severity.
+    pub severity: DiagnosticSeverity,
+    /// Human-readable reason.
+    pub reason: String,
+    /// Machine-readable evidence.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub evidence: BTreeMap<String, String>,
+    /// Concrete next actions.
+    pub suggestions: Vec<String>,
+    /// Summary quality for the row that emitted the diagnostic.
+    pub quality: QualityClass,
+    /// Structured parameters for the row that emitted the diagnostic.
+    pub parameters: BTreeMap<String, String>,
 }
 
 impl PrimaryMetric {
@@ -579,6 +680,9 @@ pub struct ProfileConfig {
     pub fail_on_quality: bool,
     /// Whether the profile fails on meaningful regressions.
     pub fail_on_regression: bool,
+    /// Optional strict diagnostic gate threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny_diagnostics: Option<DiagnosticSeverity>,
     /// Regression/improvement threshold.
     pub regression_threshold: f64,
     /// Default fixed-duration sample budget.
@@ -591,6 +695,12 @@ pub struct ProfileConfig {
     pub micro_sample_duration: Duration,
     /// Report depth label.
     pub report_depth: String,
+    /// Human console benchmark-name mode.
+    #[serde(default)]
+    pub console_names: ConsoleNameMode,
+    /// Whether human runs emit stderr progress.
+    #[serde(default = "default_progress")]
+    pub progress: bool,
 }
 
 impl Default for ProfileConfig {
@@ -603,13 +713,20 @@ impl Default for ProfileConfig {
             min_quality: QualityClass::Noisy,
             fail_on_quality: false,
             fail_on_regression: false,
+            deny_diagnostics: None,
             regression_threshold: 0.05,
             sample_duration: Duration::from_millis(500),
             operations_per_sample: 1,
             micro_sample_duration: Duration::from_millis(25),
             report_depth: "default".to_string(),
+            console_names: ConsoleNameMode::Compact,
+            progress: true,
         }
     }
+}
+
+const fn default_progress() -> bool {
+    true
 }
 
 /// Benchmark specification captured before samples are recorded.
@@ -866,6 +983,9 @@ pub struct StressRun {
     pub summaries: Vec<BenchmarkSummary>,
     /// Baseline comparisons, when requested.
     pub comparisons: Vec<ComparisonResult>,
+    /// Query-friendly ledger of all benchmark diagnostics.
+    #[serde(default)]
+    pub diagnostics_summary: Vec<DiagnosticSummary>,
     /// Timestamp/run id.
     pub started_at: String,
     /// Total elapsed wall-clock time in nanoseconds.
@@ -938,6 +1058,41 @@ impl StressRun {
                 .all(|budget_result| budget_result.passed)
         })
     }
+
+    /// Whether every diagnostic is below the configured strict threshold.
+    #[must_use]
+    pub fn diagnostics_passed(&self, threshold: DiagnosticSeverity) -> bool {
+        self.diagnostics_summary
+            .iter()
+            .all(|diagnostic| !diagnostic.severity.at_least(threshold))
+    }
+}
+
+pub(crate) fn diagnostic_summary_for_run(
+    suite: &str,
+    summaries: &[BenchmarkSummary],
+) -> Vec<DiagnosticSummary> {
+    summaries
+        .iter()
+        .flat_map(|summary| {
+            summary
+                .diagnostics
+                .iter()
+                .map(|diagnostic| DiagnosticSummary {
+                    suite: suite.to_string(),
+                    benchmark_id: summary.benchmark_id.clone(),
+                    name: summary.name.clone(),
+                    tier: summary.tier,
+                    code: diagnostic.code.clone(),
+                    severity: diagnostic.severity,
+                    reason: diagnostic.reason.clone(),
+                    evidence: diagnostic.evidence.clone(),
+                    suggestions: diagnostic.suggestions.clone(),
+                    quality: summary.quality,
+                    parameters: summary.parameters.clone(),
+                })
+        })
+        .collect()
 }
 
 /// Summarize one benchmark from raw samples.
@@ -989,6 +1144,7 @@ pub(crate) fn summarize_benchmark(spec: &BenchmarkSpec, samples: &[Sample]) -> B
         spec,
         samples: &measured,
         stats: stats.as_ref(),
+        wall_clock: wall_clock.as_ref(),
         ns_per_op: ns_per_op.as_ref(),
         overhead_ns_per_op: overhead_ns_per_op.as_ref(),
         allocs_per_op: allocs_per_op.as_ref(),
@@ -1356,6 +1512,7 @@ struct DiagnosticInputs<'a> {
     spec: &'a BenchmarkSpec,
     samples: &'a [&'a Sample],
     stats: Option<&'a SummaryStats>,
+    wall_clock: Option<&'a SummaryStats>,
     ns_per_op: Option<&'a SummaryStats>,
     overhead_ns_per_op: Option<&'a SummaryStats>,
     allocs_per_op: Option<&'a SummaryStats>,
@@ -1371,6 +1528,7 @@ fn summary_diagnostics(input: DiagnosticInputs<'_>) -> Vec<BenchmarkDiagnostic> 
         spec,
         samples,
         stats,
+        wall_clock,
         ns_per_op,
         overhead_ns_per_op,
         allocs_per_op,
@@ -1425,17 +1583,12 @@ fn summary_diagnostics(input: DiagnosticInputs<'_>) -> Vec<BenchmarkDiagnostic> 
         ));
     }
     if stats.is_some_and(|stats| stats.relative_std_dev > 0.10) {
-        diagnostics.push(diagnostic(
+        diagnostics.push(diagnostic_with_evidence(
             "high_variance",
             DiagnosticSeverity::Warning,
             "Measured samples varied enough that this row needs attention.",
-            [(
-                "relative_std_dev",
-                stats
-                    .map(|stats| stats.relative_std_dev.to_string())
-                    .unwrap_or_default(),
-            )],
-            ["Use deterministic fixtures and move setup outside the measured work."],
+            high_variance_evidence(spec, samples, stats, wall_clock),
+            high_variance_suggestions(spec, samples, stats, wall_clock),
         ));
     }
     if too_fast_sample(samples, ns_per_op, spec.mode.kind()) {
@@ -1592,6 +1745,148 @@ fn zero_completed_count(samples: &[&Sample]) -> usize {
         .iter()
         .filter(|sample| sample.operations_completed == 0)
         .count()
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn high_variance_evidence(
+    spec: &BenchmarkSpec,
+    samples: &[&Sample],
+    stats: Option<&SummaryStats>,
+    wall_clock: Option<&SummaryStats>,
+) -> BTreeMap<String, String> {
+    let mut evidence = BTreeMap::new();
+    if let Some(stats) = stats {
+        evidence.insert(
+            "relative_std_dev".to_string(),
+            stats.relative_std_dev.to_string(),
+        );
+        evidence.insert("max_to_median".to_string(), ratio(stats.max, stats.median));
+        evidence.insert("min_to_median".to_string(), ratio(stats.min, stats.median));
+    }
+    if let Some(elapsed) = elapsed_stats(samples) {
+        evidence.insert(
+            "median_elapsed_ns".to_string(),
+            elapsed.median.round().to_string(),
+        );
+    }
+    if let Some(wall_clock) = wall_clock {
+        evidence.insert(
+            "wall_clock_rsd".to_string(),
+            wall_clock.relative_std_dev.to_string(),
+        );
+    }
+    if let Some(operations) = completed_operation_stats(samples) {
+        evidence.insert(
+            "completed_operations_rsd".to_string(),
+            operations.relative_std_dev.to_string(),
+        );
+    }
+    if scheduler_sensitive_reason(spec, samples).is_some() {
+        evidence.insert("scheduler_sensitive".to_string(), "true".to_string());
+    }
+    evidence
+}
+
+fn high_variance_suggestions(
+    spec: &BenchmarkSpec,
+    samples: &[&Sample],
+    stats: Option<&SummaryStats>,
+    wall_clock: Option<&SummaryStats>,
+) -> Vec<String> {
+    let mut suggestions = Vec::new();
+    if elapsed_stats(samples).is_some_and(|stats| stats.median < 10_000_000.0) {
+        suggestions.push(
+            "Increase the measured window with STRESS_SAMPLE_DURATION_MS or batch more logical work per sample."
+                .to_string(),
+        );
+    }
+    if stats.is_some_and(has_single_outlier_shape) {
+        suggestions.push(
+            "Inspect one-off setup, cache, I/O, or background interference before updating a baseline."
+                .to_string(),
+        );
+    }
+    if stable_wall_clock_with_variable_work(samples, wall_clock) {
+        suggestions.push(
+            "Wall-clock windows are stable but completed operations vary; inspect contention, work shedding, or per-sample operation accounting."
+                .to_string(),
+        );
+    }
+    if scheduler_sensitive_reason(spec, samples).is_some() {
+        suggestions.push(
+            "Isolate CPU scheduling or pin and limit worker concurrency before using this row as a regression gate."
+                .to_string(),
+        );
+    }
+    if suggestions.is_empty() {
+        suggestions.push(
+            "Use deterministic fixtures and move setup outside the measured work.".to_string(),
+        );
+    }
+    suggestions
+}
+
+fn has_single_outlier_shape(stats: &SummaryStats) -> bool {
+    stats.median > 0.0 && (stats.max / stats.median >= 3.0 || stats.min / stats.median <= 0.33)
+}
+
+fn stable_wall_clock_with_variable_work(
+    samples: &[&Sample],
+    wall_clock: Option<&SummaryStats>,
+) -> bool {
+    wall_clock.is_some_and(|stats| stats.relative_std_dev <= 0.05)
+        && completed_operation_stats(samples).is_some_and(|stats| stats.relative_std_dev > 0.10)
+}
+
+fn scheduler_sensitive_reason(spec: &BenchmarkSpec, samples: &[&Sample]) -> Option<String> {
+    if matches!(
+        spec.intent,
+        MeasurementIntent::Async | MeasurementIntent::Threaded
+    ) {
+        return Some(spec.intent.to_string());
+    }
+    spec.parameters
+        .keys()
+        .chain(spec.metadata.keys())
+        .chain(samples.iter().flat_map(|sample| sample.parameters.keys()))
+        .find(|key| {
+            let key = key.as_str();
+            key.contains("thread")
+                || key.contains("worker")
+                || key.contains("concurrency")
+                || key.contains("client")
+                || key.contains("task")
+                || key.contains("parallel")
+        })
+        .cloned()
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn completed_operation_stats(samples: &[&Sample]) -> Option<SummaryStats> {
+    SummaryStats::from_values(
+        &samples
+            .iter()
+            .map(|sample| sample.operations_completed as f64)
+            .collect::<Vec<_>>(),
+    )
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn elapsed_stats(samples: &[&Sample]) -> Option<SummaryStats> {
+    SummaryStats::from_values(
+        &samples
+            .iter()
+            .map(|sample| sample.elapsed_ns as f64)
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn ratio(value: f64, baseline: f64) -> String {
+    if baseline == 0.0 {
+        "unknown".to_string()
+    } else {
+        format!("{:.4}", value / baseline)
+    }
 }
 
 fn too_fast_sample(
@@ -1858,6 +2153,26 @@ mod tests {
         }
     }
 
+    #[allow(clippy::cast_precision_loss)]
+    fn completed_sample(
+        id: &str,
+        sample_number: usize,
+        elapsed_ns: u128,
+        completed: u64,
+    ) -> Sample {
+        let mut sample = sample(id, SamplePhase::Measured, sample_number, elapsed_ns);
+        sample.operations_attempted = completed;
+        sample.operations_completed = completed;
+        sample.throughput = if elapsed_ns == 0 {
+            0.0
+        } else {
+            completed as f64 / (elapsed_ns as f64 / 1_000_000_000.0)
+        };
+        sample.counters.attempted = completed;
+        sample.counters.completed = completed;
+        sample
+    }
+
     fn micro_sample(id: &str, sample_number: usize, net_ns_per_op: u32) -> Sample {
         let mut sample = sample(
             id,
@@ -2097,6 +2412,72 @@ mod tests {
     }
 
     #[test]
+    fn high_variance_suggestions_include_short_window_and_outlier_shape() {
+        let spec = spec("bench");
+        let samples = vec![
+            completed_sample("bench", 0, 100, 1),
+            completed_sample("bench", 1, 100, 1),
+            completed_sample("bench", 2, 100, 1),
+            completed_sample("bench", 3, 10_000, 1),
+            completed_sample("bench", 4, 100, 1),
+        ];
+
+        let summary = summarize_benchmark(&spec, &samples);
+        let diagnostic = summary
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "high_variance")
+            .expect("high variance diagnostic");
+
+        assert!(diagnostic
+            .suggestions
+            .iter()
+            .any(|suggestion| suggestion.contains("Increase the measured window")));
+        assert!(diagnostic
+            .suggestions
+            .iter()
+            .any(|suggestion| suggestion.contains("one-off setup")));
+        assert!(diagnostic.evidence.contains_key("median_elapsed_ns"));
+        assert!(diagnostic.evidence.contains_key("max_to_median"));
+    }
+
+    #[test]
+    fn high_variance_suggestions_include_variable_work_and_scheduler_shape() {
+        let mut spec = tier3_spec("system");
+        spec.parameters
+            .insert("worker_threads".to_string(), "8".to_string());
+        let samples = vec![
+            completed_sample("system", 0, 1_000_000_000, 100),
+            completed_sample("system", 1, 1_000_000_000, 100),
+            completed_sample("system", 2, 1_000_000_000, 1000),
+            completed_sample("system", 3, 1_000_000_000, 100),
+            completed_sample("system", 4, 1_000_000_000, 100),
+        ];
+
+        let summary = summarize_benchmark(&spec, &samples);
+        let diagnostic = summary
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "high_variance")
+            .expect("high variance diagnostic");
+
+        assert!(diagnostic
+            .suggestions
+            .iter()
+            .any(|suggestion| { suggestion.contains("completed operations vary") }));
+        assert!(diagnostic
+            .suggestions
+            .iter()
+            .any(|suggestion| suggestion.contains("pin and limit worker concurrency")));
+        assert_eq!(
+            diagnostic.evidence.get("scheduler_sensitive"),
+            Some(&"true".to_string())
+        );
+        assert!(diagnostic.evidence.contains_key("completed_operations_rsd"));
+        assert!(diagnostic.evidence.contains_key("wall_clock_rsd"));
+    }
+
+    #[test]
     fn correctness_errors_make_summary_untrustworthy() {
         let spec = spec("bench");
         let mut bad = sample("bench", SamplePhase::Measured, 0, 100);
@@ -2252,6 +2633,7 @@ mod tests {
             samples: Vec::new(),
             summaries: Vec::new(),
             comparisons: Vec::new(),
+            diagnostics_summary: Vec::new(),
             started_at: "123".to_string(),
             total_elapsed_ns: 0,
             metadata: BTreeMap::new(),
@@ -2276,6 +2658,7 @@ mod tests {
             samples: Vec::new(),
             summaries: Vec::new(),
             comparisons: Vec::new(),
+            diagnostics_summary: Vec::new(),
             started_at: "123".to_string(),
             total_elapsed_ns: 0,
             metadata: BTreeMap::new(),
@@ -2292,6 +2675,49 @@ mod tests {
     }
 
     #[test]
+    fn old_v2_json_without_new_defaulted_fields_still_parses() {
+        let profile_config = ProfileConfig::default();
+        let run = StressRun {
+            schema_version: SCHEMA_VERSION.to_string(),
+            tool_version: "0.3.0".to_string(),
+            suite: "suite".to_string(),
+            run_profile: profile_config.profile,
+            environment: EnvironmentInfo::unknown(profile_config),
+            benchmark_specs: Vec::new(),
+            samples: Vec::new(),
+            summaries: Vec::new(),
+            comparisons: Vec::new(),
+            diagnostics_summary: Vec::new(),
+            started_at: "123".to_string(),
+            total_elapsed_ns: 0,
+            metadata: BTreeMap::new(),
+        };
+        let mut json = serde_json::to_value(&run).expect("serialize");
+        json.as_object_mut()
+            .expect("run object")
+            .remove("diagnostics_summary");
+        let profile = json
+            .get_mut("environment")
+            .and_then(|environment| environment.get_mut("profile_config"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("profile config");
+        profile.remove("deny_diagnostics");
+        profile.remove("console_names");
+        profile.remove("progress");
+
+        let parsed =
+            StressRun::from_json_str(&serde_json::to_string(&json).expect("json")).expect("parse");
+
+        assert!(parsed.diagnostics_summary.is_empty());
+        assert_eq!(parsed.environment.profile_config.deny_diagnostics, None);
+        assert_eq!(
+            parsed.environment.profile_config.console_names,
+            ConsoleNameMode::Compact
+        );
+        assert!(parsed.environment.profile_config.progress);
+    }
+
+    #[test]
     fn wrong_schema_version_is_not_accepted() {
         let profile_config = ProfileConfig::default();
         let run = StressRun {
@@ -2304,6 +2730,7 @@ mod tests {
             samples: Vec::new(),
             summaries: Vec::new(),
             comparisons: Vec::new(),
+            diagnostics_summary: Vec::new(),
             started_at: "123".to_string(),
             total_elapsed_ns: 0,
             metadata: BTreeMap::new(),

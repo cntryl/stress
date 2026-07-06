@@ -1,6 +1,9 @@
 //! Harness for auto-discovered stress benchmarks.
 
-use crate::artifact::{BenchmarkBudgets, BenchmarkModeKind, BenchmarkSpec, RunProfile};
+use crate::artifact::{
+    BenchmarkBudgets, BenchmarkModeKind, BenchmarkSpec, ConsoleNameMode, DiagnosticSeverity,
+    RunProfile, StressRun,
+};
 use crate::config::{parse_bool_env, StressRunnerConfig};
 use crate::runner::{evaluate_run_gate, RunGate, StressRunner};
 use crate::StressContext;
@@ -52,7 +55,13 @@ struct StressBinaryArgs {
     print_config: bool,
     output_dir: Option<PathBuf>,
     baseline: Option<PathBuf>,
+    baseline_dir: Option<PathBuf>,
+    save_baseline: Option<bool>,
     threshold: Option<f64>,
+    fail_on_issues: Option<bool>,
+    deny_diagnostics: Option<DiagnosticSeverity>,
+    names: Option<ConsoleNameMode>,
+    no_progress: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +72,8 @@ struct ResolvedStressConfig {
     workload: Option<String>,
     include_ignored: bool,
     baseline: Option<PathBuf>,
+    baseline_dir: PathBuf,
+    save_baseline: bool,
     print_config: bool,
 }
 
@@ -72,6 +83,7 @@ impl StressBinaryArgs {
         Self::parse_from_args(&args)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn parse_from_args(args: &[String]) -> Self {
         let mut result = Self::default();
         let mut index = 1;
@@ -138,11 +150,38 @@ impl StressBinaryArgs {
                         result.baseline = Some(PathBuf::from(value));
                     }
                 }
+                "--baseline-dir" => {
+                    index += 1;
+                    if let Some(value) = args.get(index) {
+                        result.baseline_dir = Some(PathBuf::from(value));
+                    }
+                }
+                "--save-baseline" => {
+                    result.save_baseline = Some(true);
+                }
                 "--threshold" => {
                     index += 1;
                     if let Some(value) = args.get(index).and_then(|value| value.parse().ok()) {
                         result.threshold = Some(value);
                     }
+                }
+                "--fail-on-issues" => {
+                    result.fail_on_issues = Some(true);
+                }
+                "--deny-diagnostics" => {
+                    index += 1;
+                    if let Some(value) = args.get(index).and_then(|value| value.parse().ok()) {
+                        result.deny_diagnostics = Some(value);
+                    }
+                }
+                "--names" => {
+                    index += 1;
+                    if let Some(value) = args.get(index).and_then(|value| value.parse().ok()) {
+                        result.names = Some(value);
+                    }
+                }
+                "--no-progress" => {
+                    result.no_progress = Some(true);
                 }
                 "--help" | "-h" => {
                     print_help();
@@ -178,7 +217,16 @@ fn print_help() {
     eprintln!("    --print-config                 Print resolved config");
     eprintln!("    --output-dir <PATH>            Artifact output directory");
     eprintln!("    --baseline <PATH>              Current baseline artifact");
+    eprintln!("    --baseline latest              Use baseline-dir/latest/<suite>.json");
+    eprintln!(
+        "    --baseline-dir <PATH>          Baseline directory (default target/stress/baselines)"
+    );
+    eprintln!("    --save-baseline                Save passed runs under baseline-dir");
     eprintln!("    --threshold <FLOAT>            Regression threshold");
+    eprintln!("    --fail-on-issues               Fail on warning-or-error diagnostics");
+    eprintln!("    --deny-diagnostics <LEVEL>     Fail on diagnostics at info, warning, or error");
+    eprintln!("    --names <compact|full>         Human console benchmark-name mode");
+    eprintln!("    --no-progress                  Disable stderr progress for human output");
 }
 
 /// Entry point used by `stress_main!`.
@@ -229,8 +277,18 @@ pub struct StressRunnerOptions {
     pub json_stdout: bool,
     /// Baseline artifact.
     pub baseline: Option<PathBuf>,
+    /// Baseline directory for latest/save conventions.
+    pub baseline_dir: Option<PathBuf>,
+    /// Save passed runs as baselines.
+    pub save_baseline: bool,
     /// Regression threshold.
     pub threshold: Option<f64>,
+    /// Strict diagnostic gate threshold.
+    pub deny_diagnostics: Option<DiagnosticSeverity>,
+    /// Human console benchmark-name mode.
+    pub names: Option<ConsoleNameMode>,
+    /// Whether human runs emit stderr progress.
+    pub progress: Option<bool>,
 }
 
 impl StressRunnerOptions {
@@ -296,10 +354,56 @@ impl StressRunnerOptions {
         self
     }
 
+    /// Set baseline directory for latest/save conventions.
+    #[must_use]
+    pub fn baseline_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.baseline_dir = Some(path.into());
+        self
+    }
+
+    /// Save passed runs as baselines.
+    #[must_use]
+    pub const fn save_baseline(mut self, value: bool) -> Self {
+        self.save_baseline = value;
+        self
+    }
+
     /// Set regression threshold.
     #[must_use]
     pub const fn threshold(mut self, threshold: f64) -> Self {
         self.threshold = Some(threshold);
+        self
+    }
+
+    /// Set strict diagnostic gate threshold.
+    #[must_use]
+    pub const fn deny_diagnostics(mut self, threshold: DiagnosticSeverity) -> Self {
+        self.deny_diagnostics = Some(threshold);
+        self
+    }
+
+    /// Alias for warning-or-higher diagnostic gating.
+    #[must_use]
+    pub const fn fail_on_issues(mut self, value: bool) -> Self {
+        self.deny_diagnostics = if value {
+            Some(DiagnosticSeverity::Warning)
+        } else {
+            None
+        };
+        self
+    }
+
+    /// Set human console benchmark-name mode.
+    #[must_use]
+    pub const fn names(mut self, mode: ConsoleNameMode) -> Self {
+        self.names = Some(mode);
+        self
+    }
+
+    /// Set whether human runs emit stderr progress.
+    #[must_use]
+    pub const fn progress(mut self, value: bool) -> Self {
+        self.progress = Some(value);
         self
     }
 }
@@ -322,7 +426,12 @@ pub fn run_with_options(options: StressRunnerOptions) {
         json_stdout: options.json_stdout.then_some(true),
         include_ignored: Some(options.include_ignored),
         baseline: options.baseline,
+        baseline_dir: options.baseline_dir,
+        save_baseline: options.save_baseline.then_some(true),
         threshold: options.threshold,
+        deny_diagnostics: options.deny_diagnostics,
+        names: options.names,
+        no_progress: options.progress.map(|progress| !progress),
         ..StressBinaryArgs::default()
     };
     run_with_resolved_config(resolve_from_binary_args(&args));
@@ -332,6 +441,7 @@ fn resolve_from_binary_args(args: &StressBinaryArgs) -> ResolvedStressConfig {
     resolve_from_binary_args_with(args, |key| std::env::var(key).ok())
 }
 
+#[allow(clippy::too_many_lines)]
 fn resolve_from_binary_args_with<F>(args: &StressBinaryArgs, get_var: F) -> ResolvedStressConfig
 where
     F: Fn(&str) -> Option<String>,
@@ -366,6 +476,26 @@ where
     metadata.insert(
         "baseline_src".to_string(),
         source_for(&get_var, "STRESS_BASELINE"),
+    );
+    let mut baseline_dir =
+        get_var("STRESS_BASELINE_DIR").map_or_else(default_baseline_dir, PathBuf::from);
+    metadata.insert(
+        "baseline_dir_src".to_string(),
+        source_for(&get_var, "STRESS_BASELINE_DIR"),
+    );
+    let mut save_baseline = get_var("STRESS_SAVE_BASELINE")
+        .and_then(|value| {
+            if let Some(value) = parse_bool_env(&value) {
+                Some(value)
+            } else {
+                warnings.push("invalid STRESS_SAVE_BASELINE, using false".to_string());
+                None
+            }
+        })
+        .unwrap_or(false);
+    metadata.insert(
+        "save_baseline_src".to_string(),
+        source_for(&get_var, "STRESS_SAVE_BASELINE"),
     );
 
     if let Some(tier) = args.tier {
@@ -413,9 +543,45 @@ where
         baseline = Some(path.clone());
         metadata.insert("baseline_src".to_string(), "cli --baseline".to_string());
     }
+    if let Some(path) = &args.baseline_dir {
+        baseline_dir.clone_from(path);
+        metadata.insert(
+            "baseline_dir_src".to_string(),
+            "cli --baseline-dir".to_string(),
+        );
+    }
+    if let Some(value) = args.save_baseline {
+        save_baseline = value;
+        metadata.insert(
+            "save_baseline_src".to_string(),
+            "cli --save-baseline".to_string(),
+        );
+    }
     if let Some(threshold) = args.threshold {
         config.threshold = threshold;
         metadata.insert("threshold_src".to_string(), "cli --threshold".to_string());
+    }
+    if let Some(value) = args.fail_on_issues {
+        config.deny_diagnostics = value.then_some(DiagnosticSeverity::Warning);
+        metadata.insert(
+            "deny_diagnostics_src".to_string(),
+            "cli --fail-on-issues".to_string(),
+        );
+    }
+    if let Some(threshold) = args.deny_diagnostics {
+        config.deny_diagnostics = Some(threshold);
+        metadata.insert(
+            "deny_diagnostics_src".to_string(),
+            "cli --deny-diagnostics".to_string(),
+        );
+    }
+    if let Some(mode) = args.names {
+        config.console_names = mode;
+        metadata.insert("console_names_src".to_string(), "cli --names".to_string());
+    }
+    if args.no_progress == Some(true) {
+        config.progress = false;
+        metadata.insert("progress_src".to_string(), "cli --no-progress".to_string());
     }
 
     ResolvedStressConfig {
@@ -425,6 +591,8 @@ where
         warnings,
         include_ignored,
         baseline,
+        baseline_dir,
+        save_baseline,
         print_config: args.print_config,
     }
 }
@@ -449,6 +617,10 @@ fn run_with_resolved_config(resolved: ResolvedStressConfig) {
     }
 
     let suite_name = get_suite_name();
+    let baseline = resolved
+        .baseline
+        .as_ref()
+        .map(|path| resolve_baseline_path(path, &resolved.baseline_dir, &suite_name));
     let config_for_specs = resolved.config.clone();
     let mut runner =
         StressRunner::with_config_and_metadata(&suite_name, resolved.config, resolved.metadata);
@@ -475,7 +647,7 @@ fn run_with_resolved_config(resolved: ResolvedStressConfig) {
         runner.run_spec(&spec, entry.func);
     }
 
-    let run_result = if let Some(baseline_path) = resolved.baseline {
+    let run_result = if let Some(baseline_path) = baseline {
         runner.finish_with_baseline(baseline_path)
     } else {
         Ok(runner.finish())
@@ -487,6 +659,12 @@ fn run_with_resolved_config(resolved: ResolvedStressConfig) {
             if gate != RunGate::Passed {
                 eprintln!("Stress run failed: {gate:?}");
                 std::process::exit(1);
+            }
+            if resolved.save_baseline {
+                if let Err(error) = save_baseline_artifacts(&run, &resolved.baseline_dir) {
+                    eprintln!("Stress run failed to save baseline: {error}");
+                    std::process::exit(1);
+                }
             }
         }
         Err(error) => {
@@ -562,6 +740,7 @@ fn clean_exe_name(name: &str) -> String {
     clean_name.replace('_', "-")
 }
 
+#[allow(clippy::too_many_lines)]
 fn print_resolved_config(suite: &str, resolved: &ResolvedStressConfig) {
     println!("Benchmark Suite: {suite}");
     println!(
@@ -637,6 +816,22 @@ fn print_resolved_config(suite: &str, resolved: &ResolvedStressConfig) {
             .map_or("unknown", String::as_str)
     );
     println!(
+        "Baseline dir: {} ({})",
+        resolved.baseline_dir.display(),
+        resolved
+            .metadata
+            .get("baseline_dir_src")
+            .map_or("unknown", String::as_str)
+    );
+    println!(
+        "Save baseline: {} ({})",
+        resolved.save_baseline,
+        resolved
+            .metadata
+            .get("save_baseline_src")
+            .map_or("unknown", String::as_str)
+    );
+    println!(
         "Threshold: {} ({})",
         resolved.config.threshold,
         resolved
@@ -644,6 +839,26 @@ fn print_resolved_config(suite: &str, resolved: &ResolvedStressConfig) {
             .get("threshold_src")
             .map_or("unknown", String::as_str)
     );
+    println!(
+        "Deny diagnostics: {} ({})",
+        resolved
+            .config
+            .deny_diagnostics
+            .map_or_else(|| "<none>".to_string(), |severity| severity.to_string()),
+        resolved
+            .metadata
+            .get("deny_diagnostics_src")
+            .map_or("unknown", String::as_str)
+    );
+    println!(
+        "Names: {} ({})",
+        resolved.config.console_names,
+        resolved
+            .metadata
+            .get("console_names_src")
+            .map_or("unknown", String::as_str)
+    );
+    println!("Progress: {}", resolved.config.progress);
 }
 
 fn source_for<F>(get_var: &F, env_key: &'static str) -> String
@@ -655,6 +870,48 @@ where
     } else {
         "default".to_string()
     }
+}
+
+fn default_baseline_dir() -> PathBuf {
+    PathBuf::from("target/stress/baselines")
+}
+
+fn resolve_baseline_path(
+    path: &std::path::Path,
+    baseline_dir: &std::path::Path,
+    suite: &str,
+) -> PathBuf {
+    if path.as_os_str() == "latest" {
+        baseline_path(baseline_dir, "latest", suite)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn save_baseline_artifacts(run: &StressRun, baseline_dir: &std::path::Path) -> std::io::Result<()> {
+    let timestamped = baseline_path(baseline_dir, &run.started_at, &run.suite);
+    let latest = baseline_path(baseline_dir, "latest", &run.suite);
+    let json = serde_json::to_string_pretty(run).map_err(std::io::Error::other)?;
+
+    if let Some(parent) = timestamped.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&timestamped, &json)?;
+    if let Some(parent) = latest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&latest, json)?;
+    Ok(())
+}
+
+fn baseline_path(baseline_dir: &std::path::Path, bucket: &str, suite: &str) -> PathBuf {
+    baseline_dir
+        .join(bucket)
+        .join(format!("{}.json", baseline_suite_name(suite)))
+}
+
+fn baseline_suite_name(suite: &str) -> String {
+    suite.replace(['/', '\\'], "_")
 }
 
 fn matches_glob(text: &str, pattern: &str) -> bool {
@@ -732,6 +989,37 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_accepts_gate_name_progress_and_baseline_flags() {
+        let args = vec![
+            "stress-demo".to_string(),
+            "--fail-on-issues".to_string(),
+            "--deny-diagnostics".to_string(),
+            "error".to_string(),
+            "--names".to_string(),
+            "full".to_string(),
+            "--no-progress".to_string(),
+            "--baseline".to_string(),
+            "latest".to_string(),
+            "--baseline-dir".to_string(),
+            "target/custom-baselines".to_string(),
+            "--save-baseline".to_string(),
+        ];
+
+        let parsed = StressBinaryArgs::parse_from_args(&args);
+
+        assert_eq!(parsed.fail_on_issues, Some(true));
+        assert_eq!(parsed.deny_diagnostics, Some(DiagnosticSeverity::Error));
+        assert_eq!(parsed.names, Some(ConsoleNameMode::Full));
+        assert_eq!(parsed.no_progress, Some(true));
+        assert_eq!(parsed.baseline, Some(PathBuf::from("latest")));
+        assert_eq!(
+            parsed.baseline_dir,
+            Some(PathBuf::from("target/custom-baselines"))
+        );
+        assert_eq!(parsed.save_baseline, Some(true));
+    }
+
+    #[test]
     fn resolve_from_binary_args_uses_stress_env() {
         let args = StressBinaryArgs::default();
         let env = BTreeMap::from([
@@ -750,15 +1038,49 @@ mod tests {
     }
 
     #[test]
+    fn resolve_from_binary_args_uses_new_env_controls() {
+        let args = StressBinaryArgs::default();
+        let env = BTreeMap::from([
+            ("STRESS_FAIL_ON_ISSUES", "true".to_string()),
+            ("STRESS_DENY_DIAGNOSTICS", "error".to_string()),
+            ("STRESS_CONSOLE_NAMES", "full".to_string()),
+            ("STRESS_PROGRESS", "false".to_string()),
+            ("STRESS_BASELINE_DIR", "target/env-baselines".to_string()),
+            ("STRESS_SAVE_BASELINE", "true".to_string()),
+        ]);
+
+        let resolved = resolve_from_binary_args_with(&args, |key| env.get(key).cloned());
+
+        assert_eq!(
+            resolved.config.deny_diagnostics,
+            Some(DiagnosticSeverity::Error)
+        );
+        assert_eq!(resolved.config.console_names, ConsoleNameMode::Full);
+        assert!(!resolved.config.progress);
+        assert_eq!(resolved.baseline_dir, PathBuf::from("target/env-baselines"));
+        assert!(resolved.save_baseline);
+        assert_eq!(
+            resolved.metadata.get("deny_diagnostics_src"),
+            Some(&"env STRESS_DENY_DIAGNOSTICS".to_string())
+        );
+    }
+
+    #[test]
     fn cli_overrides_env() {
         let args = StressBinaryArgs {
             profile: Some(RunProfile::Lab),
             samples: Some(5),
+            fail_on_issues: Some(true),
+            names: Some(ConsoleNameMode::Compact),
+            no_progress: Some(true),
             ..StressBinaryArgs::default()
         };
         let env = BTreeMap::from([
             ("STRESS_PROFILE", "release".to_string()),
             ("STRESS_SAMPLES", "3".to_string()),
+            ("STRESS_DENY_DIAGNOSTICS", "error".to_string()),
+            ("STRESS_CONSOLE_NAMES", "full".to_string()),
+            ("STRESS_PROGRESS", "true".to_string()),
         ]);
 
         let resolved = resolve_from_binary_args_with(&args, |key| env.get(key).cloned());
@@ -769,6 +1091,12 @@ mod tests {
             resolved.metadata.get("samples_src"),
             Some(&"cli --samples".to_string())
         );
+        assert_eq!(
+            resolved.config.deny_diagnostics,
+            Some(DiagnosticSeverity::Warning)
+        );
+        assert_eq!(resolved.config.console_names, ConsoleNameMode::Compact);
+        assert!(!resolved.config.progress);
     }
 
     #[test]
@@ -815,5 +1143,61 @@ mod tests {
             empty_selection_error(&resolved),
             "No benchmarks matched the workload pattern"
         );
+    }
+
+    #[test]
+    fn baseline_latest_resolves_under_baseline_dir() {
+        let baseline_dir = PathBuf::from("target/stress/baselines");
+
+        assert_eq!(
+            resolve_baseline_path(std::path::Path::new("latest"), &baseline_dir, "suite/name"),
+            baseline_dir.join("latest").join("suite_name.json")
+        );
+        assert_eq!(
+            resolve_baseline_path(
+                std::path::Path::new("target/explicit/latest.json"),
+                &baseline_dir,
+                "suite"
+            ),
+            PathBuf::from("target/explicit/latest.json")
+        );
+    }
+
+    #[test]
+    fn save_baseline_writes_timestamped_and_latest_paths() {
+        let baseline_dir = unique_temp_dir("stress-baseline-save");
+        let config = StressRunnerConfig::for_profile(RunProfile::Smoke)
+            .samples(1)
+            .warmup_samples(0)
+            .cooldown_samples(0);
+        let mut runner = StressRunner::with_config("suite/name", config);
+        runner.reporters(Vec::new());
+        runner.run("bench", |ctx| {
+            ctx.measure("work", || std::hint::black_box(1_u64));
+        });
+        let run = runner.finish();
+
+        save_baseline_artifacts(&run, &baseline_dir).expect("save baseline");
+
+        let timestamped = baseline_path(&baseline_dir, &run.started_at, &run.suite);
+        let latest = baseline_path(&baseline_dir, "latest", &run.suite);
+        assert!(timestamped.exists());
+        assert!(latest.exists());
+        let latest_run = StressRun::load(&latest).expect("latest baseline");
+        assert_eq!(latest_run.suite, "suite/name");
+
+        let _ = std::fs::remove_dir_all(&baseline_dir);
+    }
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{}-{}-{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ))
     }
 }

@@ -74,9 +74,10 @@ fn advanced_imports_compile_from_modules() {
 
 fn current_schema_run() -> cntryl_stress::artifact::StressRun {
     use cntryl_stress::artifact::{
-        BenchmarkBudgets, BenchmarkMode, BenchmarkSpec, BenchmarkSummary, CorrectnessCounters,
-        CorrectnessSummary, EnvironmentInfo, MeasurementIntent, PrimaryMetric, ProfileConfig,
-        QualityClass, RunProfile, Sample, SamplePhase, StressRun, SummaryStats, SCHEMA_VERSION,
+        BenchmarkBudgets, BenchmarkMode, BenchmarkSpec, BenchmarkSummary, ConsoleNameMode,
+        CorrectnessCounters, CorrectnessSummary, EnvironmentInfo, MeasurementIntent, PrimaryMetric,
+        ProfileConfig, QualityClass, RunProfile, Sample, SamplePhase, StressRun, SummaryStats,
+        SCHEMA_VERSION,
     };
 
     let profile_config = ProfileConfig {
@@ -87,11 +88,14 @@ fn current_schema_run() -> cntryl_stress::artifact::StressRun {
         min_quality: QualityClass::Untrustworthy,
         fail_on_quality: false,
         fail_on_regression: false,
+        deny_diagnostics: None,
         regression_threshold: 0.05,
         sample_duration: Duration::from_millis(10),
         operations_per_sample: 1,
         micro_sample_duration: Duration::from_millis(5),
         report_depth: "summary".to_string(),
+        console_names: ConsoleNameMode::Compact,
+        progress: true,
     };
     let environment = EnvironmentInfo::unknown(profile_config);
 
@@ -177,6 +181,7 @@ fn current_schema_run() -> cntryl_stress::artifact::StressRun {
             metadata: BTreeMap::new(),
         }],
         comparisons: Vec::new(),
+        diagnostics_summary: Vec::new(),
         started_at: "1".to_string(),
         total_elapsed_ns: 1,
         metadata: BTreeMap::new(),

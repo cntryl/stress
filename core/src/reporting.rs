@@ -1,8 +1,9 @@
 //! Pluggable reporters for current stress artifacts.
 
 use crate::artifact::{
-    BenchmarkDiagnostic, BenchmarkSummary, ComparisonClass, ComparisonResult, CorrectnessSummary,
-    PrimaryMetric, QualityClass, StressRun, SummaryStats,
+    BenchmarkDiagnostic, BenchmarkSpec, BenchmarkSummary, ComparisonClass, ComparisonResult,
+    ConsoleNameMode, CorrectnessSummary, PrimaryMetric, QualityClass, SamplePhase, StressRun,
+    SummaryStats,
 };
 use crate::config::StressRunnerConfig;
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,6 +17,12 @@ pub trait Reporter: Send + Sync {
     /// Called when a suite starts.
     fn suite_start(&self, _suite: &str, _config: &StressRunnerConfig) {}
 
+    /// Called before a benchmark row starts running.
+    fn bench_start(&self, _spec: &BenchmarkSpec) {}
+
+    /// Called as samples are recorded.
+    fn sample_progress(&self, _progress: &SampleProgress) {}
+
     /// Called when a benchmark summary is available.
     fn bench_end(&self, _summary: &BenchmarkSummary) {}
 
@@ -23,8 +30,25 @@ pub trait Reporter: Send + Sync {
     fn suite_end(&self, _run: &StressRun) {}
 }
 
+/// Progress update for one benchmark sample.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SampleProgress {
+    /// Stable benchmark id.
+    pub benchmark_id: String,
+    /// Display name.
+    pub name: String,
+    /// Numeric tier.
+    pub tier: u32,
+    /// Sample phase.
+    pub phase: SamplePhase,
+    /// Completed samples for this phase.
+    pub completed_samples: usize,
+    /// Target samples for this phase.
+    pub target_samples: usize,
+}
+
 const NAME_WIDTH: usize = 36;
-const HUMAN_TABLE_NAME_WIDTH: usize = 24;
+const HUMAN_TABLE_NAME_WIDTH: usize = 64;
 const HUMAN_TABLE_VALUE_WIDTH: usize = 11;
 const HUMAN_TABLE_ALLOC_WIDTH: usize = 9;
 const VALUE_WIDTH: usize = 16;
@@ -102,6 +126,71 @@ impl Reporter for JsonStdoutReporter {
             format!(r#"{{"error":"failed to serialize stress run: {error}"}}"#)
         });
         self.write_stdout(&output);
+    }
+}
+
+/// Stderr-only progress reporter for long human runs.
+pub struct StderrProgressReporter {
+    output_lock: Mutex<()>,
+}
+
+impl StderrProgressReporter {
+    /// Create a progress reporter.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            output_lock: Mutex::new(()),
+        }
+    }
+
+    fn write_stderr(&self, message: &str) {
+        let _guard = self
+            .output_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(stderr, "{message}");
+    }
+}
+
+impl Default for StderrProgressReporter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Reporter for StderrProgressReporter {
+    fn bench_start(&self, spec: &BenchmarkSpec) {
+        self.write_stderr(&format!("stress: start {} (tier {})", spec.name, spec.tier));
+    }
+
+    fn sample_progress(&self, progress: &SampleProgress) {
+        self.write_stderr(&format!(
+            "stress: sample {} {} {}/{}",
+            progress.name,
+            phase_label(progress.phase),
+            progress.completed_samples,
+            progress.target_samples
+        ));
+    }
+
+    fn bench_end(&self, summary: &BenchmarkSummary) {
+        let value = summary.primary_value().map_or_else(
+            || "n/a".to_string(),
+            |value| format_metric(value, summary.primary_metric),
+        );
+        self.write_stderr(&format!(
+            "stress: finish {} value={} quality={}",
+            summary.name, value, summary.quality
+        ));
+    }
+}
+
+const fn phase_label(phase: SamplePhase) -> &'static str {
+    match phase {
+        SamplePhase::Warmup => "warmup",
+        SamplePhase::Measured => "measured",
+        SamplePhase::Cooldown => "cooldown",
     }
 }
 
@@ -246,6 +335,22 @@ impl Reporter for MultiReporter {
         for reporter in &self.reporters {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 reporter.suite_start(suite, config);
+            }));
+        }
+    }
+
+    fn bench_start(&self, spec: &BenchmarkSpec) {
+        for reporter in &self.reporters {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                reporter.bench_start(spec);
+            }));
+        }
+    }
+
+    fn sample_progress(&self, progress: &SampleProgress) {
+        for reporter in &self.reporters {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                reporter.sample_progress(progress);
             }));
         }
     }
@@ -411,7 +516,12 @@ fn write_suite_block(output: &mut String, run: &StressRun) {
     }
 
     let comparisons = comparison_by_benchmark(run);
-    write_human_table(output, &rows, &comparisons);
+    write_human_table(
+        output,
+        &rows,
+        &comparisons,
+        run.environment.profile_config.console_names,
+    );
 }
 
 fn rows_for_human_console(run: &StressRun) -> Vec<&BenchmarkSummary> {
@@ -430,17 +540,31 @@ fn write_human_table(
     output: &mut String,
     summaries: &[&BenchmarkSummary],
     comparisons: &BTreeMap<&str, &ComparisonResult>,
+    name_mode: ConsoleNameMode,
 ) {
-    write_human_table_header(output);
+    let name_width = human_table_name_width(summaries, name_mode);
+    write_human_table_header(output, name_width);
     for summary in summaries {
-        write_human_table_row(output, summary);
+        write_human_table_row(output, summary, name_mode, name_width);
     }
     write_issue_groups(output, &suite_issue_groups(summaries, comparisons));
 }
 
-fn write_human_table_header(output: &mut String) {
+fn human_table_name_width(summaries: &[&BenchmarkSummary], name_mode: ConsoleNameMode) -> usize {
+    match name_mode {
+        ConsoleNameMode::Compact => HUMAN_TABLE_NAME_WIDTH,
+        ConsoleNameMode::Full => summaries
+            .iter()
+            .map(|summary| name_with_parameter_hint(summary).chars().count())
+            .max()
+            .unwrap_or(HUMAN_TABLE_NAME_WIDTH)
+            .max("benchmark".len()),
+    }
+}
+
+fn write_human_table_header(output: &mut String, name_width: usize) {
     let header = format!(
-        "{benchmark:<HUMAN_TABLE_NAME_WIDTH$} {value:>HUMAN_TABLE_VALUE_WIDTH$} {p50:>HUMAN_TABLE_VALUE_WIDTH$} {p95:>HUMAN_TABLE_VALUE_WIDTH$} {p99:>HUMAN_TABLE_VALUE_WIDTH$} {rsd:>7} {allocs:>HUMAN_TABLE_ALLOC_WIDTH$} {bytes:>HUMAN_TABLE_ALLOC_WIDTH$}",
+        "{benchmark:<name_width$} {value:>HUMAN_TABLE_VALUE_WIDTH$} {p50:>HUMAN_TABLE_VALUE_WIDTH$} {p95:>HUMAN_TABLE_VALUE_WIDTH$} {p99:>HUMAN_TABLE_VALUE_WIDTH$} {rsd:>7} {allocs:>HUMAN_TABLE_ALLOC_WIDTH$} {bytes:>HUMAN_TABLE_ALLOC_WIDTH$}",
         benchmark = "benchmark",
         value = "value",
         p50 = "p50",
@@ -449,13 +573,19 @@ fn write_human_table_header(output: &mut String) {
         rsd = "rsd",
         allocs = "alloc/op",
         bytes = "B/op",
+        name_width = name_width,
     );
     let _ = writeln!(output, "{header}");
     let _ = writeln!(output, "{}", "-".repeat(header.len()));
 }
 
-fn write_human_table_row(output: &mut String, summary: &BenchmarkSummary) {
-    let name = truncate_name_to_width(&summary.name, HUMAN_TABLE_NAME_WIDTH);
+fn write_human_table_row(
+    output: &mut String,
+    summary: &BenchmarkSummary,
+    name_mode: ConsoleNameMode,
+    name_width: usize,
+) {
+    let name = format_human_table_name(summary, name_mode, name_width);
     let value = summary.primary_value().map_or_else(
         || "n/a".to_string(),
         |value| format_metric_value(value, summary.primary_metric),
@@ -470,10 +600,36 @@ fn write_human_table_row(output: &mut String, summary: &BenchmarkSummary) {
     );
     let _ = writeln!(
         output,
-        "{name:<HUMAN_TABLE_NAME_WIDTH$} {value:>HUMAN_TABLE_VALUE_WIDTH$} {p50:>HUMAN_TABLE_VALUE_WIDTH$} {p95:>HUMAN_TABLE_VALUE_WIDTH$} {p99:>HUMAN_TABLE_VALUE_WIDTH$} {rsd:>7} {allocs:>HUMAN_TABLE_ALLOC_WIDTH$} {bytes:>HUMAN_TABLE_ALLOC_WIDTH$}",
+        "{name:<name_width$} {value:>HUMAN_TABLE_VALUE_WIDTH$} {p50:>HUMAN_TABLE_VALUE_WIDTH$} {p95:>HUMAN_TABLE_VALUE_WIDTH$} {p99:>HUMAN_TABLE_VALUE_WIDTH$} {rsd:>7} {allocs:>HUMAN_TABLE_ALLOC_WIDTH$} {bytes:>HUMAN_TABLE_ALLOC_WIDTH$}",
         allocs = format_optional_scaled_stat(summary.allocs_per_op.as_ref()),
         bytes = format_optional_scaled_stat(summary.bytes_per_op.as_ref()),
+        name_width = name_width,
     );
+}
+
+fn format_human_table_name(
+    summary: &BenchmarkSummary,
+    name_mode: ConsoleNameMode,
+    width: usize,
+) -> String {
+    let name = name_with_parameter_hint(summary);
+    match name_mode {
+        ConsoleNameMode::Compact => truncate_name_to_width(&name, width),
+        ConsoleNameMode::Full => name,
+    }
+}
+
+fn name_with_parameter_hint(summary: &BenchmarkSummary) -> String {
+    if summary.parameters.is_empty() {
+        return summary.name.clone();
+    }
+    let hints = summary
+        .parameters
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{} [{hints}]", summary.name)
 }
 
 fn write_final_result_line(output: &mut String, runs: &[StressRun]) {
@@ -936,6 +1092,7 @@ fn format_summary_blocks(run: &StressRun) -> String {
     let budget_failures = budget_failure_count(&run.summaries);
     let quality_failures = quality_gate_failures(run).len();
     let regressions = regression_gate_count(run);
+    let diagnostic_failures = diagnostic_gate_count(run);
     let improvements = comparison_count(run, ComparisonClass::Improvement);
     let _ = writeln!(output, "Summary");
     let _ = writeln!(output, "  benchmarks:      {}", run.summaries.len());
@@ -947,8 +1104,9 @@ fn format_summary_blocks(run: &StressRun) -> String {
     );
     let _ = writeln!(output, "  correctness_bad: {correctness_failed}");
     let _ = writeln!(output, "  budget_failed:   {budget_failures}");
-    let _ = writeln!(output, "  quality_failed:  {quality_failures}");
     let _ = writeln!(output, "  regressions:     {regressions}");
+    let _ = writeln!(output, "  diagnostics:     {diagnostic_failures}");
+    let _ = writeln!(output, "  quality_failed:  {quality_failures}");
     let _ = writeln!(output, "  improvements:    {improvements}");
     let counts = quality_counts(&run.summaries);
     let _ = writeln!(output, "Quality");
@@ -965,8 +1123,6 @@ fn attention_items(run: &StressRun) -> Vec<String> {
     let mut seen = BTreeSet::new();
     push_correctness_attention(&mut items, &mut seen, &run.summaries);
     push_budget_attention(&mut items, &mut seen, &run.summaries);
-    push_quality_gate_attention(&mut items, &mut seen, run);
-    push_noisy_attention(&mut items, &mut seen, &run.summaries);
     push_comparison_attention(
         &mut items,
         &mut seen,
@@ -974,6 +1130,9 @@ fn attention_items(run: &StressRun) -> Vec<String> {
         &comparisons,
         ComparisonClass::Regression,
     );
+    push_diagnostic_gate_attention(&mut items, &mut seen, run);
+    push_quality_gate_attention(&mut items, &mut seen, run);
+    push_noisy_attention(&mut items, &mut seen, &run.summaries);
     push_diagnostic_attention(
         &mut items,
         &mut seen,
@@ -1106,6 +1265,28 @@ fn push_quality_gate_attention(
                 summary.quality,
                 run.environment.profile_config.min_quality,
                 row_notes(summary)
+            ));
+        }
+    }
+}
+
+fn push_diagnostic_gate_attention(
+    items: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+    run: &StressRun,
+) {
+    let Some(threshold) = run.environment.profile_config.deny_diagnostics else {
+        return;
+    };
+    for diagnostic in run
+        .diagnostics_summary
+        .iter()
+        .filter(|diagnostic| diagnostic.severity.at_least(threshold))
+    {
+        if seen.insert(diagnostic.benchmark_id.clone()) {
+            items.push(format!(
+                "! {} diagnostic {}={}: {}",
+                diagnostic.name, diagnostic.severity, diagnostic.code, diagnostic.reason
             ));
         }
     }
@@ -1449,6 +1630,18 @@ fn regression_gate_count(run: &StressRun) -> usize {
         .count()
 }
 
+fn diagnostic_gate_count(run: &StressRun) -> usize {
+    run.environment
+        .profile_config
+        .deny_diagnostics
+        .map_or(0, |threshold| {
+            run.diagnostics_summary
+                .iter()
+                .filter(|diagnostic| diagnostic.severity.at_least(threshold))
+                .count()
+        })
+}
+
 fn comparison_count(run: &StressRun, class: ComparisonClass) -> usize {
     run.comparisons
         .iter()
@@ -1464,16 +1657,25 @@ fn gate_status(run: &StressRun) -> String {
     if budget_failure_count(&run.summaries) != 0 {
         return "failed budget".to_string();
     }
+    let regressions = regression_gate_count(run);
+    if regressions != 0 {
+        return format!("failed regression ({regressions})");
+    }
+    let diagnostic_failures = diagnostic_gate_count(run);
+    if diagnostic_failures != 0 {
+        let threshold = run
+            .environment
+            .profile_config
+            .deny_diagnostics
+            .map_or("unknown".to_string(), |threshold| threshold.to_string());
+        return format!("failed diagnostics ({diagnostic_failures} >= {threshold})");
+    }
     let quality_failures = quality_gate_failures(run).len();
     if quality_failures != 0 {
         return format!(
             "failed quality ({quality_failures} below {})",
             run.environment.profile_config.min_quality
         );
-    }
-    let regressions = regression_gate_count(run);
-    if regressions != 0 {
-        return format!("failed regression ({regressions})");
     }
     "passed".to_string()
 }
@@ -1761,8 +1963,8 @@ mod tests {
     use super::*;
     use crate::artifact::{
         BenchmarkBudgets, BenchmarkMode, BenchmarkSpec, BudgetResult, ComparisonResult,
-        CorrectnessCounters, CorrectnessSummary, DiagnosticSeverity, EnvironmentInfo,
-        MeasurementIntent, Sample, SamplePhase, SummaryStats, SCHEMA_VERSION,
+        ConsoleNameMode, CorrectnessCounters, CorrectnessSummary, DiagnosticSeverity,
+        EnvironmentInfo, MeasurementIntent, Sample, SamplePhase, SummaryStats, SCHEMA_VERSION,
     };
 
     fn summary(name: &str, value: f64, quality: QualityClass) -> BenchmarkSummary {
@@ -1856,6 +2058,7 @@ mod tests {
             }],
             summaries,
             comparisons: Vec::new(),
+            diagnostics_summary: Vec::new(),
             started_at: "123".to_string(),
             total_elapsed_ns: 1_000,
             metadata: BTreeMap::new(),
@@ -1929,6 +2132,57 @@ mod tests {
         assert_eq!(
             truncate_name_to_width("abcdefghijklmnopqrstuvwx", 10),
             "abcd..uvwx"
+        );
+    }
+
+    #[test]
+    fn compact_console_names_allow_64_characters() {
+        let name = "a".repeat(64);
+
+        assert_eq!(truncate_name_to_width(&name, HUMAN_TABLE_NAME_WIDTH), name);
+    }
+
+    #[test]
+    fn compact_console_names_preserve_parameter_suffixes() {
+        let mut single = summary(
+            "storage::reader::payload_lookup_for_small_client_group",
+            1_000_000.0,
+            QualityClass::Acceptable,
+        );
+        single
+            .parameters
+            .insert("clients".to_string(), "1".to_string());
+        let mut many = summary(
+            "storage::reader::payload_lookup_for_large_client_group",
+            1_000_000.0,
+            QualityClass::Acceptable,
+        );
+        many.parameters
+            .insert("clients".to_string(), "16".to_string());
+
+        let report = format_console_output(&run_with_summaries(vec![single, many]));
+
+        assert!(report.contains("clients=1]"));
+        assert!(report.contains("clients=16]"));
+        assert!(report.contains(".."));
+    }
+
+    #[test]
+    fn full_console_names_are_untruncated() {
+        let mut row = summary(
+            "storage::reader::payload_lookup_for_large_client_group",
+            1_000_000.0,
+            QualityClass::Acceptable,
+        );
+        row.parameters
+            .insert("clients".to_string(), "16".to_string());
+        let mut run = run_with_summaries(vec![row]);
+        run.environment.profile_config.console_names = ConsoleNameMode::Full;
+
+        let report = format_console_output(&run);
+
+        assert!(
+            report.contains("storage::reader::payload_lookup_for_large_client_group [clients=16]")
         );
     }
 
