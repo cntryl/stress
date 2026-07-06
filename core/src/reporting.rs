@@ -612,10 +612,9 @@ fn format_human_table_name(
     name_mode: ConsoleNameMode,
     width: usize,
 ) -> String {
-    let name = name_with_parameter_hint(summary);
     match name_mode {
-        ConsoleNameMode::Compact => truncate_name_to_width(&name, width),
-        ConsoleNameMode::Full => name,
+        ConsoleNameMode::Compact => truncate_name_to_width(&summary.name, width),
+        ConsoleNameMode::Full => name_with_parameter_hint(summary),
     }
 }
 
@@ -2143,28 +2142,20 @@ mod tests {
     }
 
     #[test]
-    fn compact_console_names_preserve_parameter_suffixes() {
-        let mut single = summary(
-            "storage::reader::payload_lookup_for_small_client_group",
+    fn compact_console_names_are_64_character_labels() {
+        let mut row = summary(
+            "storage::reader::payload_lookup_for_large_client_group_with_expensive_projection",
             1_000_000.0,
             QualityClass::Acceptable,
         );
-        single
-            .parameters
-            .insert("clients".to_string(), "1".to_string());
-        let mut many = summary(
-            "storage::reader::payload_lookup_for_large_client_group",
-            1_000_000.0,
-            QualityClass::Acceptable,
-        );
-        many.parameters
+        row.parameters
             .insert("clients".to_string(), "16".to_string());
 
-        let report = format_console_output(&run_with_summaries(vec![single, many]));
+        let label = format_human_table_name(&row, ConsoleNameMode::Compact, HUMAN_TABLE_NAME_WIDTH);
 
-        assert!(report.contains("clients=1]"));
-        assert!(report.contains("clients=16]"));
-        assert!(report.contains(".."));
+        assert_eq!(label.chars().count(), HUMAN_TABLE_NAME_WIDTH);
+        assert!(label.contains(".."));
+        assert!(!label.contains("clients"));
     }
 
     #[test]
