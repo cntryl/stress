@@ -2386,7 +2386,7 @@ fn measurement_mode(summary: &BenchmarkSummary) -> MeasurementMode {
             "duration" => Some(MeasurementMode::Duration),
             _ => None,
         })
-        .unwrap_or_else(|| match summary.tier {
+        .unwrap_or(match summary.tier {
             1 => MeasurementMode::Micro,
             2 => MeasurementMode::FixedOps,
             _ => MeasurementMode::Duration,

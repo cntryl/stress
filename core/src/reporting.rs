@@ -49,6 +49,7 @@ pub struct SampleProgress {
 
 const NAME_WIDTH: usize = 36;
 const HUMAN_TABLE_NAME_WIDTH: usize = 64;
+const HUMAN_TABLE_MEASUREMENT_WIDTH: usize = 14;
 const HUMAN_TABLE_VALUE_WIDTH: usize = 16;
 const HUMAN_TABLE_TRUST_WIDTH: usize = 12;
 const HUMAN_TABLE_MODE_WIDTH: usize = 10;
@@ -564,8 +565,9 @@ fn human_table_name_width(summaries: &[&BenchmarkSummary], name_mode: ConsoleNam
 
 fn write_human_table_header(output: &mut String, name_width: usize) {
     let header = format!(
-        "{benchmark:<name_width$} {value:>HUMAN_TABLE_VALUE_WIDTH$} {p50:>HUMAN_TABLE_VALUE_WIDTH$} {p95:>HUMAN_TABLE_VALUE_WIDTH$} {p99:>HUMAN_TABLE_VALUE_WIDTH$} {rsd:>7} {trust:>HUMAN_TABLE_TRUST_WIDTH$} {mode:>HUMAN_TABLE_MODE_WIDTH$} {question}",
+        "{benchmark:<name_width$} {measurement:<HUMAN_TABLE_MEASUREMENT_WIDTH$} {value:>HUMAN_TABLE_VALUE_WIDTH$} {p50:>HUMAN_TABLE_VALUE_WIDTH$} {p95:>HUMAN_TABLE_VALUE_WIDTH$} {p99:>HUMAN_TABLE_VALUE_WIDTH$} {rsd:>7} {trust:>HUMAN_TABLE_TRUST_WIDTH$} {mode:>HUMAN_TABLE_MODE_WIDTH$}",
         benchmark = "benchmark",
+        measurement = "measurement",
         value = "value",
         p50 = "p50",
         p95 = "p95",
@@ -573,7 +575,6 @@ fn write_human_table_header(output: &mut String, name_width: usize) {
         rsd = "rsd",
         trust = "trust",
         mode = "mode",
-        question = "question",
         name_width = name_width,
     );
     let _ = writeln!(output, "{header}");
@@ -589,22 +590,23 @@ fn write_human_table_row(
     let name = format_human_table_name(summary, name_mode, name_width);
     let value = summary.primary_value().map_or_else(
         || "n/a".to_string(),
-        |value| format_metric_value(value, summary),
+        |value| format_human_metric_value(value, summary),
     );
+    let measurement = human_measurement_label(summary);
     let stats = summary.stats.as_ref();
-    let p50 = format_metric_stat(summary, stats, |stats| stats.p50);
-    let p95 = format_metric_stat(summary, stats, |stats| stats.p95);
-    let p99 = format_metric_stat(summary, stats, |stats| stats.p99);
+    let p50 = format_human_metric_stat(summary, stats, |stats| stats.p50);
+    let p95 = format_human_metric_stat(summary, stats, |stats| stats.p95);
+    let p99 = format_human_metric_stat(summary, stats, |stats| stats.p99);
     let rsd = stats.map_or_else(
         || "n/a".to_string(),
         |stats| format_percent(stats.relative_std_dev),
     );
     let _ = writeln!(
         output,
-        "{name:<name_width$} {value:>HUMAN_TABLE_VALUE_WIDTH$} {p50:>HUMAN_TABLE_VALUE_WIDTH$} {p95:>HUMAN_TABLE_VALUE_WIDTH$} {p99:>HUMAN_TABLE_VALUE_WIDTH$} {rsd:>7} {trust:>HUMAN_TABLE_TRUST_WIDTH$} {mode:>HUMAN_TABLE_MODE_WIDTH$} {question}",
+        "{name:<name_width$} {measurement:<HUMAN_TABLE_MEASUREMENT_WIDTH$} {value:>HUMAN_TABLE_VALUE_WIDTH$} {p50:>HUMAN_TABLE_VALUE_WIDTH$} {p95:>HUMAN_TABLE_VALUE_WIDTH$} {p99:>HUMAN_TABLE_VALUE_WIDTH$} {rsd:>7} {trust:>HUMAN_TABLE_TRUST_WIDTH$} {mode:>HUMAN_TABLE_MODE_WIDTH$}",
+        measurement = measurement,
         trust = summary.trust_class,
         mode = measurement_mode_label(summary),
-        question = measurement_question(summary),
         name_width = name_width,
     );
 }
@@ -1836,7 +1838,19 @@ fn format_metric_value(value: f64, summary: &BenchmarkSummary) -> String {
     }
 }
 
-fn format_metric_stat<F>(
+fn format_human_metric_value(value: f64, summary: &BenchmarkSummary) -> String {
+    if !value.is_finite() {
+        return "n/a".to_string();
+    }
+    match summary.primary_metric {
+        PrimaryMetric::Throughput => format_scaled_number(value),
+        PrimaryMetric::LatencyP95 | PrimaryMetric::NsPerOp => {
+            format_duration_ns(f64_to_u128(value))
+        }
+    }
+}
+
+fn format_human_metric_stat<F>(
     summary: &BenchmarkSummary,
     stats: Option<&SummaryStats>,
     select: F,
@@ -1846,7 +1860,7 @@ where
 {
     stats.map_or_else(
         || "n/a".to_string(),
-        |stats| format_metric_value(select(stats), summary),
+        |stats| format_human_metric_value(select(stats), summary),
     )
 }
 
@@ -2082,6 +2096,14 @@ fn measurement_question(summary: &BenchmarkSummary) -> String {
     parts.join("; ")
 }
 
+fn human_measurement_label(summary: &BenchmarkSummary) -> String {
+    let unit = display_unit(summary);
+    match summary.primary_metric {
+        PrimaryMetric::Throughput => format!("{unit}/s"),
+        PrimaryMetric::LatencyP95 | PrimaryMetric::NsPerOp => format!("time/{unit}"),
+    }
+}
+
 fn display_unit(summary: &BenchmarkSummary) -> String {
     normalization_basis_unit(summary)
         .or_else(|| logical_unit(summary))
@@ -2278,18 +2300,24 @@ mod tests {
             header.split_whitespace().collect::<Vec<_>>(),
             vec![
                 "benchmark",
+                "measurement",
                 "value",
                 "p50",
                 "p95",
                 "p99",
                 "rsd",
                 "trust",
-                "mode",
-                "question"
+                "mode"
             ]
         );
         assert!(report.contains("queue::fast"));
+        assert!(report.contains("op/s"));
         assert!(report.contains("1.00M"));
+        let fast_row = report
+            .lines()
+            .find(|line| line.starts_with("queue::fast"))
+            .expect("fast benchmark row");
+        assert_eq!(fast_row.matches("op/s").count(), 1);
         assert!(!report.contains("Summary"));
         assert!(!report.contains("Quality"));
         assert!(!report.contains("issues"));
@@ -2595,7 +2623,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_include_trust_mode_and_question_columns() {
+    fn console_reports_measurement_trust_and_mode_columns() {
         let mut benchmark = summary("queue::row", 100.0, QualityClass::Acceptable);
         benchmark.trust_class = TrustClass::Diagnostic;
         benchmark
@@ -2611,12 +2639,37 @@ mod tests {
 
         assert!(console.contains("trust"));
         assert!(console.contains("mode"));
-        assert!(console.contains("question"));
+        assert!(console.contains("measurement"));
         assert!(console.contains("diagnostic"));
         assert!(console.contains("transaction/s"));
-        assert!(console.contains("mode=duration"));
+        assert!(console.contains("duration"));
+        assert!(!console.contains("mode=duration"));
         assert!(markdown.contains("| Trust | Mode | Question |"));
         assert!(markdown.contains("diagnostic"));
+    }
+
+    #[test]
+    fn console_uses_batch_normalization_without_repeating_batch_shape() {
+        let mut benchmark = summary("get_batch_hit_1000", 50_500.0, QualityClass::Acceptable);
+        benchmark.primary_metric = PrimaryMetric::NsPerOp;
+        benchmark
+            .parameters
+            .insert("logical_unit".to_string(), "cache_lookup_batch".to_string());
+        benchmark.parameters.insert(
+            "lookups_per_logical_operation".to_string(),
+            "1000".to_string(),
+        );
+        let run = run_with_summaries(vec![benchmark]);
+
+        let console = format_console_output(&run);
+        let row = console
+            .lines()
+            .find(|line| line.starts_with("get_batch_hit_1000"))
+            .expect("batch benchmark row");
+
+        assert!(row.contains("time/lookup"));
+        assert!(row.contains("µs"));
+        assert!(!row.contains("1000 lookup/batch"));
     }
 
     #[test]

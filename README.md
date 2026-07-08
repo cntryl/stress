@@ -356,7 +356,7 @@ cargo bench --bench storage_stress
 cargo bench --bench storage_stress -- --json
 ```
 
-`cargo bench --bench ...` uses one console format: one simple benchmark table per suite with `benchmark`, `value`, `p50`, `p95`, `p99`, `rsd`, `alloc/op`, and `B/op` columns. Suite-local `issues` appear directly after a table only when a row needs attention, and the run ends with one `result:` line. Use `--json` only for machine-readable stdout.
+`cargo bench --bench ...` uses one console format: one simple benchmark table per suite with `benchmark`, `measurement`, `value`, `p50`, `p95`, `p99`, `rsd`, `trust`, and `mode` columns. Suite-local `issues` appear directly after a table only when a row needs attention, and the run ends with one `result:` line. Use `--json` only for machine-readable stdout.
 
 ## Artifacts
 
