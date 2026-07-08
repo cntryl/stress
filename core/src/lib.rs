@@ -1,18 +1,20 @@
 //! # cntryl-stress
 //!
-//! Benchmarks for engineers optimizing real code.
+//! Performance benchmarks for engineers who need trustworthy artifacts, not
+//! just timing numbers.
 //!
-//! cntryl-stress is an opinionated benchmarking framework focused on making
-//! performance work simple, repeatable, and trustworthy. It encourages
-//! deterministic, low-ceremony benchmarks and highlights common benchmark
-//! authoring mistakes automatically.
+//! cntryl-stress is an opinionated Rust benchmarking framework for performance
+//! engineering loops. It keeps benchmark authoring low ceremony while producing
+//! structured artifacts, diagnostics, and gates that can support real
+//! optimization decisions.
 //!
-//! The framework is designed around the questions developers ask every day:
+//! The framework is designed around one core question:
 //!
-//! - Is this change faster?
-//! - Is the measurement stable?
-//! - Is the benchmark measuring the code I intended?
-//! - Can I trust this result?
+//! - Can this benchmark row be trusted?
+//!
+//! It helps answer that by recording raw samples, deriving summaries from
+//! measured samples only, preserving correctness counters, and calling out
+//! common benchmark-shape mistakes automatically.
 //!
 //! Tier labels:
 //!

@@ -1,9 +1,9 @@
 //! Stress runner that records raw samples and derives current artifacts.
 
 use crate::artifact::{
-    attach_regression_diagnostics, compare_summaries, diagnostic_summary_for_run,
-    summarize_benchmark, BenchmarkModeKind, BenchmarkSpec, ComparisonClass, EnvironmentInfo,
-    MeasurementIntent, Sample, SamplePhase, StressRun, MAX_TIER, SCHEMA_VERSION,
+    attach_measurement_mode_mismatch_diagnostics, attach_regression_diagnostics, compare_summaries,
+    diagnostic_summary_for_run, summarize_benchmark, BenchmarkModeKind, BenchmarkSpec,
+    EnvironmentInfo, MeasurementIntent, Sample, SamplePhase, StressRun, MAX_TIER, SCHEMA_VERSION,
 };
 use crate::config::StressRunnerConfig;
 use crate::context::{MeasurementRecord, StressContext};
@@ -247,6 +247,7 @@ impl StressRunner {
 
     fn finish_inner(mut self, comparisons: Vec<crate::artifact::ComparisonResult>) -> StressRun {
         attach_regression_diagnostics(&mut self.summaries, &comparisons);
+        attach_measurement_mode_mismatch_diagnostics(&mut self.summaries);
         let diagnostics_summary = diagnostic_summary_for_run(&self.suite, &self.summaries);
         let run = StressRun {
             schema_version: SCHEMA_VERSION.to_string(),
@@ -475,6 +476,9 @@ fn register_measurement_spec(
     if let Some(spec) = derived_specs.get_mut(benchmark_id) {
         spec.metadata.extend(record.metadata.clone());
         spec.parameters.extend(record.parameters.clone());
+        spec.parameters
+            .entry("measurement_mode".to_string())
+            .or_insert_with(|| measurement_mode_label(record.mode.kind()).to_string());
         if record.mode.kind() == BenchmarkModeKind::Micro
             && record.intent == MeasurementIntent::Batch
         {
@@ -497,6 +501,9 @@ fn register_measurement_spec(
     }
     let mut parameters = base_spec.parameters.clone();
     parameters.extend(record.parameters.clone());
+    parameters
+        .entry("measurement_mode".to_string())
+        .or_insert_with(|| measurement_mode_label(record.mode.kind()).to_string());
     derived_specs.insert(
         benchmark_id.to_string(),
         BenchmarkSpec {
@@ -510,6 +517,14 @@ fn register_measurement_spec(
             metadata,
         },
     );
+}
+
+const fn measurement_mode_label(kind: BenchmarkModeKind) -> &'static str {
+    match kind {
+        BenchmarkModeKind::Micro => "micro",
+        BenchmarkModeKind::FixedOperations => "fixed_ops",
+        BenchmarkModeKind::FixedDuration => "duration",
+    }
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -630,12 +645,7 @@ pub fn evaluate_run_gate(run: &StressRun) -> RunGate {
         return RunGate::BudgetFailed;
     }
     let profile_config = &run.environment.profile_config;
-    if profile_config.fail_on_regression
-        && run
-            .comparisons
-            .iter()
-            .any(|comparison| comparison.classification == ComparisonClass::Regression)
-    {
+    if profile_config.fail_on_regression && !run.regressions().is_empty() {
         return RunGate::RegressionFailed;
     }
     if profile_config
@@ -656,6 +666,7 @@ mod tests {
     use crate::artifact::{
         BenchmarkBudgets, BenchmarkMode, BenchmarkModeKind, ComparisonClass, ComparisonResult,
         CorrectnessCounters, DiagnosticSeverity, PrimaryMetric, QualityClass, RunProfile,
+        TrustClass,
     };
     use std::sync::Mutex;
     use std::time::Duration;
@@ -782,7 +793,9 @@ mod tests {
         runner.run("bench", |ctx| {
             ctx.measure("work", || {});
         });
-        let run = runner.finish();
+        let mut run = runner.finish();
+        run.summaries[0].quality = QualityClass::Noisy;
+        run.summaries[0].trust_class = TrustClass::Gate;
 
         assert_eq!(evaluate_run_gate(&run), RunGate::QualityFailed);
     }
@@ -901,6 +914,8 @@ mod tests {
     fn regression_gate_precedes_diagnostics_gate() {
         let mut run = warning_diagnostic_run(Some(DiagnosticSeverity::Warning));
         run.environment.profile_config.fail_on_regression = true;
+        run.summaries[0].quality = QualityClass::Acceptable;
+        run.summaries[0].trust_class = TrustClass::Gate;
         run.comparisons.push(ComparisonResult {
             benchmark_id: run.summaries[0].benchmark_id.clone(),
             current_quality: QualityClass::Acceptable,

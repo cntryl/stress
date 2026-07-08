@@ -1,7 +1,12 @@
 # Bench Recipes
 
-Pick the tier first, then use the matching timing recipe. The tier should make
-the benchmark body obvious.
+Pick the tier first, then use the matching timing recipe. A good stress
+benchmark makes the measured work, logical operation count, and benchmark row
+identity obvious from the body.
+
+These recipes are intentionally prescriptive. They keep benchmark rows
+comparable across runs and make diagnostics actionable when a row is noisy,
+untrustworthy, or measuring the wrong unit of work.
 
 | Tier | Scope | Default Recipe |
 |------|-------|----------------|
@@ -23,6 +28,23 @@ fn parse_header_hot_path(ctx: &mut StressContext) {
     ctx.parameter("header_len", header.len());
 
     ctx.measure("separator lookup", || black_box(header.iter().position(|byte| *byte == b':')));
+}
+```
+
+Tier 1 uses calibrated micro timing and reports `ns/op` as the primary metric.
+Keep the closure small and deterministic. If the row intentionally measures
+parsing, construction, or allocation behavior, add explicit row context so
+allocation diagnostics are interpreted correctly:
+
+```rust
+use cntryl_stress::{black_box, stress, StressContext};
+
+#[stress(tier = 1, metadata(row_class = "parsing"))]
+fn parse_header(ctx: &mut StressContext) {
+    let header = b"content-type:application/json";
+    ctx.measure("parse header", || {
+        black_box(header.split(|byte| *byte == b':').count())
+    });
 }
 ```
 
@@ -50,6 +72,11 @@ fn flush_ready_entries(ctx: &mut StressContext) {
     let _completed = ctx.measure_batch("flush ready entries", ready, || flush_ready_entries_once());
 }
 ```
+
+`measure_batch` returns the completed logical operation count. For Tier 1 batch
+rows, stress records `ns_per_op_basis = logical_completed_operation` in summary
+metadata so baseline tools do not compare old iteration-based rows to new
+logical-operation rows as if they were the same measurement.
 
 ## Tiers 3-6: Batched Throughput
 
@@ -91,6 +118,10 @@ fn remote_round_trip(ctx: &mut StressContext) {
 }
 ```
 
+Use `record_external` only when the external harness already knows both elapsed
+time and completed logical operations. If either value is approximate, record
+that context as metadata and avoid using the row as a release gate.
+
 ## Async Work
 
 Async measurements do not require a Tokio dependency in `cntryl-stress`; the
@@ -107,6 +138,29 @@ async fn read_from_cache(ctx: &mut StressContext) {
 }
 ```
 
+## Selecting Rows
+
+`--workload` can match the display name, Rust function name, module path,
+`module_path::function_name`, or `module_path::display_name`.
+
+```bash
+cargo bench --bench storage_stress -- --workload 'read_from_cache'
+cargo bench --bench storage_stress -- --workload 'storage::cache::*'
+```
+
+If nothing matches, stress prints close registered candidates so a typo does not
+look like an empty benchmark suite.
+
+## Run Freshness
+
+Set `STRESS_RUN_ID` when a larger script or CI job runs multiple benchmark
+binaries and wants their artifacts treated as one generation. The optional
+`cargo stress` wrapper does this automatically for child binaries.
+
+```bash
+STRESS_RUN_ID=ci-run-20260706-001 cargo bench --bench storage_stress
+```
+
 ## Anti-Patterns
 
 - Setup inside the measured closure: build deterministic fixtures before `ctx.measure*`.
@@ -115,3 +169,8 @@ async fn read_from_cache(ctx: &mut StressContext) {
 - Comparing unlike tiers: compare Tier 1 hot paths to Tier 1 hot paths, not to Tier 4 integration rows.
 - One-sample release gates: use `release` or enough measured samples for the quality class you need.
 - Allocation budgets without `cntryl_stress::stress_allocator!()`: install the allocator in the benchmark crate.
+- Treating construction, parsing, or allocation rows as accidental allocation
+  regressions: add `metadata(row_class = "...")`, then use explicit allocation
+  budgets when allocation count is a gate.
+- Reusing stale `latest.json` artifacts from different runs: group multi-suite
+  reports by `STRESS_RUN_ID` or refresh the full suite before comparing.

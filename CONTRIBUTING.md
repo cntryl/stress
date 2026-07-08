@@ -1,6 +1,9 @@
 # Contributing to cntryl-stress
 
-Thank you for your interest in contributing to cntryl-stress! This document provides guidelines and instructions for contributing.
+Thank you for your interest in contributing to cntryl-stress. The project
+optimizes for low-ceremony benchmark authoring, trustworthy artifacts, and
+clear diagnostics. Changes should preserve that workflow unless the discussion
+explicitly chooses a new direction.
 
 ## Code of Conduct
 
@@ -74,7 +77,8 @@ All of these must pass before submitting a PR.
 
 ### Running Benchmarks
 
-Test the benchmarks to ensure they work correctly:
+Run the demo benchmarks when changing benchmark authoring, reporting, or
+artifact behavior:
 
 ```bash
 cargo bench --bench stress-demo1
@@ -86,9 +90,11 @@ cargo bench --bench stress-demo2
 - **core/** - Main library (`cntryl-stress`)
   - `src/harness.rs` - Test discovery and execution
   - `src/runner.rs` - StressRunner API
-  - `src/report.rs` - Output reporters (Console, JSON)
-  - `src/result.rs` - Result data structures
+  - `src/reporting.rs` - Output reporters and human formatting
+  - `src/artifact.rs` - Artifact schema, summaries, diagnostics, and comparisons
+  - `src/context.rs` - Benchmark authoring context
   - `src/config.rs` - Configuration and CLI parsing
+  - `src/bin/cargo-stress.rs` - Optional `cargo stress` wrapper behind the `cli` feature
 
 - **macros/** - Proc macros (`cntryl-stress-macros`)
   - `src/lib.rs` - `#[stress]` and `stress_main!()` macros
@@ -104,7 +110,13 @@ cargo bench --bench stress-demo2
 2. Create a branch: `git checkout -b fix/issue-description`
 3. Make your changes
 4. Add tests if applicable
-5. Ensure all checks pass: `cargo test --workspace --all-features && cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::pedantic`
+5. Ensure all checks pass:
+   ```bash
+   cargo fmt --all -- --check
+   cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::pedantic
+   cargo test --workspace --all-features
+   cargo doc --workspace --all-features --no-deps
+   ```
 6. Create a pull request with a clear description
 
 ### For Features
@@ -114,7 +126,7 @@ cargo bench --bench stress-demo2
 3. Implement the feature
 4. Add tests for new functionality
 5. Update documentation if it affects the public API
-6. Ensure all checks pass
+6. Ensure the full check set passes
 7. Create a pull request
 
 ### For Documentation
@@ -147,10 +159,10 @@ cargo bench --bench stress-demo2
 
 Use clear, descriptive commit messages:
 
-- ✅ Good: `Add duration format helper to reporter`
-- ✅ Good: `Fix unicode handling in console output`
-- ❌ Bad: `fix stuff`
-- ❌ Bad: `wip`
+- Good: `Add duration format helper to reporter`
+- Good: `Fix unicode handling in console output`
+- Avoid: `fix stuff`
+- Avoid: `wip`
 
 ## Semantic Versioning
 
@@ -170,4 +182,4 @@ By contributing, you agree that your contributions will be licensed under the sa
 - Check the documentation in `docs/`
 - Create a discussion issue if you have questions
 
-Thank you for contributing! 🎉
+Thank you for contributing.

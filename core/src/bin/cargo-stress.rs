@@ -1064,6 +1064,7 @@ mod tests {
             allocs_per_op: None,
             bytes_per_op: None,
             quality,
+            trust_class: crate::artifact::TrustClass::Gate,
             budgets: BenchmarkBudgets::default(),
             budget_results: Vec::new(),
             diagnostics: Vec::new(),

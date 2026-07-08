@@ -4,96 +4,74 @@
 [![docs.rs](https://docs.rs/cntryl-stress/badge.svg)](https://docs.rs/cntryl-stress)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-Benchmarks for engineers optimizing real code.
+Performance benchmarks for engineers who need trustworthy artifacts, not just
+timing numbers.
 
-`@cntryl/stress` is an opinionated benchmarking framework focused on making performance work simple, repeatable, and trustworthy.
+`cntryl-stress` is an opinionated Rust benchmarking framework for performance
+engineering loops. It keeps benchmark authoring low ceremony while producing
+structured artifacts, diagnostics, and gates that can support real optimization
+decisions.
 
-It is designed around the questions developers ask every day:
+The core question is simple: **can this benchmark row be trusted?**
 
-- Is this change faster?
-- Is the measurement stable?
-- Is the benchmark measuring the code I intended?
-- Can I trust this result?
+`cntryl-stress` helps answer that by recording raw samples, deriving summaries
+from measured samples only, preserving correctness counters, and calling out
+common benchmark-shape mistakes such as uncounted batch work, invalid timing,
+high variance, setup-dominated measurements, and missing allocation tracking.
 
-stress encourages deterministic, low-ceremony benchmarks and highlights common benchmark authoring mistakes automatically.
+## What It Optimizes For
 
-## Philosophy
+- Small benchmark bodies that read like tests.
+- Deterministic fixtures with setup outside measured work.
+- Named measurements and stable row identifiers.
+- Logical operation counts for batch and throughput work.
+- Machine-readable JSON artifacts under `target/stress`.
+- Human output that prioritizes value, variance, allocations, and fixes.
+- Release gates based on correctness, budgets, diagnostics, quality, and
+  baseline comparisons.
 
-Writing a benchmark should be almost as easy as writing a unit test.
+## When To Use It
 
-A good benchmark should:
+Use `cntryl-stress` when benchmark output needs to feed an engineering
+workflow:
 
-- measure one thing
-- be deterministic
-- isolate setup from measured work
-- produce trustworthy numbers
-- make regressions obvious
+- Day-to-day optimization loops.
+- CI performance gates.
+- Baseline refresh decisions.
+- Release-quality benchmark reports.
+- Subsystem, integration, throughput, saturation, or soak-style workloads.
+- Allocation-aware hot-path and parser/constructor benchmarks.
 
-The framework should help you achieve those goals by default with minimal configuration.
+`cntryl-stress` is public tooling, but it is intentionally not neutral. It has
+opinions about benchmark shape because those opinions make performance work
+easier to repeat and harder to misread.
 
-## Opinionated by Design
+## When Not To Use It
 
-stress is intentionally opinionated.
+Do not reach for `cntryl-stress` first when you only need a quick one-off
+timing, rich statistical plotting for an isolated function, or a fully custom
+benchmarking policy. It works best when you want conventions, JSON artifacts,
+and actionable diagnostics more than a blank-slate benchmark harness.
 
-It prefers convention over configuration and encourages benchmark practices that lead to reliable performance measurements.
+## Benchmark Model
 
-The default output focuses on the information most useful during optimization:
+`cntryl-stress` organizes benchmarks by intent rather than by raw size:
 
-- execution time
-- latency distribution, including p50, p95, and p99
-- variance, reported as RSD
-- allocations per operation
-- bytes allocated per operation
-- benchmark diagnostics when results may not be trustworthy
+- Tier 1: Hot paths and microbenchmarks.
+- Tier 2: Subsystem operations.
+- Tier 3: System behavior.
+- Tier 4: Integration workloads.
+- Tier 5: Saturation and scaling scenarios.
+- Tier 6: Soak and endurance runs.
 
-When the benchmark itself needs improvement, stress tells you.
-
-## Built for Performance Engineering
-
-stress is designed for the iterative workflow of performance optimization:
-
-1. Write a benchmark.
-2. Verify the benchmark is trustworthy.
-3. Optimize the implementation.
-4. Measure again.
-5. Repeat.
-
-The framework helps distinguish problems in your code from problems in your benchmark.
-
-## Tiered Benchmarking
-
-stress encourages organizing benchmarks by intent rather than by size.
-
-- Tier 1: Hot paths and microbenchmarks
-- Tier 2: Subsystems
-- Tier 3: System behavior
-- Tier 4: Integration workloads
-- Tier 5: Production scenarios
-- Tier 6: Long-running stress and endurance testing
-
-Each tier represents a different level of confidence, isolation, and realism while using a consistent API and reporting model.
-
-## Low Ceremony
-
-Performance work should stay focused on the system under test.
-
-The API is intentionally small.
-
-The output is intentionally dense.
-
-The defaults are intentionally opinionated.
-
-You spend your time improving software, not configuring benchmarks.
-
-## Focused Scope
-
-stress is intentionally focused.
-
-It is built for engineers who spend significant time optimizing systems and want a fast feedback loop with minimal ceremony. It favors practical engineering decisions, clear benchmark shape, and a workflow optimized for day-to-day performance development.
+Each tier uses the same authoring API and reporting model, but the default
+timing shape changes to match the expected workload: micro timing for Tier 1,
+fixed operations for Tier 2, and fixed-duration windows for Tiers 3 through 6.
 
 ## Dependency Posture
 
-stress keeps the dependencies that directly support the benchmark authoring and reporting experience.
+`cntryl-stress` keeps the dependencies that directly support the benchmark
+authoring and reporting experience.
 
 - `serde` and `serde_json` are core dependencies because JSON artifacts, baselines, schema validation, and machine-readable output are part of the stable workflow.
 - `linkme` keeps `#[stress]` benchmarks automatically registered without asking users to maintain manual benchmark lists.
@@ -140,7 +118,7 @@ stress_main!();
 
 ```bash
 cargo bench --bench storage_stress
-cargo bench --bench storage_stress -- --workload '*fanout*'
+cargo bench --bench storage_stress -- --workload 'parse_route_hot_path'
 ```
 
 The optional `cargo stress` wrapper is feature-gated so ordinary benchmark builds do not compile its CLI dependency graph:
@@ -151,7 +129,21 @@ cargo stress
 cargo stress --baseline target/stress/storage_stress/latest.json
 ```
 
-## Model
+## Selection
+
+`--workload` filters the registered benchmark set before execution. It matches
+the display name, Rust function name, module path, `module_path::function_name`,
+and `module_path::display_name`.
+
+```bash
+cargo bench --bench storage_stress -- --workload 'parse_route_hot_path'
+cargo bench --bench storage_stress -- --workload 'queue::writer::*'
+```
+
+When no row matches, stress prints close registered candidates instead of
+failing with an empty selection message.
+
+## Run Semantics
 
 - `tier = 1..6` describes benchmark scope:
   - Tier 1: hot path
@@ -165,11 +157,21 @@ cargo stress --baseline target/stress/storage_stress/latest.json
 - Use `lab` for deeper exploratory runs with more samples and longer sample windows.
 - Use `release` for the trustworthy release-quality gate: quality enforcement and regression enforcement when a baseline is supplied.
 - JSON artifacts use `schema_version: "cntryl-stress.v2"`.
-- Raw `Sample` rows are authoritative; summaries, diagnostics, quality, and comparisons are derived from measured samples only.
+- `STRESS_RUN_ID` is copied into run metadata when present; `cargo stress`
+  creates one shared run id for all child benchmark binaries unless the caller
+  already supplied one.
+- Raw `Sample` rows are the source of truth; summaries, diagnostics, quality,
+  and comparisons are derived from measured samples only.
 - Warmup and cooldown samples are retained in JSON and excluded from summary statistics and baseline comparison.
 - Tier drives benchmark mode: Tier 1 uses micro timing, Tier 2 uses fixed operations, and Tiers 3-6 use fixed duration.
 - `mode = "..."` is not public API; choose `#[stress(tier = 1..6)]`.
 - Human console output is one table per suite. Bench-shape, result, and diagnostic issues are grouped after the table with concrete fixes.
+- Tier 1 batch rows mark `ns_per_op_basis = logical_completed_operation` so
+  baseline tools can treat changed ns/op semantics as a baseline refresh event,
+  not as a performance regression.
+- `metadata(row_class = "construction" | "parsing" | "allocation")` marks
+  allocation-oriented rows so allocation diagnostics are advisory unless an
+  explicit allocation budget fails.
 
 ## Tier Recipes
 
@@ -285,6 +287,7 @@ ctx.record_external("name", duration, n);
 #[stress(max_allocs_per_op = 0, max_bytes_per_op = 0, max_rsd_pct = 10)]
 #[stress(name = "custom_name", ignore)]
 #[stress(metadata(component = "queue", scenario = "fanout"))]
+#[stress(metadata(row_class = "parsing"))]
 ```
 
 Tiers are defined as 1 through 6. The macro rejects `tier = 0`, `tier > 6`, and any explicit `mode`.
@@ -324,11 +327,18 @@ Command-line arguments override `STRESS_*` environment variables, which override
 | `STRESS_JSON` | Emit machine-readable JSON to stdout instead of the console table |
 | `STRESS_INCLUDE_IGNORED` | Include ignored benchmarks |
 | `STRESS_BASELINE` | Baseline stress artifact |
+| `STRESS_BASELINE_DIR` | Baseline directory for `latest` and `--save-baseline` conventions |
+| `STRESS_SAVE_BASELINE` | Save a passed run under the baseline directory |
 | `STRESS_THRESHOLD` | Regression threshold |
 | `STRESS_GIT_SHA` | Git SHA override |
 | `STRESS_SAMPLE_DURATION_MS` | Fixed-duration sample budget |
 | `STRESS_OPERATIONS_PER_SAMPLE` | Fixed-operations sample size |
 | `STRESS_MICRO_SAMPLE_DURATION_MS` | Micro sample target duration |
+| `STRESS_RUN_ID` | Run generation identity copied into artifact metadata |
+| `STRESS_FAIL_ON_ISSUES` | Fail on warning-or-error diagnostics |
+| `STRESS_DENY_DIAGNOSTICS` | Fail on diagnostics at `info`, `warning`, or `error` |
+| `STRESS_CONSOLE_NAMES` | Human console name mode: `compact` or `full` |
+| `STRESS_PROGRESS` | Enable or disable stderr progress for human output |
 
 Harness options:
 
@@ -358,7 +368,11 @@ Files are written under `target/stress/{suite}/`:
 
 The JSON artifact contains tool version, run profile, environment, benchmark specs, raw samples, summaries, diagnostics, quality, and comparisons. Unknown environment fields are explicit `"unknown"` or `null`.
 
-## Import Migration
+Freshness-sensitive report tooling should group artifacts by `metadata.run_id`
+when present. Older artifacts without run ids can still be consumed, but mixed
+`latest.json` files from widely separated runs should be treated as stale.
+
+## Public API Layout
 
 Common benchmark files do not change: keep using root imports such as `stress`, `stress_main`, `black_box`, `StressContext`, `StressRunner`, `StressRunnerConfig`, `StressRunnerOptions`, and `RunProfile`.
 

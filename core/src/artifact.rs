@@ -317,6 +317,69 @@ impl std::str::FromStr for DiagnosticSeverity {
     }
 }
 
+/// Whether a benchmark row should participate in performance gates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustClass {
+    /// The row is semantically valid and can drive quality/regression gates.
+    #[default]
+    Gate,
+    /// The row is intentionally non-gating but still useful for diagnostics.
+    Diagnostic,
+    /// The row still needs follow-up validation before it should be treated as stable.
+    Experimental,
+    /// The row has known-bad semantics or blocking trust issues.
+    Invalid,
+}
+
+impl TrustClass {
+    /// Relative trust ordering used for override downgrades.
+    #[must_use]
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Invalid => 0,
+            Self::Experimental => 1,
+            Self::Diagnostic => 2,
+            Self::Gate => 3,
+        }
+    }
+
+    /// Return the less-trusted of two classes.
+    #[must_use]
+    pub const fn min(self, other: Self) -> Self {
+        if self.rank() <= other.rank() {
+            self
+        } else {
+            other
+        }
+    }
+}
+
+impl fmt::Display for TrustClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Gate => f.write_str("gate"),
+            Self::Diagnostic => f.write_str("diagnostic"),
+            Self::Experimental => f.write_str("experimental"),
+            Self::Invalid => f.write_str("invalid"),
+        }
+    }
+}
+
+impl std::str::FromStr for TrustClass {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "gate" => Ok(Self::Gate),
+            "diagnostic" => Ok(Self::Diagnostic),
+            "experimental" => Ok(Self::Experimental),
+            "invalid" => Ok(Self::Invalid),
+            other => Err(format!("unknown trust class '{other}'")),
+        }
+    }
+}
+
 /// Console benchmark-name presentation mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -389,6 +452,9 @@ pub struct DiagnosticSummary {
     pub suggestions: Vec<String>,
     /// Summary quality for the row that emitted the diagnostic.
     pub quality: QualityClass,
+    /// Trust classification for the row that emitted the diagnostic.
+    #[serde(default)]
+    pub trust_class: TrustClass,
     /// Structured parameters for the row that emitted the diagnostic.
     pub parameters: BTreeMap<String, String>,
 }
@@ -894,6 +960,9 @@ pub struct BenchmarkSummary {
     pub bytes_per_op: Option<SummaryStats>,
     /// Quality classification.
     pub quality: QualityClass,
+    /// Whether the row should participate in performance gates.
+    #[serde(default)]
+    pub trust_class: TrustClass,
     /// Budget gates copied from the spec.
     #[serde(default)]
     pub budgets: BenchmarkBudgets,
@@ -920,6 +989,12 @@ impl BenchmarkSummary {
             PrimaryMetric::Throughput | PrimaryMetric::NsPerOp => Some(stats.mean),
             PrimaryMetric::LatencyP95 => Some(stats.p95),
         }
+    }
+
+    /// Whether this row participates in quality and regression gates.
+    #[must_use]
+    pub const fn is_gate(&self) -> bool {
+        matches!(self.trust_class, TrustClass::Gate)
     }
 }
 
@@ -1039,15 +1114,23 @@ impl StressRun {
     pub fn meets_min_quality(&self, min_quality: QualityClass) -> bool {
         self.summaries
             .iter()
+            .filter(|summary| summary.is_gate())
             .all(|summary| quality_rank(summary.quality) >= quality_rank(min_quality))
     }
 
     /// Meaningful regression rows.
     #[must_use]
     pub fn regressions(&self) -> Vec<&ComparisonResult> {
+        let gate_rows = self
+            .summaries
+            .iter()
+            .filter(|summary| summary.is_gate())
+            .map(|summary| summary.benchmark_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
         self.comparisons
             .iter()
             .filter(|comparison| comparison.classification == ComparisonClass::Regression)
+            .filter(|comparison| gate_rows.contains(comparison.benchmark_id.as_str()))
             .collect()
     }
 
@@ -1092,6 +1175,7 @@ pub(crate) fn diagnostic_summary_for_run(
                     evidence: diagnostic.evidence.clone(),
                     suggestions: diagnostic.suggestions.clone(),
                     quality: summary.quality,
+                    trust_class: summary.trust_class,
                     parameters: summary.parameters.clone(),
                 })
         })
@@ -1130,6 +1214,7 @@ pub(crate) fn summarize_benchmark(spec: &BenchmarkSpec, samples: &[Sample]) -> B
     let values = primary_values(primary_metric, &measured);
     let stats = SummaryStats::from_values(&values);
     let wall_clock = SummaryStats::from_values(&wall_clock_values(&measured));
+    let completed_operations = completed_operation_stats(&measured);
     let total_wall_clock_ns = samples
         .iter()
         .filter(|sample| sample.benchmark_id == spec.id)
@@ -1163,6 +1248,15 @@ pub(crate) fn summarize_benchmark(spec: &BenchmarkSpec, samples: &[Sample]) -> B
         &diagnostics,
         &budget_results,
     );
+    let trust_class = derive_trust_class(
+        spec,
+        &diagnostics,
+        quality,
+        primary_metric,
+        measured.len(),
+        wall_clock.as_ref(),
+        completed_operations.as_ref(),
+    );
 
     BenchmarkSummary {
         benchmark_id: spec.id.clone(),
@@ -1182,6 +1276,7 @@ pub(crate) fn summarize_benchmark(spec: &BenchmarkSpec, samples: &[Sample]) -> B
         allocs_per_op,
         bytes_per_op,
         quality,
+        trust_class,
         budgets: spec.budgets,
         budget_results,
         diagnostics,
@@ -1252,7 +1347,6 @@ pub(crate) fn attach_regression_diagnostics(
                 "Compare the same benchmark row before updating baselines.".to_string()
             ],
         });
-        summary.quality = QualityClass::Untrustworthy;
     }
 
     for comparison in comparisons.iter().filter(|comparison| {
@@ -1277,6 +1371,60 @@ pub(crate) fn attach_regression_diagnostics(
                     .to_string(),
             ],
         });
+    }
+}
+
+pub(crate) fn attach_measurement_mode_mismatch_diagnostics(summaries: &mut [BenchmarkSummary]) {
+    let mut families = BTreeMap::<String, BTreeMap<String, Vec<usize>>>::new();
+    for (index, summary) in summaries.iter().enumerate() {
+        if summary.primary_metric != PrimaryMetric::Throughput {
+            continue;
+        }
+        let family = measurement_family(summary);
+        let mode = measurement_mode(summary).to_string();
+        families
+            .entry(family)
+            .or_default()
+            .entry(mode)
+            .or_default()
+            .push(index);
+    }
+
+    for (family, modes) in families {
+        if modes.len() < 2 {
+            continue;
+        }
+        let mode_names = modes.keys().cloned().collect::<Vec<_>>().join(", ");
+        for indices in modes.values() {
+            for index in indices {
+                let summary = &mut summaries[*index];
+                if summary
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "measurement_mode_mismatch")
+                {
+                    continue;
+                }
+                summary.diagnostics.push(BenchmarkDiagnostic {
+                    code: "measurement_mode_mismatch".to_string(),
+                    severity: DiagnosticSeverity::Warning,
+                    reason: "Sibling rows in the same workload family mix throughput measurement semantics."
+                        .to_string(),
+                    evidence: BTreeMap::from([
+                        ("family".to_string(), family.clone()),
+                        (
+                            "measurement_modes".to_string(),
+                            mode_names.clone(),
+                        ),
+                    ]),
+                    suggestions: vec![
+                        "Use one measurement_mode per workload family, or split fixed-op probes into explicit diagnostic rows."
+                            .to_string(),
+                    ],
+                });
+                summary.trust_class = derive_trust_class_from_summary(summary);
+            }
+        }
     }
 }
 
@@ -1707,12 +1855,9 @@ fn summary_diagnostics(input: DiagnosticInputs<'_>) -> Vec<BenchmarkDiagnostic> 
             high_allocation_suggestions(spec),
         ));
     }
-    if spec.mode.kind() == BenchmarkModeKind::Micro
-        && !micro_is_validated(spec)
-        && ns_per_op.is_some_and(|stats| stats.mean < 5.0)
-    {
+    if should_flag_likely_optimized_away(spec, ns_per_op) {
         diagnostics.push(diagnostic(
-            "suspicious_micro_timing",
+            "likely_optimized_away",
             DiagnosticSeverity::Warning,
             "Tier 1 timing is below 5 ns/op without explicit validation.",
             [(
@@ -1721,7 +1866,62 @@ fn summary_diagnostics(input: DiagnosticInputs<'_>) -> Vec<BenchmarkDiagnostic> 
                     .map(|stats| stats.mean.to_string())
                     .unwrap_or_default(),
             )],
-            ["Validate the microbenchmark independently before trusting this row, or batch more work."],
+            ["Vary inputs, accumulate observable outputs, and use validated_micro=true only after anti-DCE is explicit."],
+        ));
+    } else if should_flag_tiny_micro_timing(spec, ns_per_op) {
+        diagnostics.push(diagnostic(
+            "tiny_micro_timing",
+            DiagnosticSeverity::Warning,
+            "Tier 1 timing is below 15 ns/op without explicit validation.",
+            [(
+                "mean_ns_per_op",
+                ns_per_op
+                    .map(|stats| stats.mean.to_string())
+                    .unwrap_or_default(),
+            )],
+            ["Batch more logical work per sample, or keep the row as a validated diagnostic with an explicit trust_class downgrade."],
+        ));
+    }
+    if batch_unit_ambiguous(spec) {
+        diagnostics.push(diagnostic_with_evidence(
+            "batch_unit_ambiguous",
+            DiagnosticSeverity::Warning,
+            "Batched work is missing explicit logical-unit normalization metadata.",
+            batch_unit_ambiguity_evidence(spec),
+            vec![
+                "Add logical_unit and any *_per_logical_operation parameter so the report can state the measured question directly."
+                    .to_string(),
+            ],
+        ));
+    }
+    if fixed_ops_throughput(spec, samples) {
+        diagnostics.push(diagnostic_with_evidence(
+            "fixed_ops_throughput",
+            DiagnosticSeverity::Warning,
+            "A throughput row is using fixed-op timing semantics instead of a fixed-duration window.",
+            BTreeMap::from([
+                (
+                    "measurement_mode".to_string(),
+                    measurement_mode_for_spec(spec).to_string(),
+                ),
+                ("tier".to_string(), spec.tier.to_string()),
+            ]),
+            vec![
+                "Use duration-based throughput for main rows, or split the fixed-op probe into an explicit diagnostic row."
+                    .to_string(),
+            ],
+        ));
+    }
+    if flat_or_capped_throughput(spec, stats, wall_clock, samples) {
+        diagnostics.push(diagnostic_with_evidence(
+            "flat_or_capped_throughput",
+            DiagnosticSeverity::Warning,
+            "Throughput is near-perfectly flat while completed logical work is effectively fixed across samples.",
+            flat_or_capped_throughput_evidence(stats, wall_clock, samples),
+            vec![
+                "Confirm whether this row is an intentional capped-capacity probe; otherwise inspect local bottlenecks or move it out of the gate set."
+                    .to_string(),
+            ],
         ));
     }
     if (3..=MAX_TIER).contains(&spec.tier)
@@ -1954,7 +2154,7 @@ fn too_fast_sample(
         && samples
             .iter()
             .any(|sample| sample.elapsed_ns < 1_000 && sample.operations_completed <= 1)
-        || mode == BenchmarkModeKind::Micro && ns_per_op.is_some_and(|stats| stats.mean < 1.0)
+        || mode == BenchmarkModeKind::Micro && ns_per_op.is_some_and(|stats| stats.mean < 0.5)
 }
 
 fn overhead_evidence(overhead_ns_per_op: Option<&SummaryStats>) -> [(&'static str, String); 1] {
@@ -2056,6 +2256,315 @@ fn micro_is_validated(spec: &BenchmarkSpec) -> bool {
         .get("validated_micro")
         .or_else(|| spec.metadata.get("micro_validated"))
         .is_some_and(|value| value == "true")
+}
+
+fn should_flag_likely_optimized_away(
+    spec: &BenchmarkSpec,
+    ns_per_op: Option<&SummaryStats>,
+) -> bool {
+    spec.mode.kind() == BenchmarkModeKind::Micro
+        && !micro_is_validated(spec)
+        && ns_per_op.is_some_and(|stats| stats.mean < 5.0)
+}
+
+fn should_flag_tiny_micro_timing(spec: &BenchmarkSpec, ns_per_op: Option<&SummaryStats>) -> bool {
+    spec.mode.kind() == BenchmarkModeKind::Micro
+        && !micro_is_validated(spec)
+        && ns_per_op.is_some_and(|stats| (5.0..15.0).contains(&stats.mean))
+}
+
+fn batch_unit_ambiguous(spec: &BenchmarkSpec) -> bool {
+    if spec.intent != MeasurementIntent::Batch {
+        return false;
+    }
+    let Some(logical_unit) = spec.parameters.get("logical_unit") else {
+        return true;
+    };
+    logical_unit.contains("batch") && batch_normalization_basis(spec).is_none()
+}
+
+fn batch_unit_ambiguity_evidence(spec: &BenchmarkSpec) -> BTreeMap<String, String> {
+    let mut evidence = BTreeMap::new();
+    evidence.insert("intent".to_string(), spec.intent.to_string());
+    evidence.insert(
+        "logical_unit".to_string(),
+        spec.parameters
+            .get("logical_unit")
+            .cloned()
+            .unwrap_or_else(|| "<missing>".to_string()),
+    );
+    evidence.insert(
+        "measurement_mode".to_string(),
+        measurement_mode_for_spec(spec).to_string(),
+    );
+    evidence
+}
+
+fn fixed_ops_throughput(spec: &BenchmarkSpec, samples: &[&Sample]) -> bool {
+    spec.tier >= 3
+        && !samples.is_empty()
+        && infer_primary_metric(spec, samples) == PrimaryMetric::Throughput
+        && measurement_mode_for_spec(spec) == MeasurementMode::FixedOps
+}
+
+fn flat_or_capped_throughput(
+    spec: &BenchmarkSpec,
+    stats: Option<&SummaryStats>,
+    wall_clock: Option<&SummaryStats>,
+    samples: &[&Sample],
+) -> bool {
+    measurement_mode_for_spec(spec) == MeasurementMode::Duration
+        && infer_primary_metric(spec, samples) == PrimaryMetric::Throughput
+        && stats.is_some_and(|stats| stats.relative_std_dev <= 0.02)
+        && wall_clock.is_some_and(|stats| stats.relative_std_dev <= 0.02)
+        && completed_operation_stats(samples).is_some_and(|stats| stats.relative_std_dev <= 0.005)
+}
+
+fn flat_or_capped_throughput_evidence(
+    stats: Option<&SummaryStats>,
+    wall_clock: Option<&SummaryStats>,
+    samples: &[&Sample],
+) -> BTreeMap<String, String> {
+    let mut evidence = BTreeMap::new();
+    if let Some(stats) = stats {
+        evidence.insert(
+            "throughput_rsd".to_string(),
+            stats.relative_std_dev.to_string(),
+        );
+    }
+    if let Some(wall_clock) = wall_clock {
+        evidence.insert(
+            "wall_clock_rsd".to_string(),
+            wall_clock.relative_std_dev.to_string(),
+        );
+    }
+    if let Some(completed) = completed_operation_stats(samples) {
+        evidence.insert(
+            "completed_operations_rsd".to_string(),
+            completed.relative_std_dev.to_string(),
+        );
+    }
+    evidence
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeasurementMode {
+    Micro,
+    FixedOps,
+    Duration,
+}
+
+impl fmt::Display for MeasurementMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Micro => f.write_str("micro"),
+            Self::FixedOps => f.write_str("fixed_ops"),
+            Self::Duration => f.write_str("duration"),
+        }
+    }
+}
+
+fn measurement_mode_for_spec(spec: &BenchmarkSpec) -> MeasurementMode {
+    spec.parameters
+        .get("measurement_mode")
+        .and_then(|value| match value.as_str() {
+            "micro" => Some(MeasurementMode::Micro),
+            "fixed_ops" => Some(MeasurementMode::FixedOps),
+            "duration" => Some(MeasurementMode::Duration),
+            _ => None,
+        })
+        .unwrap_or_else(|| measurement_mode_for_kind(spec.mode.kind()))
+}
+
+fn measurement_mode(summary: &BenchmarkSummary) -> MeasurementMode {
+    summary
+        .parameters
+        .get("measurement_mode")
+        .and_then(|value| match value.as_str() {
+            "micro" => Some(MeasurementMode::Micro),
+            "fixed_ops" => Some(MeasurementMode::FixedOps),
+            "duration" => Some(MeasurementMode::Duration),
+            _ => None,
+        })
+        .unwrap_or_else(|| match summary.tier {
+            1 => MeasurementMode::Micro,
+            2 => MeasurementMode::FixedOps,
+            _ => MeasurementMode::Duration,
+        })
+}
+
+const fn measurement_mode_for_kind(kind: BenchmarkModeKind) -> MeasurementMode {
+    match kind {
+        BenchmarkModeKind::Micro => MeasurementMode::Micro,
+        BenchmarkModeKind::FixedOperations => MeasurementMode::FixedOps,
+        BenchmarkModeKind::FixedDuration => MeasurementMode::Duration,
+    }
+}
+
+fn batch_normalization_basis(spec: &BenchmarkSpec) -> Option<(String, String)> {
+    normalization_basis_from_parameters(&spec.parameters)
+}
+
+fn normalization_basis_from_parameters(
+    parameters: &BTreeMap<String, String>,
+) -> Option<(String, String)> {
+    parameters.iter().find_map(|(key, value)| {
+        key.strip_suffix("_per_logical_operation")
+            .map(|unit| (unit.to_string(), value.clone()))
+    })
+}
+
+fn measurement_family(summary: &BenchmarkSummary) -> String {
+    let tokens = summary.name.split('_').collect::<Vec<_>>();
+    if tokens.len() >= 4 {
+        let last = tokens[tokens.len() - 1];
+        let penultimate = tokens[tokens.len() - 2];
+        let antepenultimate = tokens[tokens.len() - 3];
+        if matches!(last, "client" | "clients") && penultimate.parse::<usize>().is_ok() {
+            return tokens[..tokens.len() - 3].join("_");
+        }
+        if summary.parameters.contains_key("storage_profile")
+            && summary.parameters.contains_key("clients")
+            && antepenultimate.parse::<usize>().is_ok()
+        {
+            return tokens[..tokens.len() - 2].join("_");
+        }
+    }
+    summary.name.clone()
+}
+
+fn derive_trust_class(
+    spec: &BenchmarkSpec,
+    diagnostics: &[BenchmarkDiagnostic],
+    quality: QualityClass,
+    primary_metric: PrimaryMetric,
+    measured_samples: usize,
+    wall_clock: Option<&SummaryStats>,
+    completed_operations: Option<&SummaryStats>,
+) -> TrustClass {
+    let derived = derive_trust_class_inner(
+        spec,
+        diagnostics,
+        quality,
+        primary_metric,
+        measured_samples,
+        wall_clock,
+        completed_operations,
+    );
+    apply_trust_class_override(spec.metadata.get("trust_class"), derived)
+}
+
+fn derive_trust_class_from_summary(summary: &BenchmarkSummary) -> TrustClass {
+    let derived = derive_trust_class_inner_from_summary(summary);
+    apply_trust_class_override(summary.metadata.get("trust_class"), derived)
+}
+
+fn derive_trust_class_inner(
+    spec: &BenchmarkSpec,
+    diagnostics: &[BenchmarkDiagnostic],
+    quality: QualityClass,
+    primary_metric: PrimaryMetric,
+    measured_samples: usize,
+    wall_clock: Option<&SummaryStats>,
+    completed_operations: Option<&SummaryStats>,
+) -> TrustClass {
+    if quality == QualityClass::Untrustworthy
+        || diagnostics
+            .iter()
+            .any(|diagnostic| blocking_trust_diagnostic(diagnostic.code.as_str()))
+    {
+        return TrustClass::Invalid;
+    }
+    if diagnostics.iter().any(|diagnostic| {
+        matches!(
+            diagnostic.code.as_str(),
+            "fixed_ops_throughput" | "measurement_mode_mismatch"
+        )
+    }) {
+        return TrustClass::Invalid;
+    }
+    let mut trust = TrustClass::Gate;
+    if quality == QualityClass::Noisy
+        || diagnostics.iter().any(|diagnostic| {
+            matches!(
+                diagnostic.code.as_str(),
+                "tiny_micro_timing" | "flat_or_capped_throughput" | "high_variance"
+            )
+        })
+    {
+        trust = trust.min(TrustClass::Diagnostic);
+    }
+    if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "batch_unit_ambiguous")
+    {
+        trust = trust.min(TrustClass::Experimental);
+    }
+    if primary_metric == PrimaryMetric::Throughput
+        && measurement_mode_for_spec(spec) == MeasurementMode::Duration
+        && measured_samples >= 5
+        && wall_clock.is_some()
+        && completed_operations.is_some()
+    {
+        return trust;
+    }
+    trust
+}
+
+fn derive_trust_class_inner_from_summary(summary: &BenchmarkSummary) -> TrustClass {
+    if summary.quality == QualityClass::Untrustworthy
+        || summary
+            .diagnostics
+            .iter()
+            .any(|diagnostic| blocking_trust_diagnostic(diagnostic.code.as_str()))
+    {
+        return TrustClass::Invalid;
+    }
+    if summary.diagnostics.iter().any(|diagnostic| {
+        matches!(
+            diagnostic.code.as_str(),
+            "fixed_ops_throughput" | "measurement_mode_mismatch"
+        )
+    }) {
+        return TrustClass::Invalid;
+    }
+    let mut trust = TrustClass::Gate;
+    if summary.quality == QualityClass::Noisy
+        || summary.diagnostics.iter().any(|diagnostic| {
+            matches!(
+                diagnostic.code.as_str(),
+                "tiny_micro_timing" | "flat_or_capped_throughput" | "high_variance"
+            )
+        })
+    {
+        trust = trust.min(TrustClass::Diagnostic);
+    }
+    if summary
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "batch_unit_ambiguous")
+    {
+        trust = trust.min(TrustClass::Experimental);
+    }
+    trust
+}
+
+fn blocking_trust_diagnostic(code: &str) -> bool {
+    matches!(
+        code,
+        "invalid_timing"
+            | "zero_completed_ops"
+            | "correctness_failure"
+            | "budget_failure"
+            | "setup_dominates_measurement"
+            | "likely_optimized_away"
+    )
+}
+
+fn apply_trust_class_override(override_value: Option<&String>, derived: TrustClass) -> TrustClass {
+    override_value
+        .and_then(|value| value.parse::<TrustClass>().ok())
+        .map_or(derived, |override_class| derived.min(override_class))
 }
 
 fn classify_quality(
@@ -2346,7 +2855,7 @@ mod tests {
     }
 
     #[test]
-    fn micro_summary_uses_net_ns_per_op_and_diagnoses_suspicious_rows() {
+    fn micro_summary_uses_net_ns_per_op_and_flags_likely_optimized_rows() {
         let spec = micro_spec("hot_path");
         let samples = (0..5)
             .map(|i| micro_sample("hot_path", i, 4))
@@ -2360,7 +2869,7 @@ mod tests {
         assert!(summary
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code == "suspicious_micro_timing"));
+            .any(|diagnostic| diagnostic.code == "likely_optimized_away"));
         assert_close(summary.overhead_ns_per_op.expect("overhead").mean, 2.0);
     }
 
@@ -2525,6 +3034,125 @@ mod tests {
             summarize_benchmark(&spec, &untrustworthy).quality,
             QualityClass::Untrustworthy
         );
+    }
+
+    #[test]
+    fn noisy_rows_default_to_diagnostic_trust() {
+        let spec = spec("noisy");
+        let samples = vec![
+            sample("noisy", SamplePhase::Measured, 0, 100),
+            sample("noisy", SamplePhase::Measured, 1, 300),
+            sample("noisy", SamplePhase::Measured, 2, 1_000),
+        ];
+
+        let summary = summarize_benchmark(&spec, &samples);
+
+        assert_eq!(summary.quality, QualityClass::Noisy);
+        assert_eq!(summary.trust_class, TrustClass::Diagnostic);
+        assert!(summary
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "high_variance"));
+    }
+
+    #[test]
+    fn trust_class_override_can_downgrade_but_not_promote() {
+        let mut downgrade_spec = spec("downgrade");
+        downgrade_spec
+            .metadata
+            .insert("trust_class".to_string(), "diagnostic".to_string());
+        let downgraded = summarize_benchmark(
+            &downgrade_spec,
+            &(0..5)
+                .map(|i| sample("downgrade", SamplePhase::Measured, i, 100 + i as u128))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(downgraded.trust_class, TrustClass::Diagnostic);
+
+        let mut promote_spec = micro_spec("promote");
+        promote_spec
+            .metadata
+            .insert("trust_class".to_string(), "gate".to_string());
+        let promoted = summarize_benchmark(
+            &promote_spec,
+            &(0..5)
+                .map(|i| micro_sample("promote", i, 4))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(promoted.trust_class, TrustClass::Invalid);
+        assert!(promoted
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "likely_optimized_away"));
+    }
+
+    #[test]
+    fn run_filters_quality_and_regressions_by_gate_trust() {
+        let gate = summarize_benchmark(
+            &spec("gate"),
+            &(0..5)
+                .map(|i| sample("gate", SamplePhase::Measured, i, 100 + i as u128))
+                .collect::<Vec<_>>(),
+        );
+        let mut diagnostic = summarize_benchmark(
+            &spec("diagnostic"),
+            &[
+                sample("diagnostic", SamplePhase::Measured, 0, 100),
+                sample("diagnostic", SamplePhase::Measured, 1, 300),
+                sample("diagnostic", SamplePhase::Measured, 2, 1_000),
+            ],
+        );
+        diagnostic.trust_class = TrustClass::Diagnostic;
+
+        let mut run = StressRun {
+            schema_version: SCHEMA_VERSION.to_string(),
+            tool_version: "0.3.0".to_string(),
+            suite: "suite".to_string(),
+            run_profile: RunProfile::Default,
+            environment: EnvironmentInfo::unknown(ProfileConfig::default()),
+            benchmark_specs: Vec::new(),
+            samples: Vec::new(),
+            summaries: vec![gate, diagnostic],
+            comparisons: vec![
+                ComparisonResult {
+                    benchmark_id: "gate".to_string(),
+                    current_quality: QualityClass::Acceptable,
+                    baseline_quality: Some(QualityClass::Acceptable),
+                    primary_metric: PrimaryMetric::Throughput,
+                    baseline_value: Some(100.0),
+                    current_value: Some(80.0),
+                    change_percent: Some(-20.0),
+                    threshold: 0.05,
+                    confidence_intervals_overlap: Some(false),
+                    classification: ComparisonClass::Regression,
+                    reason: None,
+                },
+                ComparisonResult {
+                    benchmark_id: "diagnostic".to_string(),
+                    current_quality: QualityClass::Noisy,
+                    baseline_quality: Some(QualityClass::Acceptable),
+                    primary_metric: PrimaryMetric::Throughput,
+                    baseline_value: Some(100.0),
+                    current_value: Some(50.0),
+                    change_percent: Some(-50.0),
+                    threshold: 0.05,
+                    confidence_intervals_overlap: Some(false),
+                    classification: ComparisonClass::Regression,
+                    reason: None,
+                },
+            ],
+            diagnostics_summary: Vec::new(),
+            started_at: "123".to_string(),
+            total_elapsed_ns: 0,
+            metadata: BTreeMap::new(),
+        };
+
+        assert!(run.meets_min_quality(QualityClass::Acceptable));
+        assert_eq!(run.regressions().len(), 1);
+        assert_eq!(run.regressions()[0].benchmark_id, "gate");
+
+        run.summaries[0].quality = QualityClass::Noisy;
+        assert!(!run.meets_min_quality(QualityClass::Acceptable));
     }
 
     #[test]
@@ -2862,6 +3490,58 @@ mod tests {
             ConsoleNameMode::Compact
         );
         assert!(parsed.environment.profile_config.progress);
+    }
+
+    #[test]
+    fn summary_and_diagnostic_trust_class_default_when_missing_from_json() {
+        let run = StressRun {
+            schema_version: SCHEMA_VERSION.to_string(),
+            tool_version: "0.3.0".to_string(),
+            suite: "suite".to_string(),
+            run_profile: RunProfile::Default,
+            environment: EnvironmentInfo::unknown(ProfileConfig::default()),
+            benchmark_specs: Vec::new(),
+            samples: Vec::new(),
+            summaries: vec![summarize_benchmark(
+                &spec("bench"),
+                &(0..5)
+                    .map(|i| sample("bench", SamplePhase::Measured, i, 100 + i as u128))
+                    .collect::<Vec<_>>(),
+            )],
+            comparisons: Vec::new(),
+            diagnostics_summary: vec![DiagnosticSummary {
+                suite: "suite".to_string(),
+                benchmark_id: "bench".to_string(),
+                name: "bench".to_string(),
+                tier: 1,
+                code: "high_variance".to_string(),
+                severity: DiagnosticSeverity::Warning,
+                reason: "high variance".to_string(),
+                evidence: BTreeMap::new(),
+                suggestions: vec!["rerun".to_string()],
+                quality: QualityClass::Noisy,
+                trust_class: TrustClass::Diagnostic,
+                parameters: BTreeMap::new(),
+            }],
+            started_at: "123".to_string(),
+            total_elapsed_ns: 0,
+            metadata: BTreeMap::new(),
+        };
+        let mut json = serde_json::to_value(&run).expect("serialize");
+        json["summaries"][0]
+            .as_object_mut()
+            .expect("summary object")
+            .remove("trust_class");
+        json["diagnostics_summary"][0]
+            .as_object_mut()
+            .expect("diagnostic summary object")
+            .remove("trust_class");
+
+        let parsed =
+            StressRun::from_json_str(&serde_json::to_string(&json).expect("json")).expect("parse");
+
+        assert_eq!(parsed.summaries[0].trust_class, TrustClass::Gate);
+        assert_eq!(parsed.diagnostics_summary[0].trust_class, TrustClass::Gate);
     }
 
     #[test]

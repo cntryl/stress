@@ -3,7 +3,7 @@
 use crate::artifact::{
     BenchmarkDiagnostic, BenchmarkSpec, BenchmarkSummary, ComparisonClass, ComparisonResult,
     ConsoleNameMode, CorrectnessSummary, PrimaryMetric, QualityClass, SamplePhase, StressRun,
-    SummaryStats,
+    SummaryStats, TrustClass,
 };
 use crate::config::StressRunnerConfig;
 use std::collections::{BTreeMap, BTreeSet};
@@ -49,8 +49,9 @@ pub struct SampleProgress {
 
 const NAME_WIDTH: usize = 36;
 const HUMAN_TABLE_NAME_WIDTH: usize = 64;
-const HUMAN_TABLE_VALUE_WIDTH: usize = 11;
-const HUMAN_TABLE_ALLOC_WIDTH: usize = 9;
+const HUMAN_TABLE_VALUE_WIDTH: usize = 16;
+const HUMAN_TABLE_TRUST_WIDTH: usize = 12;
+const HUMAN_TABLE_MODE_WIDTH: usize = 10;
 const VALUE_WIDTH: usize = 16;
 
 /// Console reporter that prints the human benchmark table to stdout.
@@ -175,10 +176,9 @@ impl Reporter for StderrProgressReporter {
     }
 
     fn bench_end(&self, summary: &BenchmarkSummary) {
-        let value = summary.primary_value().map_or_else(
-            || "n/a".to_string(),
-            |value| format_metric(value, summary.primary_metric),
-        );
+        let value = summary
+            .primary_value()
+            .map_or_else(|| "n/a".to_string(), |value| format_metric(value, summary));
         self.write_stderr(&format!(
             "stress: finish {} value={} quality={}",
             summary.name, value, summary.quality
@@ -306,10 +306,9 @@ impl Reporter for GitHubActionsReporter {
             println!(
                 "  {}: {} ({})",
                 summary.name,
-                summary.primary_value().map_or_else(
-                    || "n/a".to_string(),
-                    |value| { format_metric(value, summary.primary_metric) }
-                ),
+                summary
+                    .primary_value()
+                    .map_or_else(|| "n/a".to_string(), |value| format_metric(value, summary)),
                 summary.quality
             );
         }
@@ -445,21 +444,22 @@ pub(crate) fn format_markdown_report(run: &StressRun) -> String {
     let _ = writeln!(output);
     let _ = writeln!(
         output,
-        "| Benchmark | Tier | Metric | Value | Quality | Samples | Wall |"
+        "| Benchmark | Tier | Value | Trust | Mode | Question | Quality | Samples | Wall |"
     );
-    let _ = writeln!(output, "|---|---:|---|---:|---|---:|---:|");
+    let _ = writeln!(output, "|---|---:|---|---|---|---|---|---:|---:|");
     for summary in &run.summaries {
-        let value = summary.primary_value().map_or_else(
-            || "n/a".to_string(),
-            |value| format_metric(value, summary.primary_metric),
-        );
+        let value = summary
+            .primary_value()
+            .map_or_else(|| "n/a".to_string(), |value| format_metric(value, summary));
         let _ = writeln!(
             output,
-            "| {} | {} | {:?} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             summary.name,
             summary.tier,
-            summary.primary_metric,
             value,
+            summary.trust_class,
+            measurement_mode_label(summary),
+            measurement_question(summary),
             summary.quality,
             summary.measured_samples,
             format_duration_ns(summary.total_wall_clock_ns)
@@ -564,15 +564,16 @@ fn human_table_name_width(summaries: &[&BenchmarkSummary], name_mode: ConsoleNam
 
 fn write_human_table_header(output: &mut String, name_width: usize) {
     let header = format!(
-        "{benchmark:<name_width$} {value:>HUMAN_TABLE_VALUE_WIDTH$} {p50:>HUMAN_TABLE_VALUE_WIDTH$} {p95:>HUMAN_TABLE_VALUE_WIDTH$} {p99:>HUMAN_TABLE_VALUE_WIDTH$} {rsd:>7} {allocs:>HUMAN_TABLE_ALLOC_WIDTH$} {bytes:>HUMAN_TABLE_ALLOC_WIDTH$}",
+        "{benchmark:<name_width$} {value:>HUMAN_TABLE_VALUE_WIDTH$} {p50:>HUMAN_TABLE_VALUE_WIDTH$} {p95:>HUMAN_TABLE_VALUE_WIDTH$} {p99:>HUMAN_TABLE_VALUE_WIDTH$} {rsd:>7} {trust:>HUMAN_TABLE_TRUST_WIDTH$} {mode:>HUMAN_TABLE_MODE_WIDTH$} {question}",
         benchmark = "benchmark",
         value = "value",
         p50 = "p50",
         p95 = "p95",
         p99 = "p99",
         rsd = "rsd",
-        allocs = "alloc/op",
-        bytes = "B/op",
+        trust = "trust",
+        mode = "mode",
+        question = "question",
         name_width = name_width,
     );
     let _ = writeln!(output, "{header}");
@@ -588,21 +589,22 @@ fn write_human_table_row(
     let name = format_human_table_name(summary, name_mode, name_width);
     let value = summary.primary_value().map_or_else(
         || "n/a".to_string(),
-        |value| format_metric_value(value, summary.primary_metric),
+        |value| format_metric_value(value, summary),
     );
     let stats = summary.stats.as_ref();
-    let p50 = format_metric_stat(stats, summary.primary_metric, |stats| stats.p50);
-    let p95 = format_metric_stat(stats, summary.primary_metric, |stats| stats.p95);
-    let p99 = format_metric_stat(stats, summary.primary_metric, |stats| stats.p99);
+    let p50 = format_metric_stat(summary, stats, |stats| stats.p50);
+    let p95 = format_metric_stat(summary, stats, |stats| stats.p95);
+    let p99 = format_metric_stat(summary, stats, |stats| stats.p99);
     let rsd = stats.map_or_else(
         || "n/a".to_string(),
         |stats| format_percent(stats.relative_std_dev),
     );
     let _ = writeln!(
         output,
-        "{name:<name_width$} {value:>HUMAN_TABLE_VALUE_WIDTH$} {p50:>HUMAN_TABLE_VALUE_WIDTH$} {p95:>HUMAN_TABLE_VALUE_WIDTH$} {p99:>HUMAN_TABLE_VALUE_WIDTH$} {rsd:>7} {allocs:>HUMAN_TABLE_ALLOC_WIDTH$} {bytes:>HUMAN_TABLE_ALLOC_WIDTH$}",
-        allocs = format_optional_scaled_stat(summary.allocs_per_op.as_ref()),
-        bytes = format_optional_scaled_stat(summary.bytes_per_op.as_ref()),
+        "{name:<name_width$} {value:>HUMAN_TABLE_VALUE_WIDTH$} {p50:>HUMAN_TABLE_VALUE_WIDTH$} {p95:>HUMAN_TABLE_VALUE_WIDTH$} {p99:>HUMAN_TABLE_VALUE_WIDTH$} {rsd:>7} {trust:>HUMAN_TABLE_TRUST_WIDTH$} {mode:>HUMAN_TABLE_MODE_WIDTH$} {question}",
+        trust = summary.trust_class,
+        mode = measurement_mode_label(summary),
+        question = measurement_question(summary),
         name_width = name_width,
     );
 }
@@ -731,11 +733,24 @@ fn push_shape_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSummar
         groups,
         "Micro timing",
         summaries,
-        "suspicious_micro_timing",
-        "Validate the microbenchmark independently before trusting this row, or batch more work.",
+        "tiny_micro_timing",
+        "Batch more logical work per sample, or keep the row as a validated diagnostic with an explicit trust_class downgrade.",
         |summary| {
             format!(
-                "{} is suspiciously fast for a microbenchmark.",
+                "{} is too small to trust as a gate-quality microbenchmark.",
+                summary.name
+            )
+        },
+    );
+    push_diagnostic_group(
+        groups,
+        "Optimized away",
+        summaries,
+        "likely_optimized_away",
+        "Vary inputs, accumulate observable outputs, and use validated_micro=true only after anti-DCE is explicit.",
+        |summary| {
+            format!(
+                "{} is likely optimized away or dominated by compiler artifacts.",
                 summary.name
             )
         },
@@ -768,6 +783,48 @@ fn push_shape_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSummar
                 summary.name
             )
         },
+    );
+    push_diagnostic_group(
+        groups,
+        "Measurement semantics",
+        summaries,
+        "fixed_ops_throughput",
+        "Use duration-based throughput for main rows, or split the fixed-op probe into an explicit diagnostic row.",
+        |summary| {
+            format!(
+                "{} uses fixed-op timing for a throughput row.",
+                summary.name
+            )
+        },
+    );
+    push_diagnostic_group(
+        groups,
+        "Batch unit",
+        summaries,
+        "batch_unit_ambiguous",
+        "Add logical_unit and any *_per_logical_operation parameter so the report can state the measured question directly.",
+        |summary| format!("{} does not declare an explicit batch normalization basis.", summary.name),
+    );
+    push_diagnostic_group(
+        groups,
+        "Measurement mode",
+        summaries,
+        "measurement_mode_mismatch",
+        "Use one measurement_mode per workload family, or split fixed-op probes into explicit diagnostic rows.",
+        |summary| {
+            format!(
+                "{} mixes throughput measurement modes with sibling rows in the same family.",
+                summary.name
+            )
+        },
+    );
+    push_diagnostic_group(
+        groups,
+        "Capped throughput",
+        summaries,
+        "flat_or_capped_throughput",
+        "Confirm whether this row is an intentional capped-capacity probe; otherwise inspect local bottlenecks or move it out of the gate set.",
+        |summary| format!("{} is suspiciously flat for a duration-based throughput row.", summary.name),
     );
 }
 
@@ -1120,11 +1177,17 @@ fn format_summary_blocks(run: &StressRun) -> String {
     let _ = writeln!(output, "  quality_failed:  {quality_failures}");
     let _ = writeln!(output, "  improvements:    {improvements}");
     let counts = quality_counts(&run.summaries);
+    let trust_counts = trust_class_counts(&run.summaries);
     let _ = writeln!(output, "Quality");
     let _ = writeln!(output, "  authoritative:   {}", counts.authoritative);
     let _ = writeln!(output, "  acceptable:      {}", counts.acceptable);
     let _ = writeln!(output, "  noisy:           {}", counts.noisy);
     let _ = writeln!(output, "  untrustworthy:   {}", counts.untrustworthy);
+    let _ = writeln!(output, "Trust");
+    let _ = writeln!(output, "  gate:            {}", trust_counts.gate);
+    let _ = writeln!(output, "  diagnostic:      {}", trust_counts.diagnostic);
+    let _ = writeln!(output, "  experimental:    {}", trust_counts.experimental);
+    let _ = writeln!(output, "  invalid:         {}", trust_counts.invalid);
     output
 }
 
@@ -1150,11 +1213,12 @@ fn attention_items(run: &StressRun) -> Vec<String> {
         &run.summaries,
         "single_op_throughput",
     );
+    push_diagnostic_attention(&mut items, &mut seen, &run.summaries, "tiny_micro_timing");
     push_diagnostic_attention(
         &mut items,
         &mut seen,
         &run.summaries,
-        "suspicious_micro_timing",
+        "likely_optimized_away",
     );
     push_untrustworthy_attention(&mut items, &mut seen, &run.summaries);
     push_comparison_attention(
@@ -1612,6 +1676,14 @@ struct QualityCounts {
     untrustworthy: usize,
 }
 
+#[derive(Default)]
+struct TrustClassCounts {
+    gate: usize,
+    diagnostic: usize,
+    experimental: usize,
+    invalid: usize,
+}
+
 fn failed_correctness_count(summaries: &[BenchmarkSummary]) -> usize {
     summaries
         .iter()
@@ -1626,6 +1698,20 @@ fn budget_failure_count(summaries: &[BenchmarkSummary]) -> usize {
         .count()
 }
 
+fn trust_class_counts(summaries: &[BenchmarkSummary]) -> TrustClassCounts {
+    summaries
+        .iter()
+        .fold(TrustClassCounts::default(), |mut acc, summary| {
+            match summary.trust_class {
+                TrustClass::Gate => acc.gate += 1,
+                TrustClass::Diagnostic => acc.diagnostic += 1,
+                TrustClass::Experimental => acc.experimental += 1,
+                TrustClass::Invalid => acc.invalid += 1,
+            }
+            acc
+        })
+}
+
 fn quality_gate_failures(run: &StressRun) -> Vec<&BenchmarkSummary> {
     let profile_config = &run.environment.profile_config;
     if !profile_config.fail_on_quality {
@@ -1633,6 +1719,7 @@ fn quality_gate_failures(run: &StressRun) -> Vec<&BenchmarkSummary> {
     }
     run.summaries
         .iter()
+        .filter(|summary| summary.is_gate())
         .filter(|summary| quality_rank(summary.quality) < quality_rank(profile_config.min_quality))
         .collect()
 }
@@ -1641,10 +1728,7 @@ fn regression_gate_count(run: &StressRun) -> usize {
     if !run.environment.profile_config.fail_on_regression {
         return 0;
     }
-    run.comparisons
-        .iter()
-        .filter(|comparison| comparison.classification == ComparisonClass::Regression)
-        .count()
+    run.regressions().len()
 }
 
 fn diagnostic_gate_count(run: &StressRun) -> usize {
@@ -1660,9 +1744,16 @@ fn diagnostic_gate_count(run: &StressRun) -> usize {
 }
 
 fn comparison_count(run: &StressRun, class: ComparisonClass) -> usize {
+    let gate_rows = run
+        .summaries
+        .iter()
+        .filter(|summary| summary.is_gate())
+        .map(|summary| summary.benchmark_id.as_str())
+        .collect::<BTreeSet<_>>();
     run.comparisons
         .iter()
         .filter(|comparison| comparison_is_trustworthy(comparison))
+        .filter(|comparison| gate_rows.contains(comparison.benchmark_id.as_str()))
         .filter(|comparison| comparison.classification == class)
         .count()
 }
@@ -1708,6 +1799,7 @@ const fn quality_rank(quality: QualityClass) -> u8 {
 
 fn is_trustworthy(summary: &BenchmarkSummary) -> bool {
     summary.correctness.passed
+        && summary.is_gate()
         && matches!(
             summary.quality,
             QualityClass::Authoritative | QualityClass::Acceptable
@@ -1731,29 +1823,30 @@ fn truncate_name_to_width(name: &str, width: usize) -> String {
     format!("{head}..{tail}")
 }
 
-fn format_metric_value(value: f64, metric: PrimaryMetric) -> String {
+fn format_metric_value(value: f64, summary: &BenchmarkSummary) -> String {
     if !value.is_finite() {
         return "n/a".to_string();
     }
-    match metric {
-        PrimaryMetric::Throughput => format_scaled_number(value),
+    let unit = display_unit(summary);
+    match summary.primary_metric {
+        PrimaryMetric::Throughput => format!("{}/s", format_scaled_with_unit(value, &unit)),
         PrimaryMetric::LatencyP95 | PrimaryMetric::NsPerOp => {
-            format_duration_ns(f64_to_u128(value))
+            format!("{}/{}", format_duration_ns(f64_to_u128(value)), unit)
         }
     }
 }
 
-fn format_optional_scaled_stat(stats: Option<&SummaryStats>) -> String {
-    stats.map_or_else(|| "-".to_string(), |stats| format_scaled_number(stats.mean))
-}
-
-fn format_metric_stat<F>(stats: Option<&SummaryStats>, metric: PrimaryMetric, select: F) -> String
+fn format_metric_stat<F>(
+    summary: &BenchmarkSummary,
+    stats: Option<&SummaryStats>,
+    select: F,
+) -> String
 where
     F: FnOnce(&SummaryStats) -> f64,
 {
     stats.map_or_else(
         || "n/a".to_string(),
-        |stats| format_metric_value(select(stats), metric),
+        |stats| format_metric_value(select(stats), summary),
     )
 }
 
@@ -1782,19 +1875,25 @@ fn format_percent(ratio: f64) -> String {
     }
 }
 
+fn format_scaled_with_unit(value: f64, unit: &str) -> String {
+    format!("{} {}", format_scaled_number(value), unit)
+}
+
 fn write_summary_line(output: &mut String, summary: &BenchmarkSummary) {
-    let value = summary.primary_value().map_or_else(
-        || "n/a".to_string(),
-        |value| format_metric(value, summary.primary_metric),
-    );
+    let value = summary
+        .primary_value()
+        .map_or_else(|| "n/a".to_string(), |value| format_metric(value, summary));
     let _ = writeln!(
         output,
-        "  {name:<NAME_WIDTH$} {value:>VALUE_WIDTH$}  tier={tier} quality={quality} samples={samples} wall={wall}",
+        "  {name:<NAME_WIDTH$} {value:>VALUE_WIDTH$}  tier={tier} trust={trust} mode={mode} quality={quality} samples={samples} wall={wall} question={question}",
         name = summary.name,
         tier = summary.tier,
+        trust = summary.trust_class,
+        mode = measurement_mode_label(summary),
         quality = summary.quality,
         samples = summary.measured_samples,
-        wall = format_duration_ns(summary.total_wall_clock_ns)
+        wall = format_duration_ns(summary.total_wall_clock_ns),
+        question = measurement_question(summary),
     );
 }
 
@@ -1908,7 +2007,7 @@ fn write_sweep_tables(output: &mut String, run: &StressRun) {
                 "  {}={} value={} speedup={:.2} efficiency={:.2}",
                 key,
                 x,
-                format_metric(*y, summary.primary_metric),
+                format_metric(*y, summary),
                 speedup,
                 efficiency
             );
@@ -1937,28 +2036,13 @@ fn numeric_parameter_keys(summaries: &[BenchmarkSummary]) -> Vec<String> {
         .collect()
 }
 
-fn format_metric(value: f64, metric: PrimaryMetric) -> String {
-    match metric {
-        PrimaryMetric::Throughput => format_throughput(value),
-        PrimaryMetric::LatencyP95 | PrimaryMetric::NsPerOp => {
-            format_duration_ns(f64_to_u128(value))
-        }
-    }
+fn format_metric(value: f64, summary: &BenchmarkSummary) -> String {
+    format_metric_value(value, summary)
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn f64_to_u128(value: f64) -> u128 {
     value.max(0.0).round() as u128
-}
-
-fn format_throughput(value: f64) -> String {
-    if value >= 1_000_000.0 {
-        format!("{:.2}M ops/s", value / 1_000_000.0)
-    } else if value >= 1_000.0 {
-        format!("{:.2}K ops/s", value / 1_000.0)
-    } else {
-        format!("{value:.2} ops/s")
-    }
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -1972,6 +2056,73 @@ fn format_duration_ns(nanos: u128) -> String {
         format!("{:.2}µs", secs * 1_000_000.0)
     } else {
         format!("{:.2}ns", secs * 1_000_000_000.0)
+    }
+}
+
+fn measurement_mode_label(summary: &BenchmarkSummary) -> &'static str {
+    match summary
+        .parameters
+        .get("measurement_mode")
+        .map(String::as_str)
+    {
+        Some("micro") => "micro",
+        Some("fixed_ops") => "fixed_ops",
+        Some("duration") => "duration",
+        _ if summary.tier == 1 => "micro",
+        _ if summary.tier == 2 => "fixed_ops",
+        _ => "duration",
+    }
+}
+
+fn measurement_question(summary: &BenchmarkSummary) -> String {
+    let mut parts = vec![format!("mode={}", measurement_mode_label(summary))];
+    if let Some(basis) = normalization_basis(summary) {
+        parts.push(basis);
+    }
+    parts.join("; ")
+}
+
+fn display_unit(summary: &BenchmarkSummary) -> String {
+    normalization_basis_unit(summary)
+        .or_else(|| logical_unit(summary))
+        .unwrap_or_else(|| "op".to_string())
+}
+
+fn logical_unit(summary: &BenchmarkSummary) -> Option<String> {
+    summary.parameters.get("logical_unit").map(|value| {
+        value
+            .rsplit('_')
+            .next()
+            .map_or_else(|| value.clone(), ToString::to_string)
+    })
+}
+
+fn normalization_basis_unit(summary: &BenchmarkSummary) -> Option<String> {
+    summary.parameters.iter().find_map(|(key, _value)| {
+        key.strip_suffix("_per_logical_operation")
+            .map(singularize_unit)
+    })
+}
+
+fn normalization_basis(summary: &BenchmarkSummary) -> Option<String> {
+    summary.parameters.iter().find_map(|(key, value)| {
+        key.strip_suffix("_per_logical_operation").map(|unit| {
+            let display_unit = singularize_unit(unit);
+            let logical_unit = logical_unit(summary).unwrap_or_else(|| "op".to_string());
+            format!("{value} {unit}/{logical_unit}")
+                .replace(unit, &display_unit.replace('_', " "))
+                .replace('_', " ")
+        })
+    })
+}
+
+fn singularize_unit(value: &str) -> String {
+    if let Some(stem) = value.strip_suffix("ies") {
+        format!("{stem}y")
+    } else if let Some(stem) = value.strip_suffix('s') {
+        stem.to_string()
+    } else {
+        value.to_string()
     }
 }
 
@@ -2004,6 +2155,7 @@ mod tests {
             allocs_per_op: None,
             bytes_per_op: None,
             quality,
+            trust_class: TrustClass::Gate,
             budgets: BenchmarkBudgets::default(),
             budget_results: Vec::new(),
             diagnostics: Vec::new(),
@@ -2131,8 +2283,9 @@ mod tests {
                 "p95",
                 "p99",
                 "rsd",
-                "alloc/op",
-                "B/op"
+                "trust",
+                "mode",
+                "question"
             ]
         );
         assert!(report.contains("queue::fast"));
@@ -2329,9 +2482,9 @@ mod tests {
         let mut suspicious = summary("tier1_suspicious", 4.0, QualityClass::Acceptable);
         suspicious.tier = 1;
         suspicious.diagnostics = vec![diagnostic(
-            "suspicious_micro_timing",
-            "Tier 1 timing is below 5 ns/op without explicit validation.",
-            "Validate the microbenchmark independently.",
+            "tiny_micro_timing",
+            "Tier 1 timing is below 15 ns/op without explicit validation.",
+            "Batch more logical work per sample.",
         )];
         let mut allocation = summary("tier2_allocation", 100.0, QualityClass::Untrustworthy);
         allocation.tier = 2;
@@ -2359,7 +2512,7 @@ mod tests {
         assert!(report.contains("ctx.record_external(\"name\", duration, n)"));
         assert!(report.contains("setup_dominates_measurement: Timing overhead or setup dominates"));
         assert!(report.contains("Tier 1 recipe: ctx.measure(\"name\", || hot_path())"));
-        assert!(report.contains("suspicious_micro_timing: Tier 1 timing is below 5 ns/op"));
+        assert!(report.contains("tiny_micro_timing: Tier 1 timing is below 15 ns/op"));
         assert!(report.contains("cntryl_stress::stress_allocator!()"));
     }
 
@@ -2400,9 +2553,9 @@ mod tests {
         }];
         let mut suspicious = summary("micro", 4.0, QualityClass::Acceptable);
         suspicious.diagnostics = vec![diagnostic(
-            "suspicious_micro_timing",
-            "Tier 1 timing is below 5 ns/op without explicit validation.",
-            "Validate the microbenchmark independently.",
+            "tiny_micro_timing",
+            "Tier 1 timing is below 15 ns/op without explicit validation.",
+            "Batch more logical work per sample.",
         )];
         let mut run = run_with_summaries(vec![
             budget,
@@ -2430,15 +2583,40 @@ mod tests {
         assert!(report.contains("  Regression"));
         assert!(report.contains("regressed against baseline"));
         assert!(report.contains("  Micro timing"));
-        assert!(report.contains("micro is suspiciously fast"));
+        assert!(report.contains("micro is too small to trust as a gate-quality microbenchmark"));
         assert!(report.contains("Fix: Inspect the failing budget"));
         assert!(
             report.contains("Fix: Inspect the same benchmark row before updating the baseline.")
         );
-        assert!(report.contains("Fix: Validate the microbenchmark independently."));
+        assert!(report.contains("Fix: Batch more logical work per sample."));
         assert!(report
             .trim_end()
             .ends_with("result: failed (suite: failed budget)"));
+    }
+
+    #[test]
+    fn reports_include_trust_mode_and_question_columns() {
+        let mut benchmark = summary("queue::row", 100.0, QualityClass::Acceptable);
+        benchmark.trust_class = TrustClass::Diagnostic;
+        benchmark
+            .parameters
+            .insert("measurement_mode".to_string(), "duration".to_string());
+        benchmark
+            .parameters
+            .insert("logical_unit".to_string(), "transaction".to_string());
+        let run = run_with_summaries(vec![benchmark]);
+
+        let console = format_console_output(&run);
+        let markdown = format_markdown_report(&run);
+
+        assert!(console.contains("trust"));
+        assert!(console.contains("mode"));
+        assert!(console.contains("question"));
+        assert!(console.contains("diagnostic"));
+        assert!(console.contains("transaction/s"));
+        assert!(console.contains("mode=duration"));
+        assert!(markdown.contains("| Trust | Mode | Question |"));
+        assert!(markdown.contains("diagnostic"));
     }
 
     #[test]

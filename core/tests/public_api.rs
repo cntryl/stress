@@ -165,6 +165,7 @@ fn current_schema_run() -> cntryl_stress::artifact::StressRun {
             allocs_per_op: None,
             bytes_per_op: None,
             quality: QualityClass::Untrustworthy,
+            trust_class: cntryl_stress::artifact::TrustClass::Invalid,
             budgets: BenchmarkBudgets::default(),
             budget_results: Vec::new(),
             diagnostics: Vec::new(),
