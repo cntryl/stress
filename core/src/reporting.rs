@@ -48,11 +48,7 @@ pub struct SampleProgress {
 }
 
 const NAME_WIDTH: usize = 36;
-const HUMAN_TABLE_NAME_WIDTH: usize = 64;
-const HUMAN_TABLE_MEASUREMENT_WIDTH: usize = 14;
-const HUMAN_TABLE_VALUE_WIDTH: usize = 16;
-const HUMAN_TABLE_TRUST_WIDTH: usize = 12;
-const HUMAN_TABLE_MODE_WIDTH: usize = 10;
+const HUMAN_TABLE_NAME_MAX_WIDTH: usize = 64;
 const VALUE_WIDTH: usize = 16;
 
 /// Console reporter that prints the human benchmark table to stdout.
@@ -544,28 +540,107 @@ fn write_human_table(
     name_mode: ConsoleNameMode,
 ) {
     let name_width = human_table_name_width(summaries, name_mode);
-    write_human_table_header(output, name_width);
-    for summary in summaries {
-        write_human_table_row(output, summary, name_mode, name_width);
+    let rows = summaries
+        .iter()
+        .map(|summary| human_table_row(summary, name_mode, name_width))
+        .collect::<Vec<_>>();
+    let layout = HumanTableLayout::for_rows(&rows, name_width);
+    write_human_table_header(output, &layout);
+    for row in &rows {
+        write_human_table_row(output, row, &layout);
     }
     write_issue_groups(output, &suite_issue_groups(summaries, comparisons));
 }
 
 fn human_table_name_width(summaries: &[&BenchmarkSummary], name_mode: ConsoleNameMode) -> usize {
-    match name_mode {
-        ConsoleNameMode::Compact => HUMAN_TABLE_NAME_WIDTH,
-        ConsoleNameMode::Full => summaries
-            .iter()
-            .map(|summary| name_with_parameter_hint(summary).chars().count())
-            .max()
-            .unwrap_or(HUMAN_TABLE_NAME_WIDTH)
-            .max("benchmark".len()),
+    let max_name_width = summaries
+        .iter()
+        .map(|summary| match name_mode {
+            ConsoleNameMode::Compact => summary.name.chars().count(),
+            ConsoleNameMode::Full => name_with_parameter_hint(summary).chars().count(),
+        })
+        .max()
+        .unwrap_or("benchmark".len())
+        .max("benchmark".len());
+
+    if matches!(name_mode, ConsoleNameMode::Compact) {
+        max_name_width.min(HUMAN_TABLE_NAME_MAX_WIDTH)
+    } else {
+        max_name_width
     }
 }
 
-fn write_human_table_header(output: &mut String, name_width: usize) {
+#[derive(Debug)]
+struct HumanTableRow {
+    name: String,
+    measurement: String,
+    value: String,
+    p50: String,
+    p95: String,
+    p99: String,
+    rsd: String,
+    trust: String,
+    mode: &'static str,
+}
+
+#[derive(Debug)]
+struct HumanTableLayout {
+    name: usize,
+    measurement: usize,
+    metric: usize,
+    rsd: usize,
+    trust: usize,
+    mode: usize,
+}
+
+impl HumanTableLayout {
+    fn for_rows(rows: &[HumanTableRow], name_width: usize) -> Self {
+        let measurement = max_chars(
+            "measurement",
+            rows.iter().map(|row| row.measurement.as_str()),
+        );
+        let metric = rows
+            .iter()
+            .flat_map(|row| {
+                [
+                    row.value.as_str(),
+                    row.p50.as_str(),
+                    row.p95.as_str(),
+                    row.p99.as_str(),
+                ]
+            })
+            .map(str::chars)
+            .map(Iterator::count)
+            .chain(["value", "p50", "p95", "p99"].into_iter().map(str::len))
+            .max()
+            .unwrap_or("value".len());
+        let rsd = max_chars("rsd", rows.iter().map(|row| row.rsd.as_str()));
+        let trust = max_chars("trust", rows.iter().map(|row| row.trust.as_str()));
+        let mode = max_chars("mode", rows.iter().map(|row| row.mode));
+
+        Self {
+            name: name_width,
+            measurement,
+            metric,
+            rsd,
+            trust,
+            mode,
+        }
+    }
+}
+
+fn max_chars<'a>(header: &str, values: impl Iterator<Item = &'a str>) -> usize {
+    values
+        .map(str::chars)
+        .map(Iterator::count)
+        .chain(std::iter::once(header.chars().count()))
+        .max()
+        .unwrap_or_else(|| header.chars().count())
+}
+
+fn write_human_table_header(output: &mut String, layout: &HumanTableLayout) {
     let header = format!(
-        "{benchmark:<name_width$} {measurement:<HUMAN_TABLE_MEASUREMENT_WIDTH$} {value:>HUMAN_TABLE_VALUE_WIDTH$} {p50:>HUMAN_TABLE_VALUE_WIDTH$} {p95:>HUMAN_TABLE_VALUE_WIDTH$} {p99:>HUMAN_TABLE_VALUE_WIDTH$} {rsd:>7} {trust:>HUMAN_TABLE_TRUST_WIDTH$} {mode:>HUMAN_TABLE_MODE_WIDTH$}",
+        "{benchmark:<name_width$} {measurement:<measurement_width$} {value:>metric_width$} {p50:>metric_width$} {p95:>metric_width$} {p99:>metric_width$} {rsd:>rsd_width$} {trust:<trust_width$} {mode:<mode_width$}",
         benchmark = "benchmark",
         measurement = "measurement",
         value = "value",
@@ -575,18 +650,22 @@ fn write_human_table_header(output: &mut String, name_width: usize) {
         rsd = "rsd",
         trust = "trust",
         mode = "mode",
-        name_width = name_width,
+        name_width = layout.name,
+        measurement_width = layout.measurement,
+        metric_width = layout.metric,
+        rsd_width = layout.rsd,
+        trust_width = layout.trust,
+        mode_width = layout.mode,
     );
     let _ = writeln!(output, "{header}");
     let _ = writeln!(output, "{}", "-".repeat(header.len()));
 }
 
-fn write_human_table_row(
-    output: &mut String,
+fn human_table_row(
     summary: &BenchmarkSummary,
     name_mode: ConsoleNameMode,
     name_width: usize,
-) {
+) -> HumanTableRow {
     let name = format_human_table_name(summary, name_mode, name_width);
     let value = summary.primary_value().map_or_else(
         || "n/a".to_string(),
@@ -601,13 +680,39 @@ fn write_human_table_row(
         || "n/a".to_string(),
         |stats| format_percent(stats.relative_std_dev),
     );
+
+    HumanTableRow {
+        name,
+        measurement,
+        value,
+        p50,
+        p95,
+        p99,
+        rsd,
+        trust: summary.trust_class.to_string(),
+        mode: measurement_mode_label(summary),
+    }
+}
+
+fn write_human_table_row(output: &mut String, row: &HumanTableRow, layout: &HumanTableLayout) {
     let _ = writeln!(
         output,
-        "{name:<name_width$} {measurement:<HUMAN_TABLE_MEASUREMENT_WIDTH$} {value:>HUMAN_TABLE_VALUE_WIDTH$} {p50:>HUMAN_TABLE_VALUE_WIDTH$} {p95:>HUMAN_TABLE_VALUE_WIDTH$} {p99:>HUMAN_TABLE_VALUE_WIDTH$} {rsd:>7} {trust:>HUMAN_TABLE_TRUST_WIDTH$} {mode:>HUMAN_TABLE_MODE_WIDTH$}",
-        measurement = measurement,
-        trust = summary.trust_class,
-        mode = measurement_mode_label(summary),
-        name_width = name_width,
+        "{name:<name_width$} {measurement:<measurement_width$} {value:>metric_width$} {p50:>metric_width$} {p95:>metric_width$} {p99:>metric_width$} {rsd:>rsd_width$} {trust:<trust_width$} {mode:<mode_width$}",
+        name = row.name,
+        measurement = row.measurement,
+        value = row.value,
+        p50 = row.p50,
+        p95 = row.p95,
+        p99 = row.p99,
+        rsd = row.rsd,
+        trust = row.trust,
+        mode = row.mode,
+        name_width = layout.name,
+        measurement_width = layout.measurement,
+        metric_width = layout.metric,
+        rsd_width = layout.rsd,
+        trust_width = layout.trust,
+        mode_width = layout.mode,
     );
 }
 
@@ -2310,6 +2415,7 @@ mod tests {
                 "mode"
             ]
         );
+        assert!(header.len() < 100);
         assert!(report.contains("queue::fast"));
         assert!(report.contains("op/s"));
         assert!(report.contains("1.00M"));
@@ -2317,6 +2423,7 @@ mod tests {
             .lines()
             .find(|line| line.starts_with("queue::fast"))
             .expect("fast benchmark row");
+        assert!(fast_row.starts_with("queue::fast op/s"));
         assert_eq!(fast_row.matches("op/s").count(), 1);
         assert!(!report.contains("Summary"));
         assert!(!report.contains("Quality"));
@@ -2337,7 +2444,10 @@ mod tests {
     fn compact_console_names_allow_64_characters() {
         let name = "a".repeat(64);
 
-        assert_eq!(truncate_name_to_width(&name, HUMAN_TABLE_NAME_WIDTH), name);
+        assert_eq!(
+            truncate_name_to_width(&name, HUMAN_TABLE_NAME_MAX_WIDTH),
+            name
+        );
     }
 
     #[test]
@@ -2350,9 +2460,10 @@ mod tests {
         row.parameters
             .insert("clients".to_string(), "16".to_string());
 
-        let label = format_human_table_name(&row, ConsoleNameMode::Compact, HUMAN_TABLE_NAME_WIDTH);
+        let label =
+            format_human_table_name(&row, ConsoleNameMode::Compact, HUMAN_TABLE_NAME_MAX_WIDTH);
 
-        assert_eq!(label.chars().count(), HUMAN_TABLE_NAME_WIDTH);
+        assert_eq!(label.chars().count(), HUMAN_TABLE_NAME_MAX_WIDTH);
         assert!(label.contains(".."));
         assert!(!label.contains("clients"));
     }
