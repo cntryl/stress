@@ -48,7 +48,13 @@ pub struct SampleProgress {
 }
 
 const NAME_WIDTH: usize = 36;
-const HUMAN_TABLE_NAME_MAX_WIDTH: usize = 64;
+const HUMAN_TABLE_NAME_LABEL_MAX_WIDTH: usize = 64;
+const HUMAN_TABLE_NAME_DEFAULT_WIDTH: usize = 65;
+const HUMAN_TABLE_MEASUREMENT_MIN_WIDTH: usize = 14;
+const HUMAN_TABLE_METRIC_MIN_WIDTH: usize = 10;
+const HUMAN_TABLE_RSD_MIN_WIDTH: usize = 5;
+const HUMAN_TABLE_TRUST_MIN_WIDTH: usize = 11;
+const HUMAN_TABLE_MODE_MIN_WIDTH: usize = 9;
 const VALUE_WIDTH: usize = 16;
 
 /// Console reporter that prints the human benchmark table to stdout.
@@ -564,7 +570,9 @@ fn human_table_name_width(summaries: &[&BenchmarkSummary], name_mode: ConsoleNam
         .max("benchmark".len());
 
     if matches!(name_mode, ConsoleNameMode::Compact) {
-        max_name_width.min(HUMAN_TABLE_NAME_MAX_WIDTH)
+        max_name_width
+            .min(HUMAN_TABLE_NAME_LABEL_MAX_WIDTH)
+            .max(HUMAN_TABLE_NAME_DEFAULT_WIDTH)
     } else {
         max_name_width
     }
@@ -598,7 +606,8 @@ impl HumanTableLayout {
         let measurement = max_chars(
             "measurement",
             rows.iter().map(|row| row.measurement.as_str()),
-        );
+        )
+        .max(HUMAN_TABLE_MEASUREMENT_MIN_WIDTH);
         let metric = rows
             .iter()
             .flat_map(|row| {
@@ -613,10 +622,14 @@ impl HumanTableLayout {
             .map(Iterator::count)
             .chain(["value", "p50", "p95", "p99"].into_iter().map(str::len))
             .max()
-            .unwrap_or("value".len());
-        let rsd = max_chars("rsd", rows.iter().map(|row| row.rsd.as_str()));
-        let trust = max_chars("trust", rows.iter().map(|row| row.trust.as_str()));
-        let mode = max_chars("mode", rows.iter().map(|row| row.mode));
+            .unwrap_or("value".len())
+            .max(HUMAN_TABLE_METRIC_MIN_WIDTH);
+        let rsd = max_chars("rsd", rows.iter().map(|row| row.rsd.as_str()))
+            .max(HUMAN_TABLE_RSD_MIN_WIDTH);
+        let trust = max_chars("trust", rows.iter().map(|row| row.trust.as_str()))
+            .max(HUMAN_TABLE_TRUST_MIN_WIDTH);
+        let mode =
+            max_chars("mode", rows.iter().map(|row| row.mode)).max(HUMAN_TABLE_MODE_MIN_WIDTH);
 
         Self {
             name: name_width,
@@ -722,7 +735,9 @@ fn format_human_table_name(
     width: usize,
 ) -> String {
     match name_mode {
-        ConsoleNameMode::Compact => truncate_name_to_width(&summary.name, width),
+        ConsoleNameMode::Compact => {
+            truncate_name_to_width(&summary.name, width.min(HUMAN_TABLE_NAME_LABEL_MAX_WIDTH))
+        }
         ConsoleNameMode::Full => name_with_parameter_hint(summary),
     }
 }
@@ -2415,7 +2430,6 @@ mod tests {
                 "mode"
             ]
         );
-        assert!(header.len() < 100);
         assert!(report.contains("queue::fast"));
         assert!(report.contains("op/s"));
         assert!(report.contains("1.00M"));
@@ -2423,7 +2437,7 @@ mod tests {
             .lines()
             .find(|line| line.starts_with("queue::fast"))
             .expect("fast benchmark row");
-        assert!(fast_row.starts_with("queue::fast op/s"));
+        assert!(fast_row.contains(" op/s "));
         assert_eq!(fast_row.matches("op/s").count(), 1);
         assert!(!report.contains("Summary"));
         assert!(!report.contains("Quality"));
@@ -2445,7 +2459,7 @@ mod tests {
         let name = "a".repeat(64);
 
         assert_eq!(
-            truncate_name_to_width(&name, HUMAN_TABLE_NAME_MAX_WIDTH),
+            truncate_name_to_width(&name, HUMAN_TABLE_NAME_LABEL_MAX_WIDTH),
             name
         );
     }
@@ -2460,10 +2474,13 @@ mod tests {
         row.parameters
             .insert("clients".to_string(), "16".to_string());
 
-        let label =
-            format_human_table_name(&row, ConsoleNameMode::Compact, HUMAN_TABLE_NAME_MAX_WIDTH);
+        let label = format_human_table_name(
+            &row,
+            ConsoleNameMode::Compact,
+            HUMAN_TABLE_NAME_DEFAULT_WIDTH,
+        );
 
-        assert_eq!(label.chars().count(), HUMAN_TABLE_NAME_MAX_WIDTH);
+        assert_eq!(label.chars().count(), HUMAN_TABLE_NAME_LABEL_MAX_WIDTH);
         assert!(label.contains(".."));
         assert!(!label.contains("clients"));
     }
