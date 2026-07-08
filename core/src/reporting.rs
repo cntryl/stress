@@ -50,11 +50,7 @@ pub struct SampleProgress {
 const NAME_WIDTH: usize = 36;
 const HUMAN_TABLE_NAME_LABEL_MAX_WIDTH: usize = 64;
 const HUMAN_TABLE_NAME_DEFAULT_WIDTH: usize = 65;
-const HUMAN_TABLE_MEASUREMENT_MIN_WIDTH: usize = 14;
-const HUMAN_TABLE_METRIC_MIN_WIDTH: usize = 10;
-const HUMAN_TABLE_RSD_MIN_WIDTH: usize = 5;
-const HUMAN_TABLE_TRUST_MIN_WIDTH: usize = 11;
-const HUMAN_TABLE_MODE_MIN_WIDTH: usize = 9;
+const HUMAN_TABLE_COLUMN_MIN_WIDTH: usize = 12;
 const VALUE_WIDTH: usize = 16;
 
 /// Console reporter that prints the human benchmark table to stdout.
@@ -607,7 +603,7 @@ impl HumanTableLayout {
             "measurement",
             rows.iter().map(|row| row.measurement.as_str()),
         )
-        .max(HUMAN_TABLE_MEASUREMENT_MIN_WIDTH);
+        .max(HUMAN_TABLE_COLUMN_MIN_WIDTH);
         let metric = rows
             .iter()
             .flat_map(|row| {
@@ -623,13 +619,13 @@ impl HumanTableLayout {
             .chain(["value", "p50", "p95", "p99"].into_iter().map(str::len))
             .max()
             .unwrap_or("value".len())
-            .max(HUMAN_TABLE_METRIC_MIN_WIDTH);
+            .max(HUMAN_TABLE_COLUMN_MIN_WIDTH);
         let rsd = max_chars("rsd", rows.iter().map(|row| row.rsd.as_str()))
-            .max(HUMAN_TABLE_RSD_MIN_WIDTH);
+            .max(HUMAN_TABLE_COLUMN_MIN_WIDTH);
         let trust = max_chars("trust", rows.iter().map(|row| row.trust.as_str()))
-            .max(HUMAN_TABLE_TRUST_MIN_WIDTH);
+            .max(HUMAN_TABLE_COLUMN_MIN_WIDTH);
         let mode =
-            max_chars("mode", rows.iter().map(|row| row.mode)).max(HUMAN_TABLE_MODE_MIN_WIDTH);
+            max_chars("mode", rows.iter().map(|row| row.mode)).max(HUMAN_TABLE_COLUMN_MIN_WIDTH);
 
         Self {
             name: name_width,
@@ -2452,6 +2448,30 @@ mod tests {
             truncate_name_to_width("abcdefghijklmnopqrstuvwx", 10),
             "abcd..uvwx"
         );
+    }
+
+    #[test]
+    fn human_console_uses_twelve_char_minimum_for_non_name_columns() {
+        let rows = vec![HumanTableRow {
+            name: "row".to_string(),
+            measurement: "op/s".to_string(),
+            value: "1".to_string(),
+            p50: "1".to_string(),
+            p95: "1".to_string(),
+            p99: "1".to_string(),
+            rsd: "0%".to_string(),
+            trust: "gate".to_string(),
+            mode: "micro",
+        }];
+
+        let layout = HumanTableLayout::for_rows(&rows, HUMAN_TABLE_NAME_DEFAULT_WIDTH);
+
+        assert_eq!(layout.name, HUMAN_TABLE_NAME_DEFAULT_WIDTH);
+        assert_eq!(layout.measurement, HUMAN_TABLE_COLUMN_MIN_WIDTH);
+        assert_eq!(layout.metric, HUMAN_TABLE_COLUMN_MIN_WIDTH);
+        assert_eq!(layout.rsd, HUMAN_TABLE_COLUMN_MIN_WIDTH);
+        assert_eq!(layout.trust, HUMAN_TABLE_COLUMN_MIN_WIDTH);
+        assert_eq!(layout.mode, HUMAN_TABLE_COLUMN_MIN_WIDTH);
     }
 
     #[test]
