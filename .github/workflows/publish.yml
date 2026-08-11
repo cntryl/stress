@@ -264,6 +264,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: read
+      contents: read
       id-token: write
     steps:
       - name: Download validated release handoff
@@ -317,14 +318,48 @@ jobs:
           crate="cntryl-stress-macros"
           expected="${RUNNER_TEMP}/release-handoff/${crate}-${RELEASE_VERSION}.crate"
           downloaded="${RUNNER_TEMP}/${crate}-${RELEASE_VERSION}.registry.crate"
-          status="$(curl --silent --show-error --location --retry 3 --retry-delay 2 \
+          metadata="${RUNNER_TEMP}/${crate}-${RELEASE_VERSION}.metadata.json"
+          expected_checksum="$(sha256sum "$expected" | awk '{print $1}')"
+          status="$(curl --silent --show-error --location \
+            --retry 5 --retry-all-errors --retry-delay 2 \
             --header "User-Agent: cntryl-stress-release/${GITHUB_RUN_ID}" \
-            --output "$downloaded" \
+            --header "Accept: application/json" \
+            --header "Cache-Control: no-cache" \
+            --output "$metadata" \
             --write-out '%{http_code}' \
-            "https://crates.io/api/v1/crates/${crate}/${RELEASE_VERSION}/download")"
+            "https://crates.io/api/v1/crates/${crate}/${RELEASE_VERSION}")"
 
           case "$status" in
             200)
+              python3 - "$metadata" "$crate" "$RELEASE_VERSION" "$expected_checksum" <<'PY'
+          import json
+          import sys
+
+          metadata_path, expected_crate, expected_version, expected_checksum = sys.argv[1:]
+          with open(metadata_path, encoding="utf-8") as metadata_file:
+              version = json.load(metadata_file).get("version")
+          if not isinstance(version, dict):
+              raise SystemExit("crates.io response is missing version metadata")
+          if version.get("crate") != expected_crate or version.get("num") != expected_version:
+              raise SystemExit("crates.io returned metadata for an unexpected crate version")
+          if version.get("yanked") is not False:
+              raise SystemExit(f"{expected_crate} {expected_version} is yanked")
+          if version.get("checksum") != expected_checksum:
+              raise SystemExit(
+                  f"{expected_crate} {expected_version} has an unexpected registry checksum"
+              )
+          PY
+
+              download_status="$(curl --silent --show-error --location \
+                --retry 5 --retry-all-errors --retry-delay 2 \
+                --header "User-Agent: cntryl-stress-release/${GITHUB_RUN_ID}" \
+                --output "$downloaded" \
+                --write-out '%{http_code}' \
+                "https://crates.io/api/v1/crates/${crate}/${RELEASE_VERSION}/download")"
+              if [[ "$download_status" != "200" ]]; then
+                echo "::error::Unexpected crates.io archive response ${download_status} for ${crate} ${RELEASE_VERSION}."
+                exit 1
+              fi
               if ! cmp "$expected" "$downloaded"; then
                 echo "::error::${crate} ${RELEASE_VERSION} already exists with different package bytes."
                 exit 1
@@ -344,6 +379,47 @@ jobs:
         if: steps.registry.outputs.needs_publish == 'true'
         id: auth
         uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
+
+      - name: Revalidate remote tag immediately before macros publication
+        if: steps.registry.outputs.needs_publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.release-identity.outputs.release-sha }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          response="$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
+          object_type="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["object"]["type"])' <<< "$response")"
+          object_sha="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["object"]["sha"])' <<< "$response")"
+
+          if [[ "$object_type" != "tag" ]]; then
+            echo "::error::Remote ${RELEASE_TAG} is no longer an annotated tag."
+            exit 1
+          fi
+
+          for depth in {1..8}; do
+            response="$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}")"
+            object_type="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["object"]["type"])' <<< "$response")"
+            object_sha="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["object"]["sha"])' <<< "$response")"
+            [[ "$object_type" == "tag" ]] || break
+          done
+
+          if [[ "$object_type" != "commit" ]]; then
+            echo "::error::Remote ${RELEASE_TAG} does not resolve to a commit within eight tag objects."
+            exit 1
+          fi
+          if [[ "$object_sha" != "$RELEASE_SHA" ]]; then
+            echo "::error::Remote ${RELEASE_TAG} moved from validated commit ${RELEASE_SHA} to ${object_sha}."
+            exit 1
+          fi
 
       - name: Publish macros crate without executing package code
         if: steps.registry.outputs.needs_publish == 'true'
@@ -368,22 +444,57 @@ jobs:
           crate="cntryl-stress-macros"
           expected="${RUNNER_TEMP}/release-handoff/${crate}-${RELEASE_VERSION}.crate"
           downloaded="${RUNNER_TEMP}/${crate}-${RELEASE_VERSION}.verified.crate"
+          metadata="${RUNNER_TEMP}/${crate}-${RELEASE_VERSION}.verified.json"
+          expected_checksum="$(sha256sum "$expected" | awk '{print $1}')"
 
           for attempt in {1..18}; do
-            status="$(curl --silent --show-error --location --retry 3 --retry-delay 2 \
+            metadata_status="$(curl --silent --show-error --location \
+              --retry 5 --retry-all-errors --retry-delay 2 \
               --header "User-Agent: cntryl-stress-release/${GITHUB_RUN_ID}" \
-              --output "$downloaded" \
+              --header "Accept: application/json" \
+              --header "Cache-Control: no-cache" \
+              --output "$metadata" \
               --write-out '%{http_code}' \
-              "https://crates.io/api/v1/crates/${crate}/${RELEASE_VERSION}/download")"
-            if [[ "$status" == "200" ]]; then
-              cmp "$expected" "$downloaded" || {
-                echo "::error::Visible ${crate} ${RELEASE_VERSION} does not match the validated archive."
+              "https://crates.io/api/v1/crates/${crate}/${RELEASE_VERSION}")"
+            if [[ "$metadata_status" == "200" ]]; then
+              python3 - "$metadata" "$crate" "$RELEASE_VERSION" "$expected_checksum" <<'PY'
+          import json
+          import sys
+
+          metadata_path, expected_crate, expected_version, expected_checksum = sys.argv[1:]
+          with open(metadata_path, encoding="utf-8") as metadata_file:
+              version = json.load(metadata_file).get("version")
+          if not isinstance(version, dict):
+              raise SystemExit("crates.io response is missing version metadata")
+          if version.get("crate") != expected_crate or version.get("num") != expected_version:
+              raise SystemExit("crates.io returned metadata for an unexpected crate version")
+          if version.get("yanked") is not False:
+              raise SystemExit(f"{expected_crate} {expected_version} is yanked")
+          if version.get("checksum") != expected_checksum:
+              raise SystemExit(
+                  f"{expected_crate} {expected_version} has an unexpected registry checksum"
+              )
+          PY
+
+              archive_status="$(curl --silent --show-error --location \
+                --retry 5 --retry-all-errors --retry-delay 2 \
+                --header "User-Agent: cntryl-stress-release/${GITHUB_RUN_ID}" \
+                --output "$downloaded" \
+                --write-out '%{http_code}' \
+                "https://crates.io/api/v1/crates/${crate}/${RELEASE_VERSION}/download")"
+              if [[ "$archive_status" == "200" ]]; then
+                cmp "$expected" "$downloaded" || {
+                  echo "::error::Visible ${crate} ${RELEASE_VERSION} does not match the validated archive."
+                  exit 1
+                }
+                exit 0
+              fi
+              if [[ "$archive_status" != "404" ]]; then
+                echo "::error::Unexpected crates.io archive response ${archive_status} for ${crate} ${RELEASE_VERSION}."
                 exit 1
-              }
-              exit 0
-            fi
-            if [[ "$status" != "404" ]]; then
-              echo "::error::Unexpected crates.io response ${status} for ${crate} ${RELEASE_VERSION}."
+              fi
+            elif [[ "$metadata_status" != "404" ]]; then
+              echo "::error::Unexpected crates.io metadata response ${metadata_status} for ${crate} ${RELEASE_VERSION}."
               exit 1
             fi
             echo "Waiting for ${crate} ${RELEASE_VERSION} to become visible (${attempt}/18)."
@@ -513,6 +624,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: read
+      contents: read
       id-token: write
     steps:
       - name: Download validated core handoff
@@ -566,14 +678,48 @@ jobs:
           crate="cntryl-stress"
           expected="${RUNNER_TEMP}/core-release-handoff/${crate}-${RELEASE_VERSION}.crate"
           downloaded="${RUNNER_TEMP}/${crate}-${RELEASE_VERSION}.registry.crate"
-          status="$(curl --silent --show-error --location --retry 3 --retry-delay 2 \
+          metadata="${RUNNER_TEMP}/${crate}-${RELEASE_VERSION}.metadata.json"
+          expected_checksum="$(sha256sum "$expected" | awk '{print $1}')"
+          status="$(curl --silent --show-error --location \
+            --retry 5 --retry-all-errors --retry-delay 2 \
             --header "User-Agent: cntryl-stress-release/${GITHUB_RUN_ID}" \
-            --output "$downloaded" \
+            --header "Accept: application/json" \
+            --header "Cache-Control: no-cache" \
+            --output "$metadata" \
             --write-out '%{http_code}' \
-            "https://crates.io/api/v1/crates/${crate}/${RELEASE_VERSION}/download")"
+            "https://crates.io/api/v1/crates/${crate}/${RELEASE_VERSION}")"
 
           case "$status" in
             200)
+              python3 - "$metadata" "$crate" "$RELEASE_VERSION" "$expected_checksum" <<'PY'
+          import json
+          import sys
+
+          metadata_path, expected_crate, expected_version, expected_checksum = sys.argv[1:]
+          with open(metadata_path, encoding="utf-8") as metadata_file:
+              version = json.load(metadata_file).get("version")
+          if not isinstance(version, dict):
+              raise SystemExit("crates.io response is missing version metadata")
+          if version.get("crate") != expected_crate or version.get("num") != expected_version:
+              raise SystemExit("crates.io returned metadata for an unexpected crate version")
+          if version.get("yanked") is not False:
+              raise SystemExit(f"{expected_crate} {expected_version} is yanked")
+          if version.get("checksum") != expected_checksum:
+              raise SystemExit(
+                  f"{expected_crate} {expected_version} has an unexpected registry checksum"
+              )
+          PY
+
+              download_status="$(curl --silent --show-error --location \
+                --retry 5 --retry-all-errors --retry-delay 2 \
+                --header "User-Agent: cntryl-stress-release/${GITHUB_RUN_ID}" \
+                --output "$downloaded" \
+                --write-out '%{http_code}' \
+                "https://crates.io/api/v1/crates/${crate}/${RELEASE_VERSION}/download")"
+              if [[ "$download_status" != "200" ]]; then
+                echo "::error::Unexpected crates.io archive response ${download_status} for ${crate} ${RELEASE_VERSION}."
+                exit 1
+              fi
               if ! cmp "$expected" "$downloaded"; then
                 echo "::error::${crate} ${RELEASE_VERSION} already exists with different package bytes."
                 exit 1
@@ -593,6 +739,47 @@ jobs:
         if: steps.registry.outputs.needs_publish == 'true'
         id: auth
         uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
+
+      - name: Revalidate remote tag immediately before core publication
+        if: steps.registry.outputs.needs_publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.release-identity.outputs.release-sha }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          response="$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
+          object_type="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["object"]["type"])' <<< "$response")"
+          object_sha="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["object"]["sha"])' <<< "$response")"
+
+          if [[ "$object_type" != "tag" ]]; then
+            echo "::error::Remote ${RELEASE_TAG} is no longer an annotated tag."
+            exit 1
+          fi
+
+          for depth in {1..8}; do
+            response="$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}")"
+            object_type="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["object"]["type"])' <<< "$response")"
+            object_sha="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["object"]["sha"])' <<< "$response")"
+            [[ "$object_type" == "tag" ]] || break
+          done
+
+          if [[ "$object_type" != "commit" ]]; then
+            echo "::error::Remote ${RELEASE_TAG} does not resolve to a commit within eight tag objects."
+            exit 1
+          fi
+          if [[ "$object_sha" != "$RELEASE_SHA" ]]; then
+            echo "::error::Remote ${RELEASE_TAG} moved from validated commit ${RELEASE_SHA} to ${object_sha}."
+            exit 1
+          fi
 
       - name: Publish core crate without executing package code
         if: steps.registry.outputs.needs_publish == 'true'
@@ -617,22 +804,57 @@ jobs:
           crate="cntryl-stress"
           expected="${RUNNER_TEMP}/core-release-handoff/${crate}-${RELEASE_VERSION}.crate"
           downloaded="${RUNNER_TEMP}/${crate}-${RELEASE_VERSION}.verified.crate"
+          metadata="${RUNNER_TEMP}/${crate}-${RELEASE_VERSION}.verified.json"
+          expected_checksum="$(sha256sum "$expected" | awk '{print $1}')"
 
           for attempt in {1..18}; do
-            status="$(curl --silent --show-error --location --retry 3 --retry-delay 2 \
+            metadata_status="$(curl --silent --show-error --location \
+              --retry 5 --retry-all-errors --retry-delay 2 \
               --header "User-Agent: cntryl-stress-release/${GITHUB_RUN_ID}" \
-              --output "$downloaded" \
+              --header "Accept: application/json" \
+              --header "Cache-Control: no-cache" \
+              --output "$metadata" \
               --write-out '%{http_code}' \
-              "https://crates.io/api/v1/crates/${crate}/${RELEASE_VERSION}/download")"
-            if [[ "$status" == "200" ]]; then
-              cmp "$expected" "$downloaded" || {
-                echo "::error::Visible ${crate} ${RELEASE_VERSION} does not match the validated archive."
+              "https://crates.io/api/v1/crates/${crate}/${RELEASE_VERSION}")"
+            if [[ "$metadata_status" == "200" ]]; then
+              python3 - "$metadata" "$crate" "$RELEASE_VERSION" "$expected_checksum" <<'PY'
+          import json
+          import sys
+
+          metadata_path, expected_crate, expected_version, expected_checksum = sys.argv[1:]
+          with open(metadata_path, encoding="utf-8") as metadata_file:
+              version = json.load(metadata_file).get("version")
+          if not isinstance(version, dict):
+              raise SystemExit("crates.io response is missing version metadata")
+          if version.get("crate") != expected_crate or version.get("num") != expected_version:
+              raise SystemExit("crates.io returned metadata for an unexpected crate version")
+          if version.get("yanked") is not False:
+              raise SystemExit(f"{expected_crate} {expected_version} is yanked")
+          if version.get("checksum") != expected_checksum:
+              raise SystemExit(
+                  f"{expected_crate} {expected_version} has an unexpected registry checksum"
+              )
+          PY
+
+              archive_status="$(curl --silent --show-error --location \
+                --retry 5 --retry-all-errors --retry-delay 2 \
+                --header "User-Agent: cntryl-stress-release/${GITHUB_RUN_ID}" \
+                --output "$downloaded" \
+                --write-out '%{http_code}' \
+                "https://crates.io/api/v1/crates/${crate}/${RELEASE_VERSION}/download")"
+              if [[ "$archive_status" == "200" ]]; then
+                cmp "$expected" "$downloaded" || {
+                  echo "::error::Visible ${crate} ${RELEASE_VERSION} does not match the validated archive."
+                  exit 1
+                }
+                exit 0
+              fi
+              if [[ "$archive_status" != "404" ]]; then
+                echo "::error::Unexpected crates.io archive response ${archive_status} for ${crate} ${RELEASE_VERSION}."
                 exit 1
-              }
-              exit 0
-            fi
-            if [[ "$status" != "404" ]]; then
-              echo "::error::Unexpected crates.io response ${status} for ${crate} ${RELEASE_VERSION}."
+              fi
+            elif [[ "$metadata_status" != "404" ]]; then
+              echo "::error::Unexpected crates.io metadata response ${metadata_status} for ${crate} ${RELEASE_VERSION}."
               exit 1
             fi
             echo "Waiting for ${crate} ${RELEASE_VERSION} to become visible (${attempt}/18)."
@@ -656,6 +878,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_SHA: ${{ needs.release-identity.outputs.release-sha }}
           RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ needs.release-identity.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
@@ -701,11 +924,51 @@ jobs:
             printf '%s\n' "$object_sha"
           }
 
+          require_unyanked_registry_version() {
+            local crate="$1"
+            local metadata="${RUNNER_TEMP}/${crate}-${RELEASE_VERSION}.release.json"
+            local status
+
+            status="$(curl --silent --show-error --location \
+              --retry 5 --retry-all-errors --retry-delay 2 \
+              --header "User-Agent: cntryl-stress-release/${GITHUB_RUN_ID}" \
+              --header "Accept: application/json" \
+              --header "Cache-Control: no-cache" \
+              --output "$metadata" \
+              --write-out '%{http_code}' \
+              "https://crates.io/api/v1/crates/${crate}/${RELEASE_VERSION}")"
+            if [[ "$status" != "200" ]]; then
+              echo "::error::Expected crates.io metadata for ${crate} ${RELEASE_VERSION}, got ${status}." >&2
+              return 1
+            fi
+
+            python3 - "$metadata" "$crate" "$RELEASE_VERSION" <<'PY'
+          import json
+          import re
+          import sys
+
+          metadata_path, expected_crate, expected_version = sys.argv[1:]
+          with open(metadata_path, encoding="utf-8") as metadata_file:
+              version = json.load(metadata_file).get("version")
+          if not isinstance(version, dict):
+              raise SystemExit("crates.io response is missing version metadata")
+          if version.get("crate") != expected_crate or version.get("num") != expected_version:
+              raise SystemExit("crates.io returned metadata for an unexpected crate version")
+          if version.get("yanked") is not False:
+              raise SystemExit(f"{expected_crate} {expected_version} is yanked")
+          if not re.fullmatch(r"[0-9a-f]{64}", version.get("checksum", "")):
+              raise SystemExit("crates.io returned an invalid archive checksum")
+          PY
+          }
+
           before_sha="$(resolve_remote_annotated_tag)"
           if [[ "$before_sha" != "$RELEASE_SHA" ]]; then
             echo "::error::Remote ${RELEASE_TAG} moved from validated commit ${RELEASE_SHA} to ${before_sha}."
             exit 1
           fi
+
+          require_unyanked_registry_version cntryl-stress-macros
+          require_unyanked_registry_version cntryl-stress
 
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
             || gh release create "$RELEASE_TAG" \

@@ -1624,8 +1624,13 @@ fn diagnostic_evidence_floats_nearly_equal(path: &str, actual: &str, expected: &
 }
 
 fn floats_nearly_equal(actual: f64, expected: f64) -> bool {
+    // Summary statistics combine reductions, division, and square roots. The
+    // same canonical inputs can therefore land a few dozen representable
+    // floats apart across optimized targets while remaining many orders of
+    // magnitude below a meaningful evidence change.
+    const CROSS_PLATFORM_ROUNDING_EPSILONS: f64 = 64.0;
     let scale = actual.abs().max(expected.abs()).max(1.0);
-    (actual - expected).abs() <= f64::EPSILON * 8.0 * scale
+    (actual - expected).abs() <= f64::EPSILON * CROSS_PLATFORM_ROUNDING_EPSILONS * scale
 }
 
 pub(crate) fn diagnostic_summary_for_run(
@@ -4662,6 +4667,32 @@ mod tests {
             &actual,
             &expected,
             "summary.diagnostics[0].evidence.measurement_mode",
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn canonical_diff_tolerates_cross_platform_summary_float_roundoff_only() {
+        let linux = serde_json::json!(11.504_349_562_202_778);
+        let recomputed = serde_json::json!(11.504_349_562_202_858);
+
+        assert_eq!(
+            first_json_difference(&linux, &recomputed, "summary.stats.std_dev"),
+            None,
+        );
+
+        let tampered = serde_json::json!(11.504_350_562_202_858);
+        assert!(first_json_difference(&tampered, &recomputed, "summary.stats.std_dev").is_some());
+        assert!(first_json_difference(
+            &serde_json::json!(11),
+            &serde_json::json!(12),
+            "summary.correctness.attempted",
+        )
+        .is_some());
+        assert!(first_json_difference(
+            &serde_json::json!("11.504349562202778"),
+            &serde_json::json!("11.504349562202858"),
+            "summary.stats.std_dev",
         )
         .is_some());
     }

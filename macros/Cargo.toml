@@ -24,4 +24,4 @@ syn = { version = "2", features = ["full"] }
 
 [dev-dependencies]
 stress_alias = { package = "cntryl-stress", path = "../core" }
-trybuild = "1"
+trybuild = "=1.0.119"
