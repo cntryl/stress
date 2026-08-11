@@ -14,13 +14,6 @@ decisions.
 
 The core question is simple: **can this benchmark row be trusted?**
 
-> [!IMPORTANT]
-> This `main` branch documents the unreleased 0.3 API. Until 0.3 is published,
-> crates.io and docs.rs serve 0.2.x, whose authoring API is different. Use the
-> Git dependency below to try the current API, or follow the
-> [published 0.2.x documentation](https://docs.rs/cntryl-stress) when consuming
-> the registry release.
-
 `cntryl-stress` helps answer that by recording raw samples, deriving summaries
 from measured samples only, preserving correctness counters, and calling out
 common benchmark-shape mistakes such as uncounted batch work, invalid timing,
@@ -90,10 +83,7 @@ authoring and reporting experience.
 
 ```toml
 [dev-dependencies]
-# Unreleased 0.3 API documented on this branch:
-cntryl-stress = { git = "https://github.com/cntryl/stress" }
-# After 0.3 is published, replace the Git dependency with:
-# cntryl-stress = "0.3"
+cntryl-stress = "0.3"
 
 [[bench]]
 name = "storage_stress"
@@ -154,7 +144,7 @@ cargo bench --bench storage_stress -- --workload 'parse_route_hot_path'
 The optional `cargo stress` wrapper is feature-gated so ordinary benchmark builds do not compile its CLI dependency graph:
 
 ```bash
-cargo install --git https://github.com/cntryl/stress cntryl-stress --features cli
+cargo install cntryl-stress --features cli
 cargo stress
 cargo stress --bench storage_stress --profile release --save-baseline
 cargo stress --bench storage_stress --baseline latest
