@@ -1,0 +1,5 @@
+error: #[stress] benchmark functions cannot use an extern ABI
+ --> tests/ui/fail/signature_extern.rs:4:1
+  |
+4 | extern "C" fn benchmark(_ctx: &mut stress_alias::StressContext) {}
+  | ^^^^^^^^^^

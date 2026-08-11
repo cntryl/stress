@@ -47,7 +47,7 @@ pub struct StressRunnerConfig {
     pub tier: Option<u32>,
     /// Git SHA to include in artifacts.
     pub git_sha: Option<String>,
-    /// Per-benchmark timeout.
+    /// Per-benchmark deadline enforced by the generated `stress_main!` harness.
     pub timeout: Option<Duration>,
     /// Fixed-duration sample budget.
     pub sample_duration: Duration,
@@ -63,7 +63,7 @@ pub struct StressRunnerConfig {
     pub fail_on_regression: bool,
     /// Optional strict diagnostic gate threshold.
     pub deny_diagnostics: Option<DiagnosticSeverity>,
-    /// Regression/improvement threshold.
+    /// Regression/improvement threshold as a fraction (`0.05` means 5%).
     pub threshold: f64,
     /// Human-readable report depth label.
     pub report_depth: String,
@@ -189,12 +189,19 @@ impl StressRunnerConfig {
     }
 
     /// Resolve config from canonical `STRESS_*` environment variables.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a configured environment value is malformed. Invalid
+    /// policy input must not silently fall back to a weaker profile.
     #[must_use]
     pub fn from_env() -> Self {
         let resolution = Self::resolve_from_env();
-        for warning in &resolution.warnings {
-            eprintln!("Warning: {warning}");
-        }
+        assert!(
+            resolution.warnings.is_empty(),
+            "invalid stress environment: {}",
+            resolution.warnings.join("; ")
+        );
         resolution.config
     }
 
@@ -240,7 +247,7 @@ impl StressRunnerConfig {
         resolution
     }
 
-    /// Return validation errors that would make a run perform no useful work.
+    /// Return validation errors that would make a run invalid or perform no useful work.
     #[must_use]
     pub fn validation_errors(&self) -> Vec<String> {
         let mut errors = Vec::new();
@@ -250,8 +257,27 @@ impl StressRunnerConfig {
         if self.operations_per_sample == 0 {
             errors.push("operations_per_sample must be greater than 0".to_string());
         }
+        if self.sample_duration.is_zero() {
+            errors.push("sample_duration must be greater than 0".to_string());
+        }
+        if self.micro_sample_duration.is_zero() {
+            errors.push("micro_sample_duration must be greater than 0".to_string());
+        }
+        if self.timeout.is_some_and(|timeout| timeout.is_zero()) {
+            errors.push("timeout must be greater than 0 when configured".to_string());
+        }
         if self.tier.is_some_and(|tier| tier == 0 || tier > MAX_TIER) {
             errors.push(format!("tier must be between 1 and {MAX_TIER}"));
+        }
+        if self
+            .filter
+            .as_deref()
+            .is_some_and(|filter| filter.trim().is_empty())
+        {
+            errors.push("filter must not be empty".to_string());
+        }
+        if !self.threshold.is_finite() || !(0.0..=1.0).contains(&self.threshold) {
+            errors.push("threshold must be finite and between 0 and 1".to_string());
         }
         errors
     }
@@ -386,7 +412,7 @@ impl StressRunnerConfig {
         self
     }
 
-    /// Set per-benchmark timeout.
+    /// Set the deadline enforced by the generated `stress_main!` harness.
     #[must_use]
     pub fn timeout(mut self, duration: Duration) -> Self {
         self.timeout = Some(duration);
@@ -414,10 +440,33 @@ impl StressRunnerConfig {
         self
     }
 
-    /// Set regression threshold.
+    /// Set the regression threshold as a fraction (`0.05` means 5%).
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `value` is finite and between 0 and 1.
     #[must_use]
-    pub fn threshold(mut self, value: f64) -> Self {
+    pub fn threshold_fraction(mut self, value: f64) -> Self {
+        assert!(
+            value.is_finite() && (0.0..=1.0).contains(&value),
+            "regression threshold fraction must be between 0 and 1"
+        );
         self.threshold = value;
+        self
+    }
+
+    /// Set the regression threshold in percentage points (`5.0` means 5%).
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `value` is finite and between 0 and 100.
+    #[must_use]
+    pub fn threshold_percent(mut self, value: f64) -> Self {
+        assert!(
+            value.is_finite() && (0.0..=100.0).contains(&value),
+            "regression threshold percent must be between 0 and 100"
+        );
+        self.threshold = value / 100.0;
         self
     }
 
@@ -479,7 +528,9 @@ where
             Err(_) => (
                 RunProfile::default(),
                 "default".to_string(),
-                Some("invalid STRESS_PROFILE, using default".to_string()),
+                Some(
+                    "invalid STRESS_PROFILE; expected default, smoke, lab, or release".to_string(),
+                ),
             ),
         },
         None => (RunProfile::default(), "default".to_string(), None),
@@ -597,7 +648,7 @@ where
         resolution,
         "STRESS_TIMEOUT_SECS",
         "timeout_secs",
-        |value| value.parse::<u64>().ok(),
+        |value| value.parse::<u64>().ok().filter(|value| *value != 0),
         |config, value| config.timeout = Some(Duration::from_secs(value)),
     );
     parse_env(
@@ -605,7 +656,7 @@ where
         resolution,
         "STRESS_SAMPLE_DURATION_MS",
         "sample_duration",
-        |value| value.parse::<u64>().ok(),
+        |value| value.parse::<u64>().ok().filter(|value| *value != 0),
         |config, value| config.sample_duration = Duration::from_millis(value),
     );
     parse_env(
@@ -613,7 +664,7 @@ where
         resolution,
         "STRESS_OPERATIONS_PER_SAMPLE",
         "operations_per_sample",
-        |value| value.parse::<u64>().ok(),
+        |value| value.parse::<u64>().ok().filter(|value| *value != 0),
         |config, value| config.operations_per_sample = value,
     );
     parse_env(
@@ -621,7 +672,7 @@ where
         resolution,
         "STRESS_MICRO_SAMPLE_DURATION_MS",
         "micro_sample_duration",
-        |value| value.parse::<u64>().ok(),
+        |value| value.parse::<u64>().ok().filter(|value| *value != 0),
         |config, value| config.micro_sample_duration = Duration::from_millis(value),
     );
     parse_env(
@@ -629,7 +680,12 @@ where
         resolution,
         "STRESS_THRESHOLD",
         "threshold",
-        |value| value.parse::<f64>().ok(),
+        |value| {
+            value
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        },
         |config, value| config.threshold = value,
     );
 }
@@ -656,7 +712,7 @@ where
             }
             None => resolution
                 .warnings
-                .push("invalid STRESS_FAIL_ON_ISSUES, using profile/default value".to_string()),
+                .push("invalid STRESS_FAIL_ON_ISSUES; expected true or false".to_string()),
         }
     }
 
@@ -669,9 +725,9 @@ where
                     "env STRESS_DENY_DIAGNOSTICS".to_string(),
                 );
             }
-            Err(_) => resolution
-                .warnings
-                .push("invalid STRESS_DENY_DIAGNOSTICS, using profile/default value".to_string()),
+            Err(_) => resolution.warnings.push(
+                "invalid STRESS_DENY_DIAGNOSTICS; expected info, warning, or error".to_string(),
+            ),
         }
     }
 }
@@ -698,9 +754,7 @@ fn parse_env<F, T, P, A>(
                 .metadata
                 .insert(format!("{metadata_key}_src"), format!("env {env_key}"));
         }
-        None => resolution
-            .warnings
-            .push(format!("invalid {env_key}, using profile/default value")),
+        None => resolution.warnings.push(format!("invalid {env_key}")),
     }
 }
 
@@ -812,7 +866,8 @@ mod tests {
             .cooldown_samples(1)
             .filter("my_bench")
             .tier(3)
-            .operations_per_sample(10);
+            .operations_per_sample(10)
+            .threshold_percent(5.0);
 
         assert_eq!(cfg.samples, 5);
         assert_eq!(cfg.warmup_samples, 2);
@@ -821,7 +876,15 @@ mod tests {
         assert_eq!(cfg.filter, Some("my_bench".to_string()));
         assert_eq!(cfg.tier, Some(3));
         assert_eq!(cfg.operations_per_sample, 10);
+        assert!((cfg.threshold - 0.05).abs() < f64::EPSILON);
         assert_eq!(cfg.micro_sample_duration, Duration::from_millis(25));
+    }
+
+    #[test]
+    fn threshold_fraction_has_an_explicit_unit() {
+        let cfg = StressRunnerConfig::new().threshold_fraction(0.07);
+
+        assert!((cfg.threshold - 0.07).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -883,7 +946,7 @@ mod tests {
         );
         assert_eq!(
             resolution.warnings,
-            vec!["invalid STRESS_PROFILE, using default".to_string()]
+            vec!["invalid STRESS_PROFILE; expected default, smoke, lab, or release".to_string()]
         );
     }
 
@@ -901,6 +964,79 @@ mod tests {
                 "operations_per_sample must be greater than 0".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn validation_rejects_invalid_regression_thresholds() {
+        for threshold in [f64::NAN, f64::INFINITY, -0.01, 1.01] {
+            let mut cfg = StressRunnerConfig::new();
+            cfg.threshold = threshold;
+
+            assert_eq!(
+                cfg.validation_errors(),
+                vec!["threshold must be finite and between 0 and 1".to_string()]
+            );
+        }
+    }
+
+    #[test]
+    fn validation_rejects_zero_execution_durations() {
+        let mut cfg = StressRunnerConfig::new();
+        cfg.sample_duration = Duration::ZERO;
+        cfg.micro_sample_duration = Duration::ZERO;
+        cfg.timeout = Some(Duration::ZERO);
+
+        assert_eq!(
+            cfg.validation_errors(),
+            vec![
+                "sample_duration must be greater than 0".to_string(),
+                "micro_sample_duration must be greater than 0".to_string(),
+                "timeout must be greater than 0 when configured".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn zero_execution_env_values_warn_and_keep_profile_defaults() {
+        let env = HashMap::from([
+            ("STRESS_TIMEOUT_SECS", "0".to_string()),
+            ("STRESS_SAMPLE_DURATION_MS", "0".to_string()),
+            ("STRESS_OPERATIONS_PER_SAMPLE", "0".to_string()),
+            ("STRESS_MICRO_SAMPLE_DURATION_MS", "0".to_string()),
+        ]);
+
+        let resolution = StressRunnerConfig::resolve_from_env_with(|key| env.get(key).cloned());
+
+        assert_eq!(resolution.config.timeout, None);
+        assert_eq!(
+            resolution.config.sample_duration,
+            Duration::from_millis(500)
+        );
+        assert_eq!(resolution.config.operations_per_sample, 1);
+        assert_eq!(
+            resolution.config.micro_sample_duration,
+            Duration::from_millis(25)
+        );
+        assert_eq!(resolution.warnings.len(), 4);
+    }
+
+    #[test]
+    fn invalid_threshold_env_values_warn_and_keep_the_profile_default() {
+        for threshold in ["NaN", "inf", "-0.01", "1.01"] {
+            let env = HashMap::from([("STRESS_THRESHOLD", threshold.to_string())]);
+
+            let resolution = StressRunnerConfig::resolve_from_env_with(|key| env.get(key).cloned());
+
+            assert!((resolution.config.threshold - 0.05).abs() < f64::EPSILON);
+            assert_eq!(
+                resolution.warnings,
+                vec!["invalid STRESS_THRESHOLD".to_string()]
+            );
+            assert_eq!(
+                resolution.metadata.get("threshold_src"),
+                Some(&"default".to_string())
+            );
+        }
     }
 
     #[test]

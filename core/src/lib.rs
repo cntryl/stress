@@ -27,8 +27,8 @@
 //!
 //! The common benchmark body is intentionally small:
 //!
-//! ```rust,ignore
-//! use cntryl_stress::{black_box, stress, StressContext};
+//! ```rust,no_run
+//! use cntryl_stress::{black_box, stress, LogicalUnit, OperationOutcome, StressContext};
 //!
 //! #[stress(tier = 1)]
 //! fn parse_hot_path(ctx: &mut StressContext) {
@@ -36,20 +36,24 @@
 //!     ctx.measure("colon lookup", || black_box(header.iter().position(|byte| *byte == b':')));
 //! }
 //!
-//! #[stress(tier = 2)]
-//! fn write_batch(ctx: &mut StressContext) {
-//!     let batch = build_batch();
-//!     ctx.parameter("payload_size", batch.len());
-//!     ctx.measure("write batch", || write_to_system(&batch));
+//! #[stress(tier = 3)]
+//! fn process_batch(ctx: &mut StressContext) {
+//!     let records = [1_u64, 2, 3];
+//!     ctx.measure_outcome("process batch", LogicalUnit::new("record"), || {
+//!         black_box(records.iter().sum::<u64>());
+//!         OperationOutcome::success(records.len() as u64)
+//!     });
 //! }
-//!
-//! cntryl_stress::stress_main!();
 //! ```
+//!
+//! A `harness = false` benchmark binary ends with
+//! `cntryl_stress::stress_main!();`.
 
 mod allocation;
 pub mod artifact;
 mod config;
 pub mod context;
+mod error;
 mod harness;
 pub mod reporting;
 pub mod runner;
@@ -66,9 +70,10 @@ static CNTRYL_STRESS_TEST_ALLOCATOR: allocation::StressAllocator =
 static CNTRYL_STRESS_TEST_ALLOCATOR_INSTALLATION: fn() =
     allocation::stress_allocator_installed_marker;
 
-pub use artifact::RunProfile;
+pub use artifact::{RunProfile, TrustClass as BenchmarkRole};
 pub use config::StressRunnerConfig;
-pub use context::StressContext;
+pub use context::{LogicalUnit, OperationOutcome, StressContext};
+pub use error::{StressError, StressResult};
 pub use runner::StressRunner;
 pub use std::hint::black_box;
 
@@ -81,7 +86,10 @@ pub mod __private {
     pub use crate::allocation::{
         stress_allocator_installed_marker, StressAllocator, STRESS_ALLOCATOR_INSTALLATIONS,
     };
-    pub use crate::harness::{linkme, stress_binary_main, BenchmarkEntry, STRESS_BENCHMARKS};
+    pub use crate::error::IntoStressResult;
+    pub use crate::harness::{
+        canonical_suite_name, linkme, stress_binary_main, BenchmarkEntry, STRESS_BENCHMARKS,
+    };
 
     /// Run a future to completion without requiring a runtime dependency.
     pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -123,10 +131,10 @@ macro_rules! stress_allocator {
             $crate::__private::StressAllocator::new();
 
         #[allow(non_upper_case_globals)]
-        #[::cntryl_stress::__private::linkme::distributed_slice(
-            ::cntryl_stress::__private::STRESS_ALLOCATOR_INSTALLATIONS
+        #[$crate::__private::linkme::distributed_slice(
+            $crate::__private::STRESS_ALLOCATOR_INSTALLATIONS
         )]
-        #[linkme(crate = ::cntryl_stress::__private::linkme)]
+        #[linkme(crate = $crate::__private::linkme)]
         static CNTRYL_STRESS_ALLOCATOR_INSTALLATION: fn() =
             $crate::__private::stress_allocator_installed_marker;
     };
@@ -135,7 +143,8 @@ macro_rules! stress_allocator {
 /// Prelude module for benchmark files.
 pub mod prelude {
     pub use crate::{
-        black_box, stress, stress_allocator, stress_main, RunProfile, StressContext, StressRunner,
-        StressRunnerConfig, StressRunnerOptions,
+        black_box, stress, stress_allocator, stress_main, BenchmarkRole, RunProfile, StressContext,
+        StressError, StressResult, StressRunner, StressRunnerConfig, StressRunnerOptions,
     };
+    pub use crate::{LogicalUnit, OperationOutcome};
 }

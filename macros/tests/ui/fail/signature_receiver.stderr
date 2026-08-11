@@ -1,0 +1,5 @@
+error: #[stress] benchmark functions cannot have a self receiver; use a free function with &mut StressContext
+ --> tests/ui/fail/signature_receiver.rs:7:18
+  |
+7 |     fn benchmark(&mut self) {}
+  |                  ^^^^^^^^^

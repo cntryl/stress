@@ -1,0 +1,5 @@
+error: #[stress] benchmark parameter must have type &mut StressContext
+ --> tests/ui/fail/signature_shared_context.rs:4:20
+  |
+4 | fn benchmark(_ctx: &stress_alias::StressContext) {}
+  |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -1,0 +1,5 @@
+error: expected integer literal
+ --> tests/ui/fail/attribute_tier_wrong_type.rs:3:17
+  |
+3 | #[stress(tier = "fast")]
+  |                 ^^^^^^

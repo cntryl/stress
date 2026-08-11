@@ -3,8 +3,8 @@
 #![allow(clippy::too_many_lines)]
 
 use cntryl_stress::{
-    black_box, stress, stress_allocator, RunProfile, StressContext, StressRunner,
-    StressRunnerConfig, StressRunnerOptions,
+    black_box, stress, stress_allocator, LogicalUnit, OperationOutcome, RunProfile, StressContext,
+    StressError, StressResult, StressRunner, StressRunnerConfig, StressRunnerOptions,
 };
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -14,6 +14,89 @@ stress_allocator!();
 #[stress(tier = 1, max_allocs_per_op = 0, metadata(component = "api"))]
 fn macro_expansion_uses_namespaced_artifact_types(ctx: &mut StressContext) {
     ctx.measure("hot path", || black_box(1_u64));
+}
+
+#[stress(tier = 2, metadata(component = "api"))]
+fn fallible_macro_benchmark(ctx: &mut StressContext) -> StressResult {
+    let value = "42"
+        .parse::<u64>()
+        .map_err(|error| StressError::new(error.to_string()))?;
+    ctx.measure_outcome("fallible work", LogicalUnit::new("item"), || {
+        black_box(value);
+        OperationOutcome::success(1)
+    });
+    Ok(())
+}
+
+#[stress(tier = 2, metadata(component = "api"))]
+fn explicit_fallible_measurement_apis_compile(ctx: &mut StressContext) -> StressResult {
+    let _: u64 = ctx.measure_result("result", || Ok::<_, StressError>(black_box(1_u64)))?;
+    let _: u64 = ctx.measure_result_with_setup(
+        "result setup",
+        || vec![1_u64],
+        |input| Ok::<_, StressError>(black_box(input[0])),
+    )?;
+    ctx.measure_outcome_with_setup(
+        "outcome setup",
+        LogicalUnit::new("item"),
+        || vec![1_u64],
+        |input| {
+            black_box(input);
+            OperationOutcome::success(1)
+        },
+    );
+    ctx.benchmark("builder outcome setup")
+        .operations_per_sample(2)
+        .measure_outcome_with_setup(
+            LogicalUnit::new("item"),
+            || vec![1_u64],
+            |input| {
+                black_box(input);
+                OperationOutcome::success(1)
+            },
+        );
+    let _: u64 = ctx
+        .benchmark("builder result")
+        .operations_per_sample(2)
+        .measure_result(|| Ok::<_, StressError>(black_box(1_u64)))?;
+    let _: u64 = ctx
+        .benchmark("builder result setup")
+        .operations_per_sample(2)
+        .measure_result_with_setup(
+            || vec![1_u64],
+            |input| Ok::<_, StressError>(black_box(input[0])),
+        )?;
+    Ok(())
+}
+
+#[stress(tier = 2, metadata(component = "api"))]
+async fn explicit_fallible_async_measurement_apis_compile(ctx: &mut StressContext) -> StressResult {
+    let _: u64 = ctx
+        .measure_result_async("async result", || async {
+            Ok::<_, StressError>(black_box(1_u64))
+        })
+        .await?;
+    let _: u64 = ctx
+        .measure_result_async_with_setup(
+            "async result setup",
+            || vec![1_u64],
+            |input| async move { Ok::<_, StressError>(black_box(input[0])) },
+        )
+        .await?;
+    let _: u64 = ctx
+        .benchmark("builder async result")
+        .operations_per_sample(2)
+        .measure_result_async(|| async { Ok::<_, StressError>(black_box(1_u64)) })
+        .await?;
+    let _: u64 = ctx
+        .benchmark("builder async result setup")
+        .operations_per_sample(2)
+        .measure_result_async_with_setup(
+            || vec![1_u64],
+            |input| async move { Ok::<_, StressError>(black_box(input[0])) },
+        )
+        .await?;
+    Ok(())
 }
 
 mod benchmark_binary {
@@ -27,11 +110,16 @@ fn root_common_authoring_imports_compile() {
     let profile = RunProfile::Smoke;
     let config = StressRunnerConfig::for_profile(profile);
     let mut runner = StressRunner::with_config("public-api", config);
-    let _options = StressRunnerOptions::new().profile(profile);
+    let _options = StressRunnerOptions::new()
+        .profile(profile)
+        .warmup_samples(1)
+        .cooldown_samples(1)
+        .threshold_percent(5.0)
+        .output_dir("target/stress-public-api");
 
     runner.reporters(Vec::new());
     runner.run("bench", |ctx| {
-        ctx.measure("work", || black_box(1_u64));
+        ctx.measure_with_setup("work", || 1_u64, black_box);
     });
     let run = runner.finish();
 
@@ -165,7 +253,7 @@ fn current_schema_run() -> cntryl_stress::artifact::StressRun {
             allocs_per_op: None,
             bytes_per_op: None,
             quality: QualityClass::Untrustworthy,
-            trust_class: cntryl_stress::artifact::TrustClass::Invalid,
+            trust_class: cntryl_stress::artifact::TrustClass::Gate,
             budgets: BenchmarkBudgets::default(),
             budget_results: Vec::new(),
             diagnostics: Vec::new(),

@@ -1,0 +1,7 @@
+error: #[stress] benchmark functions require exactly one parameter: &mut StressContext
+ --> tests/ui/fail/signature_no_parameters.rs:3:1
+  |
+3 | #[stress]
+  | ^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `stress` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -1,0 +1,5 @@
+error: trust_class is reserved; use role = "diagnostic" or role = "experimental"
+ --> tests/ui/fail/attribute_role_reserved_metadata.rs:3:10
+  |
+3 | #[stress(metadata(trust_class = "diagnostic"))]
+  |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

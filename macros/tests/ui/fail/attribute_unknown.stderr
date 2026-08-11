@@ -1,0 +1,5 @@
+error: unsupported stress attribute; expected tier, name, ignore, role, a max_* budget, or metadata(...)
+ --> tests/ui/fail/attribute_unknown.rs:3:20
+  |
+3 | #[stress(tier = 1, mystery = "value")]
+  |                    ^^^^^^^^^^^^^^^^^

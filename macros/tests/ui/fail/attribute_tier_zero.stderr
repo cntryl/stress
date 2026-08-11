@@ -1,0 +1,5 @@
+error: cntryl-stress tiers start at 1
+ --> tests/ui/fail/attribute_tier_zero.rs:3:10
+  |
+3 | #[stress(tier = 0)]
+  |          ^^^^^^^^

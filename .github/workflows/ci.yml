@@ -24,7 +24,56 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Check clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::pedantic
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings -D clippy::pedantic
 
       - name: Test
-        run: cargo test --workspace --all-features
+        run: cargo test --locked --workspace --all-targets --all-features
+
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --workspace --all-features --no-deps
+
+      - name: Check minimal feature set
+        run: cargo test --locked -p cntryl-stress --no-default-features
+
+      - name: Compile benchmark targets
+        run: cargo bench --locked -p cntryl-stress-demo --no-run
+
+      - name: Run smoke benchmark
+        run: cargo bench --locked -p cntryl-stress-demo --bench stress-demo1 -- --profile smoke --no-progress
+
+      - name: Validate emitted artifact against JSON Schema
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_path="$(find . -path '*/target/stress/stress-demo1/latest.json' -print -quit)"
+          test -n "$artifact_path"
+          npx --yes ajv-cli@5 validate --spec=draft2020 --strict=false \
+            -s core/schema/cntryl-stress.v2.schema.json \
+            -d "$artifact_path"
+
+      - name: Verify published package shape
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo package --locked -p cntryl-stress-macros --allow-dirty
+          macro_package="$(find target/package -maxdepth 1 -type d -name 'cntryl-stress-macros-*' -print -quit)"
+          test -n "$macro_package"
+          cargo test --locked --manifest-path "$macro_package/Cargo.toml" --all-targets
+          cargo test --locked --manifest-path "$macro_package/Cargo.toml" --doc
+          cargo package --locked --list -p cntryl-stress --allow-dirty
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install minimum supported Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
+
+      - name: Check all targets at MSRV
+        run: cargo check --locked --workspace --all-targets --all-features

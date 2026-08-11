@@ -2,21 +2,28 @@
 name = "cntryl-stress"
 version = "0.3.0"
 edition = "2021"
+rust-version = "1.85"
 description = "Raw-sample-first stress benchmarking framework for Tier 1 through Tier 6 performance work"
 license = "Apache-2.0"
 repository = "https://github.com/cntryl/stress"
+homepage = "https://github.com/cntryl/stress"
+documentation = "https://docs.rs/cntryl-stress"
+readme = "../README.md"
 keywords = ["benchmark", "stress", "testing", "performance"]
 categories = ["development-tools::profiling", "development-tools::testing"]
 
 [features]
 default = []
-cli = ["dep:anyhow", "dep:clap"]
+cli = ["dep:anyhow", "dep:clap", "dep:syn", "dep:toml"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+fs2 = "0.4"
 clap = { version = "4", features = ["derive"], optional = true }
 anyhow = { version = "1", optional = true }
+syn = { version = "2", features = ["full"], optional = true }
+toml = { version = "1", optional = true }
 linkme = "0.3"
 cntryl-stress-macros = { version = "0.3", path = "../macros" }
 
