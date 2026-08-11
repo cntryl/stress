@@ -2772,10 +2772,9 @@ mod tests {
         let mut runner = StressRunner::with_config_and_metadata("receipt-case", config, metadata);
         runner.reporters(Vec::new());
         runner.run("bench", |ctx| {
-            ctx.measure("work", || {
-                std::thread::sleep(Duration::from_millis(1));
-                std::hint::black_box(1_u64)
-            });
+            // Receipt identity is independent of host scheduling. Keep this fixture's primary
+            // evidence deterministic; floating-point round-trip tolerance has focused tests.
+            ctx.record_external("work", Duration::from_millis(10), 1);
             if fail_correctness {
                 let _ = ctx.correctness().attempted(1).completed(0).failures(1);
             }
@@ -2865,6 +2864,7 @@ mod tests {
         let parsed = parse_and_validate_child_run(&json, &target, run_id, &expected_build_identity)
             .expect("canonical wrapper receipt");
         assert_eq!(parsed.suite, "receipt-case");
+        assert_eq!(evaluate_run_gate(&parsed), RunGate::Passed);
 
         let failing = canonical_child_receipt(run_id, true);
         let failing_identity = failing.environment.build_profile.clone();
@@ -2872,7 +2872,10 @@ mod tests {
         let parsed_failing =
             parse_and_validate_child_run(&failing_json, &target, run_id, &failing_identity)
                 .expect("a canonical failed gate remains reportable evidence");
-        assert_ne!(evaluate_run_gate(&parsed_failing), RunGate::Passed);
+        assert_eq!(
+            evaluate_run_gate(&parsed_failing),
+            RunGate::CorrectnessFailed
+        );
 
         let mut wrong_suite = run.clone();
         wrong_suite.suite = "other-suite".to_string();
