@@ -2,14 +2,15 @@
 
 use crate::artifact::{
     BenchmarkDiagnostic, BenchmarkSpec, BenchmarkSummary, ComparisonClass, ComparisonResult,
-    ConsoleNameMode, CorrectnessSummary, PrimaryMetric, QualityClass, SamplePhase, StressRun,
-    SummaryStats, TrustClass,
+    ConsoleNameMode, CorrectnessSummary, PrimaryMetric, QualityClass, RunProfile, SamplePhase,
+    StressRun, SummaryStats, TrustClass,
 };
 use crate::config::StressRunnerConfig;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as FmtWrite;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// Trait for benchmark result reporters.
@@ -27,7 +28,13 @@ pub trait Reporter: Send + Sync {
     fn bench_end(&self, _summary: &BenchmarkSummary) {}
 
     /// Called when a suite completes.
-    fn suite_end(&self, _run: &StressRun) {}
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the reporter cannot publish its result.
+    fn suite_end(&self, _run: &StressRun) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Progress update for one benchmark sample.
@@ -52,6 +59,12 @@ const HUMAN_TABLE_NAME_LABEL_MAX_WIDTH: usize = 64;
 const HUMAN_TABLE_NAME_DEFAULT_WIDTH: usize = 65;
 const HUMAN_TABLE_COLUMN_MIN_WIDTH: usize = 12;
 const VALUE_WIDTH: usize = 16;
+const ARTIFACT_PUBLICATION_LOCK_FILE: &str = ".artifact-publication.lock";
+const ARTIFACT_TRANSACTION_PREFIX: &str = ".artifact-transaction.";
+const ARTIFACT_COMMITTED_TRANSACTION_PREFIX: &str = ".artifact-committed.";
+const ARTIFACT_TRANSACTION_MANIFEST: &str = "manifest.json";
+const ARTIFACT_TRANSACTION_COMMITTED: &str = "committed";
+static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Console reporter that prints the human benchmark table to stdout.
 pub struct ConsoleReporter {
@@ -67,18 +80,13 @@ impl ConsoleReporter {
         }
     }
 
-    fn write_stdout(&self, message: &str) {
+    fn write_stdout(&self, message: &str) -> std::io::Result<()> {
         let _guard = self
             .output_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut stdout = std::io::stdout().lock();
-        if let Err(error) = writeln!(stdout, "{message}") {
-            let _ = writeln!(
-                std::io::stderr(),
-                "Warning: failed to write to stdout: {error}"
-            );
-        }
+        writeln!(stdout, "{message}")
     }
 }
 
@@ -89,8 +97,8 @@ impl Default for ConsoleReporter {
 }
 
 impl Reporter for ConsoleReporter {
-    fn suite_end(&self, run: &StressRun) {
-        self.write_stdout(&format_console_run(run));
+    fn suite_end(&self, run: &StressRun) -> std::io::Result<()> {
+        self.write_stdout(&format_console_run(run))
     }
 }
 
@@ -105,27 +113,20 @@ impl JsonStdoutReporter {
         }
     }
 
-    fn write_stdout(&self, message: &str) {
+    fn write_stdout(&self, message: &str) -> std::io::Result<()> {
         let _guard = self
             .output_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut stdout = std::io::stdout().lock();
-        if let Err(error) = writeln!(stdout, "{message}") {
-            let _ = writeln!(
-                std::io::stderr(),
-                "Warning: failed to write to stdout: {error}"
-            );
-        }
+        writeln!(stdout, "{message}")
     }
 }
 
 impl Reporter for JsonStdoutReporter {
-    fn suite_end(&self, run: &StressRun) {
-        let output = serde_json::to_string_pretty(run).unwrap_or_else(|error| {
-            format!(r#"{{"error":"failed to serialize stress run: {error}"}}"#)
-        });
-        self.write_stdout(&output);
+    fn suite_end(&self, run: &StressRun) -> std::io::Result<()> {
+        let output = serde_json::to_string_pretty(run).map_err(std::io::Error::other)?;
+        self.write_stdout(&output)
     }
 }
 
@@ -199,6 +200,23 @@ pub struct JsonReporter {
     announce: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactPublicationPoint {
+    BeforeCommit,
+    BeforeFinalize,
+}
+
+struct PendingArtifact<'a> {
+    path: PathBuf,
+    contents: &'a [u8],
+    replace_existing: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ArtifactTransactionManifest {
+    targets: Vec<String>,
+}
+
 impl JsonReporter {
     /// Create a JSON reporter.
     #[must_use]
@@ -216,14 +234,16 @@ impl JsonReporter {
         self
     }
 
-    fn write_results(&self, run: &StressRun) {
-        if let Err(error) = self.write_results_inner(run) {
-            eprintln!("Warning: failed to write results: {error}");
-        }
+    fn write_results_inner(&self, run: &StressRun) -> std::io::Result<()> {
+        self.write_results_inner_with_hook(run, |_| Ok(()))
     }
 
-    fn write_results_inner(&self, run: &StressRun) -> std::io::Result<()> {
-        let sanitized_name = run.suite.replace(['/', '\\'], "_");
+    fn write_results_inner_with_hook(
+        &self,
+        run: &StressRun,
+        mut before_publication_point: impl FnMut(ArtifactPublicationPoint) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let sanitized_name = artifact_suite_directory_name(&run.suite);
         let suite_dir = self.output_dir.join(sanitized_name);
         std::fs::create_dir_all(&suite_dir)?;
 
@@ -239,12 +259,43 @@ impl JsonReporter {
         let report = format_report(run);
         let markdown = format_markdown_report(run);
 
-        std::fs::write(&json_path, &json)?;
-        std::fs::write(&txt_path, &report)?;
-        std::fs::write(&md_path, &markdown)?;
-        std::fs::write(&latest_json_path, &json)?;
-        std::fs::write(&latest_txt_path, &report)?;
-        std::fs::write(&latest_md_path, &markdown)?;
+        // Keep JSON last so readers never observe a new canonical artifact
+        // before its corresponding human reports. If any later operation
+        // fails, the transaction restores every replaced file and removes
+        // every newly created timestamp artifact.
+        let artifacts = [
+            PendingArtifact {
+                path: txt_path,
+                contents: report.as_bytes(),
+                replace_existing: false,
+            },
+            PendingArtifact {
+                path: md_path,
+                contents: markdown.as_bytes(),
+                replace_existing: false,
+            },
+            PendingArtifact {
+                path: latest_txt_path,
+                contents: report.as_bytes(),
+                replace_existing: true,
+            },
+            PendingArtifact {
+                path: latest_md_path,
+                contents: markdown.as_bytes(),
+                replace_existing: true,
+            },
+            PendingArtifact {
+                path: json_path.clone(),
+                contents: json.as_bytes(),
+                replace_existing: false,
+            },
+            PendingArtifact {
+                path: latest_json_path.clone(),
+                contents: json.as_bytes(),
+                replace_existing: true,
+            },
+        ];
+        publish_artifact_set(&suite_dir, &artifacts, &mut before_publication_point)?;
 
         if self.announce {
             eprintln!("  Results written to: {}", json_path.display());
@@ -254,9 +305,564 @@ impl JsonReporter {
     }
 }
 
+fn publish_artifact_set(
+    suite_dir: &Path,
+    artifacts: &[PendingArtifact<'_>],
+    before_publication_point: &mut impl FnMut(ArtifactPublicationPoint) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    validate_artifact_targets(suite_dir, artifacts)?;
+    let _publication_lock = acquire_artifact_publication_lock(suite_dir)?;
+    recover_interrupted_artifact_transactions(suite_dir)?;
+    reject_timestamp_artifact_collisions(artifacts)?;
+    let transaction_dir = create_artifact_transaction_directory(suite_dir)?;
+    if let Err(error) = stage_artifacts(&transaction_dir, artifacts)
+        .and_then(|()| write_artifact_transaction_manifest(&transaction_dir, artifacts))
+    {
+        let _ = std::fs::remove_dir_all(&transaction_dir);
+        return Err(error);
+    }
+
+    let publication = commit_artifacts(
+        suite_dir,
+        &transaction_dir,
+        artifacts,
+        before_publication_point,
+    )
+    .and_then(|()| mark_artifact_transaction_committed(&transaction_dir));
+    if let Err(error) = publication {
+        return match rollback_artifacts(suite_dir, &transaction_dir, artifacts) {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "artifact publication failed: {error}; rollback also failed: {rollback_error}; recovery data remains at {}",
+                    transaction_dir.display()
+                ),
+            )),
+        };
+    }
+
+    // Once every target and the committed marker are durable, transaction
+    // cleanup is housekeeping rather than part of publication. Rename first
+    // so a crash during recursive removal can never make a committed
+    // generation look like an interrupted one that should be rolled back.
+    let _ = finalize_committed_artifact_transaction(suite_dir, &transaction_dir);
+    Ok(())
+}
+
+fn acquire_artifact_publication_lock(suite_dir: &Path) -> std::io::Result<std::fs::File> {
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(suite_dir.join(ARTIFACT_PUBLICATION_LOCK_FILE))?;
+    fs2::FileExt::lock_exclusive(&lock)?;
+    Ok(lock)
+}
+
+fn write_artifact_transaction_manifest(
+    transaction_dir: &Path,
+    artifacts: &[PendingArtifact<'_>],
+) -> std::io::Result<()> {
+    let targets = artifacts
+        .iter()
+        .map(|artifact| {
+            artifact
+                .path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "artifact target {} has no UTF-8 file name",
+                            artifact.path.display()
+                        ),
+                    )
+                })
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let manifest = serde_json::to_vec(&ArtifactTransactionManifest { targets })
+        .map_err(std::io::Error::other)?;
+    write_transaction_marker(
+        transaction_dir,
+        &format!("{ARTIFACT_TRANSACTION_MANIFEST}.pending"),
+        ARTIFACT_TRANSACTION_MANIFEST,
+        &manifest,
+    )
+}
+
+fn mark_artifact_transaction_committed(transaction_dir: &Path) -> std::io::Result<()> {
+    write_transaction_marker(
+        transaction_dir,
+        &format!("{ARTIFACT_TRANSACTION_COMMITTED}.pending"),
+        ARTIFACT_TRANSACTION_COMMITTED,
+        b"",
+    )
+}
+
+fn finalize_committed_artifact_transaction(
+    suite_dir: &Path,
+    transaction_dir: &Path,
+) -> std::io::Result<()> {
+    let transaction_name = transaction_dir
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .and_then(|name| name.strip_prefix(ARTIFACT_TRANSACTION_PREFIX))
+        .ok_or_else(|| {
+            invalid_transaction_data(format!(
+                "artifact transaction directory {} has an invalid name",
+                transaction_dir.display()
+            ))
+        })?;
+    let committed_dir = suite_dir.join(format!(
+        "{ARTIFACT_COMMITTED_TRANSACTION_PREFIX}{transaction_name}"
+    ));
+    std::fs::rename(transaction_dir, &committed_dir)?;
+    sync_parent_directory(suite_dir)?;
+    std::fs::remove_dir_all(committed_dir)?;
+    sync_parent_directory(suite_dir)
+}
+
+fn write_transaction_marker(
+    transaction_dir: &Path,
+    temporary_name: &str,
+    final_name: &str,
+    contents: &[u8],
+) -> std::io::Result<()> {
+    let temporary = transaction_dir.join(temporary_name);
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    std::fs::rename(temporary, transaction_dir.join(final_name))?;
+    sync_parent_directory(transaction_dir)
+}
+
+fn recover_interrupted_artifact_transactions(suite_dir: &Path) -> std::io::Result<()> {
+    let mut transaction_dirs = std::fs::read_dir(suite_dir)?
+        .filter_map(|entry| match entry {
+            Ok(entry) => {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(ARTIFACT_TRANSACTION_PREFIX) {
+                    Some(Ok((entry.path(), false)))
+                } else if name.starts_with(ARTIFACT_COMMITTED_TRANSACTION_PREFIX) {
+                    Some(Ok((entry.path(), true)))
+                } else {
+                    None
+                }
+            }
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    transaction_dirs.sort();
+
+    for (transaction_dir, committed) in transaction_dirs {
+        if !std::fs::symlink_metadata(&transaction_dir)?.is_dir() {
+            return Err(invalid_transaction_data(format!(
+                "artifact recovery entry {} is not a directory",
+                transaction_dir.display()
+            )));
+        }
+        if committed {
+            std::fs::remove_dir_all(&transaction_dir)?;
+            sync_parent_directory(suite_dir)?;
+            continue;
+        }
+        if transaction_regular_file_exists(&transaction_dir.join(ARTIFACT_TRANSACTION_COMMITTED))? {
+            std::fs::remove_dir_all(&transaction_dir)?;
+            sync_parent_directory(suite_dir)?;
+            continue;
+        }
+
+        let manifest_path = transaction_dir.join(ARTIFACT_TRANSACTION_MANIFEST);
+        let Some(manifest) = read_transaction_manifest(&manifest_path)? else {
+            // Publication cannot begin until the manifest rename is durable,
+            // so a manifest-free transaction is staging debris.
+            std::fs::remove_dir_all(&transaction_dir)?;
+            sync_parent_directory(suite_dir)?;
+            continue;
+        };
+        let targets = recovered_artifact_targets(suite_dir, &manifest)?;
+        rollback_artifact_targets(suite_dir, &transaction_dir, &targets)?;
+    }
+    Ok(())
+}
+
+fn transaction_regular_file_exists(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(_) => Err(invalid_transaction_data(format!(
+            "artifact transaction marker {} is not a regular file",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_transaction_manifest(path: &Path) -> std::io::Result<Option<ArtifactTransactionManifest>> {
+    if !transaction_regular_file_exists(path)? {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(path)?;
+    serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+        invalid_transaction_data(format!(
+            "artifact transaction manifest {} is invalid: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn recovered_artifact_targets(
+    suite_dir: &Path,
+    manifest: &ArtifactTransactionManifest,
+) -> std::io::Result<Vec<PathBuf>> {
+    let names = manifest.targets.iter().collect::<BTreeSet<_>>();
+    if names.len() != 6 || names.len() != manifest.targets.len() {
+        return Err(invalid_transaction_data(
+            "artifact transaction manifest must contain six unique targets",
+        ));
+    }
+    for name in &manifest.targets {
+        if name.is_empty()
+            || matches!(name.as_str(), "." | "..")
+            || name.contains('/')
+            || name.contains('\\')
+        {
+            return Err(invalid_transaction_data(format!(
+                "artifact transaction target {name:?} is not a direct file name"
+            )));
+        }
+    }
+
+    let history_json = manifest
+        .targets
+        .iter()
+        .filter(|name| name.as_str() != "latest.json")
+        .filter_map(|name| name.strip_suffix(".json"))
+        .collect::<Vec<_>>();
+    if history_json.len() != 1 || history_json[0].is_empty() || history_json[0] == "latest" {
+        return Err(invalid_transaction_data(
+            "artifact transaction manifest has no unique timestamp JSON target",
+        ));
+    }
+    let stem = history_json[0];
+    let expected = [
+        format!("{stem}.txt"),
+        format!("{stem}.md"),
+        "latest.txt".to_string(),
+        "latest.md".to_string(),
+        format!("{stem}.json"),
+        "latest.json".to_string(),
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let actual = manifest.targets.iter().cloned().collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(invalid_transaction_data(
+            "artifact transaction manifest targets do not form one complete generation",
+        ));
+    }
+    Ok(manifest
+        .targets
+        .iter()
+        .map(|name| suite_dir.join(name))
+        .collect())
+}
+
+fn invalid_transaction_data(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
+}
+
+fn reject_timestamp_artifact_collisions(artifacts: &[PendingArtifact<'_>]) -> std::io::Result<()> {
+    for artifact in artifacts
+        .iter()
+        .filter(|artifact| !artifact.replace_existing)
+    {
+        match std::fs::symlink_metadata(&artifact.path) {
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "timestamp artifact {} already exists; refusing to overwrite immutable run history",
+                        artifact.path.display()
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn validate_artifact_targets(
+    suite_dir: &Path,
+    artifacts: &[PendingArtifact<'_>],
+) -> std::io::Result<()> {
+    let mut unique = BTreeSet::new();
+    for artifact in artifacts {
+        if artifact.path.parent() != Some(suite_dir) || !unique.insert(artifact.path.clone()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "artifact target {} is not a unique direct child of {}",
+                    artifact.path.display(),
+                    suite_dir.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn create_artifact_transaction_directory(suite_dir: &Path) -> std::io::Result<PathBuf> {
+    loop {
+        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let transaction_dir = suite_dir.join(format!(
+            "{ARTIFACT_TRANSACTION_PREFIX}{}.{}",
+            std::process::id(),
+            sequence
+        ));
+        match std::fs::create_dir(&transaction_dir) {
+            Ok(()) => {
+                if let Err(error) = sync_parent_directory(suite_dir) {
+                    let _ = std::fs::remove_dir(&transaction_dir);
+                    return Err(error);
+                }
+                return Ok(transaction_dir);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn stage_artifacts(
+    transaction_dir: &Path,
+    artifacts: &[PendingArtifact<'_>],
+) -> std::io::Result<()> {
+    for (index, artifact) in artifacts.iter().enumerate() {
+        let path = staged_artifact_path(transaction_dir, index);
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)?;
+        file.write_all(artifact.contents)?;
+        file.sync_all()?;
+    }
+    sync_parent_directory(transaction_dir)
+}
+
+fn commit_artifacts(
+    suite_dir: &Path,
+    transaction_dir: &Path,
+    artifacts: &[PendingArtifact<'_>],
+    before_publication_point: &mut impl FnMut(ArtifactPublicationPoint) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    for (index, artifact) in artifacts.iter().enumerate() {
+        before_publication_point(ArtifactPublicationPoint::BeforeCommit)?;
+        preserve_previous_artifact(suite_dir, transaction_dir, index, &artifact.path)?;
+        std::fs::rename(staged_artifact_path(transaction_dir, index), &artifact.path)?;
+        sync_parent_directory(transaction_dir)?;
+        sync_parent_directory(suite_dir)?;
+    }
+    before_publication_point(ArtifactPublicationPoint::BeforeFinalize)?;
+    Ok(())
+}
+
+fn preserve_previous_artifact(
+    suite_dir: &Path,
+    transaction_dir: &Path,
+    index: usize,
+    target: &Path,
+) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+            std::fs::rename(target, backup_artifact_path(transaction_dir, index))?;
+            sync_parent_directory(suite_dir)?;
+            sync_parent_directory(transaction_dir)
+        }
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "artifact target {} exists but is not a replaceable file",
+                target.display()
+            ),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let marker = absent_artifact_path(transaction_dir, index);
+            std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(marker)?
+                .sync_all()?;
+            sync_parent_directory(transaction_dir)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn rollback_artifacts(
+    suite_dir: &Path,
+    transaction_dir: &Path,
+    artifacts: &[PendingArtifact<'_>],
+) -> std::io::Result<()> {
+    let targets = artifacts
+        .iter()
+        .map(|artifact| artifact.path.clone())
+        .collect::<Vec<_>>();
+    rollback_artifact_targets(suite_dir, transaction_dir, &targets)
+}
+
+fn rollback_artifact_targets(
+    suite_dir: &Path,
+    transaction_dir: &Path,
+    targets: &[PathBuf],
+) -> std::io::Result<()> {
+    let mut errors = Vec::new();
+    for (index, target) in targets.iter().enumerate().rev() {
+        let backup = backup_artifact_path(transaction_dir, index);
+        let absent = absent_artifact_path(transaction_dir, index);
+        let has_backup = match transaction_entry_exists(&backup) {
+            Ok(exists) => exists,
+            Err(error) => {
+                errors.push(format!(
+                    "could not inspect rollback backup {}: {error}",
+                    backup.display()
+                ));
+                continue;
+            }
+        };
+        let was_absent = match transaction_entry_exists(&absent) {
+            Ok(exists) => exists,
+            Err(error) => {
+                errors.push(format!(
+                    "could not inspect rollback marker {}: {error}",
+                    absent.display()
+                ));
+                continue;
+            }
+        };
+        if has_backup {
+            if let Err(error) =
+                remove_published_artifact(target).and_then(|()| std::fs::rename(&backup, target))
+            {
+                errors.push(format!("could not restore {}: {error}", target.display()));
+            }
+        } else if was_absent {
+            if let Err(error) = remove_published_artifact(target) {
+                errors.push(format!("could not remove {}: {error}", target.display()));
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        sync_parent_directory(suite_dir)?;
+        std::fs::remove_dir_all(transaction_dir)?;
+        sync_parent_directory(suite_dir)
+    } else {
+        Err(std::io::Error::other(errors.join("; ")))
+    }
+}
+
+fn transaction_entry_exists(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+            Ok(true)
+        }
+        Ok(_) => Err(std::io::Error::other(format!(
+            "transaction entry {} is not a file",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_published_artifact(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+            std::fs::remove_file(path)
+        }
+        Ok(_) => Err(std::io::Error::other(format!(
+            "rollback target {} is not a replaceable file",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn staged_artifact_path(transaction_dir: &Path, index: usize) -> PathBuf {
+    transaction_dir.join(format!("staged-{index}"))
+}
+
+fn backup_artifact_path(transaction_dir: &Path, index: usize) -> PathBuf {
+    transaction_dir.join(format!("backup-{index}"))
+}
+
+fn absent_artifact_path(transaction_dir: &Path, index: usize) -> PathBuf {
+    transaction_dir.join(format!("absent-{index}"))
+}
+
+fn artifact_suite_directory_name(suite: &str) -> String {
+    let sanitized = suite.replace(['/', '\\'], "_");
+    if matches!(sanitized.as_str(), "" | "." | "..") {
+        "_invalid-suite".to_string()
+    } else {
+        sanitized
+    }
+}
+
+pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("artifact path has no parent directory"))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("artifact path has no file name"))?
+        .to_string_lossy();
+    let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ));
+
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        sync_parent_directory(parent)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn sync_parent_directory(parent: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
 impl Reporter for JsonReporter {
-    fn suite_end(&self, run: &StressRun) {
-        self.write_results(run);
+    fn suite_end(&self, run: &StressRun) -> std::io::Result<()> {
+        self.write_results_inner(run)
     }
 }
 
@@ -284,9 +890,9 @@ impl Default for GitHubActionsReporter {
 }
 
 impl Reporter for GitHubActionsReporter {
-    fn suite_end(&self, run: &StressRun) {
+    fn suite_end(&self, run: &StressRun) -> std::io::Result<()> {
         if !Self::is_github_actions() {
-            return;
+            return Ok(());
         }
 
         for comparison in &run.comparisons {
@@ -312,6 +918,7 @@ impl Reporter for GitHubActionsReporter {
             );
         }
         println!("::endgroup::");
+        Ok(())
     }
 }
 
@@ -361,12 +968,16 @@ impl Reporter for MultiReporter {
         }
     }
 
-    fn suite_end(&self, run: &StressRun) {
+    fn suite_end(&self, run: &StressRun) -> std::io::Result<()> {
         for reporter in &self.reporters {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                reporter.suite_end(run);
-            }));
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reporter.suite_end(run)))
+                    .map_err(|_| {
+                        std::io::Error::other("reporter panicked while finishing the suite")
+                    })?;
+            result?;
         }
+        Ok(())
     }
 }
 
@@ -852,7 +1463,7 @@ fn push_shape_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSummar
         "Micro timing",
         summaries,
         "tiny_micro_timing",
-        "Batch more logical work per sample, or keep the row as a validated diagnostic with an explicit trust_class downgrade.",
+        "Batch more logical work per sample, or declare role = \"diagnostic\" after validating the microbenchmark shape.",
         |summary| {
             format!(
                 "{} is too small to trust as a gate-quality microbenchmark.",
@@ -865,7 +1476,7 @@ fn push_shape_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSummar
         "Optimized away",
         summaries,
         "likely_optimized_away",
-        "Vary inputs, accumulate observable outputs, and use validated_micro=true only after anti-DCE is explicit.",
+        "Vary inputs, accumulate observable outputs, and use #[stress(metadata(validated_micro = \"true\"))] only after anti-DCE is explicit.",
         |summary| {
             format!(
                 "{} is likely optimized away or dominated by compiler artifacts.",
@@ -947,10 +1558,15 @@ fn push_shape_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSummar
 }
 
 fn push_validity_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSummary]) {
+    let ordinary_summaries = summaries
+        .iter()
+        .copied()
+        .filter(|summary| !summary.metadata.contains_key("benchmark_error"))
+        .collect::<Vec<_>>();
     push_diagnostic_group(
         groups,
         "Operations",
-        summaries,
+        &ordinary_summaries,
         "zero_completed_ops",
         "Record completed logical work with measure_batch, operations, or record_external.",
         |summary| {
@@ -963,20 +1579,38 @@ fn push_validity_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSum
     push_diagnostic_group(
         groups,
         "Timing",
-        summaries,
+        &ordinary_summaries,
         "invalid_timing",
         "Measure exactly one non-empty workload for this row.",
         |summary| format!("{} recorded invalid timing.", summary.name),
     );
-    let mut correctness = IssueGroup::with_fix(
-        "Correctness",
-        "Inspect correctness counters before using this performance number.",
+    let mut benchmark_errors = IssueGroup::with_fix(
+        "Benchmark error",
+        "Fix the reported benchmark setup or workload error, then rerun the suite.",
     );
     for summary in summaries
         .iter()
         .copied()
-        .filter(|summary| !summary.correctness.passed)
+        .filter(|summary| summary.metadata.contains_key("benchmark_error"))
     {
+        benchmark_errors.push(format!(
+            "{}: {}",
+            summary.name,
+            summary
+                .metadata
+                .get("benchmark_error")
+                .map_or("unknown benchmark error", String::as_str)
+        ));
+    }
+    push_issue_group(groups, benchmark_errors);
+
+    let mut correctness = IssueGroup::with_fix(
+        "Correctness",
+        "Inspect correctness counters before using this performance number.",
+    );
+    for summary in summaries.iter().copied().filter(|summary| {
+        !summary.correctness.passed && !summary.metadata.contains_key("benchmark_error")
+    }) {
         correctness.push(format!("{} failed correctness checks.", summary.name));
     }
     push_issue_group(groups, correctness);
@@ -1837,16 +2471,21 @@ fn quality_gate_failures(run: &StressRun) -> Vec<&BenchmarkSummary> {
     }
     run.summaries
         .iter()
-        .filter(|summary| summary.is_gate())
-        .filter(|summary| quality_rank(summary.quality) < quality_rank(profile_config.min_quality))
+        .filter(|summary| summary.is_intended_gate())
+        .filter(|summary| {
+            !summary.is_gate()
+                || quality_rank(summary.quality) < quality_rank(profile_config.min_quality)
+        })
         .collect()
 }
 
 fn regression_gate_count(run: &StressRun) -> usize {
-    if !run.environment.profile_config.fail_on_regression {
-        return 0;
-    }
-    run.regressions().len()
+    run.rejected_gate_comparisons().len()
+        + if run.environment.profile_config.fail_on_regression {
+            run.regressions().len()
+        } else {
+            0
+        }
 }
 
 fn diagnostic_gate_count(run: &StressRun) -> usize {
@@ -1865,7 +2504,7 @@ fn comparison_count(run: &StressRun, class: ComparisonClass) -> usize {
     let gate_rows = run
         .summaries
         .iter()
-        .filter(|summary| summary.is_gate())
+        .filter(|summary| summary.is_intended_gate() && summary.is_gate())
         .map(|summary| summary.benchmark_id.as_str())
         .collect::<BTreeSet<_>>();
     run.comparisons
@@ -1877,11 +2516,47 @@ fn comparison_count(run: &StressRun, class: ComparisonClass) -> usize {
 }
 
 fn gate_status(run: &StressRun) -> String {
+    if run.metadata.contains_key("reporter_errors") {
+        return "failed artifact publication".to_string();
+    }
     if failed_correctness_count(&run.summaries) != 0 {
         return "failed correctness".to_string();
     }
-    if budget_failure_count(&run.summaries) != 0 {
+    if budget_failure_count(&run.summaries) != 0 || !run.regression_budgets_passed() {
         return "failed budget".to_string();
+    }
+    if run.summaries.is_empty() {
+        return "failed quality (no benchmark rows)".to_string();
+    }
+    let invalid_rows = run
+        .summaries
+        .iter()
+        .filter(|summary| summary.trust_class == TrustClass::Invalid)
+        .count();
+    let smoke_profile = run.run_profile == RunProfile::Smoke
+        || run.environment.profile_config.profile == RunProfile::Smoke;
+    if invalid_rows != 0 && !smoke_profile {
+        return if invalid_rows == 1 {
+            "failed quality (1 invalid row)".to_string()
+        } else {
+            format!("failed quality ({invalid_rows} invalid rows)")
+        };
+    }
+    let profile_config = &run.environment.profile_config;
+    let performance_gate_enabled = run.run_profile == crate::artifact::RunProfile::Release
+        || profile_config.fail_on_quality
+        || profile_config.fail_on_regression;
+    if performance_gate_enabled && !run.gate_obligations_satisfied() {
+        let failures = run
+            .summaries
+            .iter()
+            .filter(|summary| summary.is_intended_gate() && !summary.is_gate())
+            .count();
+        return if failures == 0 {
+            "failed quality (no intended gate rows)".to_string()
+        } else {
+            format!("failed quality ({failures} intended gates are not trustworthy)")
+        };
     }
     let regressions = regression_gate_count(run);
     if regressions != 0 {
@@ -2382,6 +3057,476 @@ mod tests {
         }
     }
 
+    fn unique_test_path(label: &str) -> PathBuf {
+        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "cntryl-stress-{label}-{}-{sequence}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn atomic_write_replaces_complete_files_without_leaving_staging_files() {
+        let directory = unique_test_path("atomic-write");
+        std::fs::create_dir_all(&directory).expect("test directory");
+        let path = directory.join("latest.json");
+
+        atomic_write(&path, b"first").expect("first write");
+        atomic_write(&path, b"second").expect("replacement write");
+
+        assert_eq!(std::fs::read(&path).expect("artifact"), b"second");
+        assert!(std::fs::read_dir(&directory)
+            .expect("directory")
+            .all(|entry| !entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")));
+        std::fs::remove_dir_all(directory).expect("cleanup test directory");
+    }
+
+    #[test]
+    fn json_reporter_propagates_artifact_write_failures() {
+        let output_file = unique_test_path("reporter-error");
+        std::fs::write(&output_file, b"not a directory").expect("blocking file");
+        let reporter = JsonReporter::new(&output_file);
+        let run = run_with_summaries(vec![summary(
+            "queue::fast",
+            1_000_000.0,
+            QualityClass::Authoritative,
+        )]);
+
+        let error = reporter
+            .suite_end(&run)
+            .expect_err("a file cannot be used as the output directory");
+
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotADirectory
+        ));
+        std::fs::remove_file(output_file).expect("cleanup blocking file");
+    }
+
+    #[test]
+    fn json_reporter_publishes_one_complete_six_file_transaction() {
+        let output_dir = unique_test_path("reporter-transaction-success");
+        let reporter = JsonReporter::new(&output_dir);
+        let run = run_with_summaries(vec![summary(
+            "queue::fast",
+            1_000_000.0,
+            QualityClass::Authoritative,
+        )]);
+
+        reporter.suite_end(&run).expect("publish artifact set");
+
+        let suite_dir = output_dir.join("suite");
+        let timestamp_json = std::fs::read(suite_dir.join(format!("{}.json", run.started_at)))
+            .expect("timestamp JSON");
+        let timestamp_text = std::fs::read(suite_dir.join(format!("{}.txt", run.started_at)))
+            .expect("timestamp text");
+        let timestamp_markdown = std::fs::read(suite_dir.join(format!("{}.md", run.started_at)))
+            .expect("timestamp markdown");
+        assert_eq!(
+            std::fs::read(suite_dir.join("latest.json")).expect("latest JSON"),
+            timestamp_json
+        );
+        assert_eq!(
+            std::fs::read(suite_dir.join("latest.txt")).expect("latest text"),
+            timestamp_text
+        );
+        assert_eq!(
+            std::fs::read(suite_dir.join("latest.md")).expect("latest markdown"),
+            timestamp_markdown
+        );
+        assert_eq!(
+            std::fs::read_dir(&suite_dir)
+                .expect("suite directory")
+                .filter(|entry| {
+                    !entry
+                        .as_ref()
+                        .expect("suite entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with('.')
+                })
+                .count(),
+            6
+        );
+        assert!(suite_dir.join(ARTIFACT_PUBLICATION_LOCK_FILE).is_file());
+        std::fs::remove_dir_all(output_dir).expect("cleanup reporter test directory");
+    }
+
+    #[test]
+    fn json_reporter_rejects_a_timestamp_collision_without_overwriting_history() {
+        let output_dir = unique_test_path("reporter-timestamp-collision");
+        let reporter = JsonReporter::new(&output_dir);
+        let first = run_with_summaries(vec![summary(
+            "queue::first",
+            1_000_000.0,
+            QualityClass::Authoritative,
+        )]);
+        reporter.suite_end(&first).expect("publish first run");
+        let suite_dir = output_dir.join("suite");
+        let original = ["json", "txt", "md"]
+            .into_iter()
+            .map(|extension| {
+                let path = suite_dir.join(format!("{}.{}", first.started_at, extension));
+                (
+                    path.clone(),
+                    std::fs::read(path).expect("original timestamp artifact"),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let second = run_with_summaries(vec![summary(
+            "queue::second",
+            2_000_000.0,
+            QualityClass::Authoritative,
+        )]);
+        let error = reporter
+            .suite_end(&second)
+            .expect_err("a timestamp stem is immutable once published");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(error.to_string().contains(&first.started_at));
+        for (path, contents) in original {
+            assert_eq!(
+                std::fs::read(path).expect("preserved timestamp artifact"),
+                contents
+            );
+        }
+        let latest: StressRun = serde_json::from_slice(
+            &std::fs::read(suite_dir.join("latest.json")).expect("latest artifact"),
+        )
+        .expect("latest run");
+        assert_eq!(latest.summaries[0].name, "queue::first");
+        std::fs::remove_dir_all(output_dir).expect("cleanup reporter test directory");
+    }
+
+    #[test]
+    fn json_reporter_serializes_same_suite_publication_before_committing() {
+        let output_dir = unique_test_path("reporter-suite-lock");
+        let mut first = run_with_summaries(vec![summary(
+            "queue::first",
+            1_000_000.0,
+            QualityClass::Authoritative,
+        )]);
+        first.started_at = "100".to_string();
+        let mut second = run_with_summaries(vec![summary(
+            "queue::second",
+            2_000_000.0,
+            QualityClass::Authoritative,
+        )]);
+        second.started_at = "200".to_string();
+        let (first_entered_tx, first_entered_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let first_output = output_dir.clone();
+        let first_thread = std::thread::spawn(move || {
+            let reporter = JsonReporter::new(first_output);
+            let mut paused = false;
+            reporter.write_results_inner_with_hook(&first, |point| {
+                if point == ArtifactPublicationPoint::BeforeCommit && !paused {
+                    paused = true;
+                    first_entered_tx.send(()).expect("signal first commit");
+                    release_first_rx.recv().expect("release first commit");
+                }
+                Ok(())
+            })
+        });
+        first_entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("first publisher reached commit");
+
+        let start_second = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let second_start = std::sync::Arc::clone(&start_second);
+        let (second_entered_tx, second_entered_rx) = std::sync::mpsc::channel();
+        let second_output = output_dir.clone();
+        let second_thread = std::thread::spawn(move || {
+            let reporter = JsonReporter::new(second_output);
+            let mut signalled = false;
+            second_start.wait();
+            reporter.write_results_inner_with_hook(&second, |_| {
+                if !signalled {
+                    signalled = true;
+                    second_entered_tx.send(()).expect("signal second commit");
+                }
+                Ok(())
+            })
+        });
+        start_second.wait();
+
+        assert!(matches!(
+            second_entered_rx.recv_timeout(std::time::Duration::from_millis(250)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        release_first_tx.send(()).expect("finish first publication");
+        first_thread
+            .join()
+            .expect("join first publisher")
+            .expect("first publication");
+        second_entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("second publisher entered after first completed");
+        second_thread
+            .join()
+            .expect("join second publisher")
+            .expect("second publication");
+
+        let suite_dir = output_dir.join("suite");
+        let latest: StressRun = serde_json::from_slice(
+            &std::fs::read(suite_dir.join("latest.json")).expect("latest artifact"),
+        )
+        .expect("latest run");
+        assert_eq!(latest.started_at, "200");
+        assert!(suite_dir.join("100.json").exists());
+        assert!(suite_dir.join("200.json").exists());
+        std::fs::remove_dir_all(output_dir).expect("cleanup reporter test directory");
+    }
+
+    #[test]
+    fn next_publisher_recovers_an_interrupted_mixed_generation() {
+        let output_dir = unique_test_path("reporter-crash-recovery");
+        let reporter = JsonReporter::new(&output_dir);
+        let mut first = run_with_summaries(vec![summary(
+            "queue::first",
+            1_000_000.0,
+            QualityClass::Authoritative,
+        )]);
+        first.started_at = "100".to_string();
+        reporter.suite_end(&first).expect("publish first run");
+
+        let mut interrupted = run_with_summaries(vec![summary(
+            "queue::interrupted",
+            2_000_000.0,
+            QualityClass::Authoritative,
+        )]);
+        interrupted.started_at = "200".to_string();
+        let publication = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut committed = 0;
+            reporter
+                .write_results_inner_with_hook(&interrupted, |point| {
+                    if point == ArtifactPublicationPoint::BeforeCommit {
+                        assert!(committed != 3, "injected process interruption");
+                        committed += 1;
+                    }
+                    Ok(())
+                })
+                .expect("interrupted publication does not return");
+        }));
+        assert!(publication.is_err());
+
+        let suite_dir = output_dir.join("suite");
+        assert!(suite_dir.join("200.txt").exists());
+        assert!(suite_dir.join("200.md").exists());
+        assert!(!suite_dir.join("200.json").exists());
+        assert!(std::fs::read_to_string(suite_dir.join("latest.txt"))
+            .expect("mixed latest text")
+            .contains("queue::interrupted"));
+        let old_latest: StressRun = serde_json::from_slice(
+            &std::fs::read(suite_dir.join("latest.json")).expect("old latest JSON"),
+        )
+        .expect("old latest run");
+        assert_eq!(old_latest.started_at, "100");
+
+        let mut next = run_with_summaries(vec![summary(
+            "queue::next",
+            3_000_000.0,
+            QualityClass::Authoritative,
+        )]);
+        next.started_at = "300".to_string();
+        reporter
+            .suite_end(&next)
+            .expect("recover and publish next run");
+
+        for extension in ["json", "txt", "md"] {
+            assert!(!suite_dir.join(format!("200.{extension}")).exists());
+            assert!(suite_dir.join(format!("300.{extension}")).exists());
+        }
+        let latest: StressRun = serde_json::from_slice(
+            &std::fs::read(suite_dir.join("latest.json")).expect("latest artifact"),
+        )
+        .expect("latest run");
+        assert_eq!(latest.started_at, "300");
+        assert!(!std::fs::read_dir(&suite_dir)
+            .expect("suite directory")
+            .any(|entry| entry
+                .expect("suite entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".artifact-transaction.")));
+        std::fs::remove_dir_all(output_dir).expect("cleanup reporter test directory");
+    }
+
+    #[test]
+    fn next_publisher_finishes_cleanup_for_committed_transactions() {
+        let output_dir = unique_test_path("reporter-committed-recovery");
+        let reporter = JsonReporter::new(&output_dir);
+        let mut first = run_with_summaries(vec![summary(
+            "queue::first",
+            1_000_000.0,
+            QualityClass::Authoritative,
+        )]);
+        first.started_at = "100".to_string();
+        reporter.suite_end(&first).expect("publish first run");
+
+        let suite_dir = output_dir.join("suite");
+        let renamed = suite_dir.join(format!("{ARTIFACT_COMMITTED_TRANSACTION_PREFIX}fixture"));
+        std::fs::create_dir(&renamed).expect("create renamed committed transaction");
+        std::fs::write(renamed.join("cleanup-debris"), b"debris")
+            .expect("write committed cleanup debris");
+        let marked = suite_dir.join(format!("{ARTIFACT_TRANSACTION_PREFIX}fixture"));
+        std::fs::create_dir(&marked).expect("create marked transaction");
+        std::fs::write(marked.join(ARTIFACT_TRANSACTION_COMMITTED), b"")
+            .expect("write committed marker");
+
+        let mut next = run_with_summaries(vec![summary(
+            "queue::next",
+            2_000_000.0,
+            QualityClass::Authoritative,
+        )]);
+        next.started_at = "200".to_string();
+        reporter
+            .suite_end(&next)
+            .expect("clean and publish next run");
+
+        assert!(!renamed.exists());
+        assert!(!marked.exists());
+        assert!(suite_dir.join("100.json").exists());
+        assert!(suite_dir.join("200.json").exists());
+        std::fs::remove_dir_all(output_dir).expect("cleanup reporter test directory");
+    }
+
+    #[test]
+    fn json_reporter_does_not_publish_json_after_a_human_artifact_failure() {
+        let output_dir = unique_test_path("reporter-late-error");
+        let suite_dir = output_dir.join("suite");
+        std::fs::create_dir_all(suite_dir.join("latest.txt"))
+            .expect("create path that blocks latest text publication");
+        let reporter = JsonReporter::new(&output_dir);
+        let run = run_with_summaries(vec![summary(
+            "queue::fast",
+            1_000_000.0,
+            QualityClass::Authoritative,
+        )]);
+
+        reporter
+            .suite_end(&run)
+            .expect_err("a directory cannot be replaced by latest text");
+
+        assert!(!suite_dir.join("latest.json").exists());
+        assert!(!suite_dir.join(format!("{}.json", run.started_at)).exists());
+        std::fs::remove_dir_all(output_dir).expect("cleanup reporter test directory");
+    }
+
+    #[test]
+    fn json_reporter_rolls_back_every_artifact_after_an_injected_finalization_failure() {
+        let output_dir = unique_test_path("reporter-transaction-injected-error");
+        let suite_dir = output_dir.join("suite");
+        std::fs::create_dir_all(&suite_dir).expect("create suite directory");
+        std::fs::write(suite_dir.join("latest.json"), b"previous json")
+            .expect("previous latest json");
+        std::fs::write(suite_dir.join("latest.txt"), b"previous text")
+            .expect("previous latest text");
+        std::fs::write(suite_dir.join("latest.md"), b"previous markdown")
+            .expect("previous latest markdown");
+        let reporter = JsonReporter::new(&output_dir);
+        let run = run_with_summaries(vec![summary(
+            "queue::fast",
+            1_000_000.0,
+            QualityClass::Authoritative,
+        )]);
+
+        let error = reporter
+            .write_results_inner_with_hook(&run, |point| {
+                if point == ArtifactPublicationPoint::BeforeFinalize {
+                    Err(std::io::Error::other("injected finalization failure"))
+                } else {
+                    Ok(())
+                }
+            })
+            .expect_err("finalization failure must fail publication");
+
+        assert!(error.to_string().contains("injected finalization failure"));
+        assert_eq!(
+            std::fs::read(suite_dir.join("latest.json")).expect("restored latest json"),
+            b"previous json"
+        );
+        assert_eq!(
+            std::fs::read(suite_dir.join("latest.txt")).expect("restored latest text"),
+            b"previous text"
+        );
+        assert_eq!(
+            std::fs::read(suite_dir.join("latest.md")).expect("restored latest markdown"),
+            b"previous markdown"
+        );
+        for extension in ["json", "txt", "md"] {
+            assert!(!suite_dir
+                .join(format!("{}.{extension}", run.started_at))
+                .exists());
+        }
+        assert!(std::fs::read_dir(&suite_dir)
+            .expect("suite directory")
+            .all(|entry| !entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".artifact-transaction.")));
+        std::fs::remove_dir_all(output_dir).expect("cleanup reporter test directory");
+    }
+
+    #[test]
+    fn json_reporter_rolls_back_after_a_real_final_path_failure() {
+        let output_dir = unique_test_path("reporter-transaction-filesystem-error");
+        let suite_dir = output_dir.join("suite");
+        std::fs::create_dir_all(&suite_dir).expect("create suite directory");
+        std::fs::write(suite_dir.join("latest.txt"), b"previous text")
+            .expect("previous latest text");
+        std::fs::write(suite_dir.join("latest.md"), b"previous markdown")
+            .expect("previous latest markdown");
+        std::fs::create_dir(suite_dir.join("latest.json"))
+            .expect("directory that blocks final JSON publication");
+        let reporter = JsonReporter::new(&output_dir);
+        let run = run_with_summaries(vec![summary(
+            "queue::fast",
+            1_000_000.0,
+            QualityClass::Authoritative,
+        )]);
+
+        reporter
+            .suite_end(&run)
+            .expect_err("a directory cannot be replaced by latest JSON");
+
+        assert_eq!(
+            std::fs::read(suite_dir.join("latest.txt")).expect("restored latest text"),
+            b"previous text"
+        );
+        assert_eq!(
+            std::fs::read(suite_dir.join("latest.md")).expect("restored latest markdown"),
+            b"previous markdown"
+        );
+        assert!(suite_dir.join("latest.json").is_dir());
+        for extension in ["json", "txt", "md"] {
+            assert!(!suite_dir
+                .join(format!("{}.{extension}", run.started_at))
+                .exists());
+        }
+        assert!(std::fs::read_dir(&suite_dir)
+            .expect("suite directory")
+            .all(|entry| !entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".artifact-transaction.")));
+        std::fs::remove_dir_all(output_dir).expect("cleanup reporter test directory");
+    }
+
+    #[test]
+    fn artifact_suite_directory_never_uses_a_dot_segment() {
+        assert_eq!(artifact_suite_directory_name(".."), "_invalid-suite");
+        assert_eq!(artifact_suite_directory_name("."), "_invalid-suite");
+        assert_eq!(artifact_suite_directory_name("a/b"), "a_b");
+    }
+
     #[test]
     fn formats_summary_and_noisy_rows() {
         let run = run_with_summaries(vec![
@@ -2571,6 +3716,30 @@ mod tests {
     }
 
     #[test]
+    fn console_fails_when_an_intended_gate_loses_derived_trust() {
+        let mut invalid = summary("queue::invalid", 100.0, QualityClass::Authoritative);
+        invalid.trust_class = TrustClass::Invalid;
+        let run = run_with_summaries(vec![invalid]);
+
+        let report = format_console_output(&run);
+
+        assert!(report
+            .trim_end()
+            .ends_with("result: failed (suite: failed quality (1 invalid row))"));
+    }
+
+    #[test]
+    fn console_fails_release_with_no_intended_gate_rows() {
+        let run = run_with_summaries(Vec::new());
+
+        let report = format_console_output(&run);
+
+        assert!(report
+            .trim_end()
+            .ends_with("result: failed (suite: failed quality (no benchmark rows))"));
+    }
+
+    #[test]
     fn human_console_groups_allocation_issues() {
         let mut first = summary("alloc_a", 100.0, QualityClass::Acceptable);
         first.diagnostics = vec![diagnostic(
@@ -2718,6 +3887,36 @@ mod tests {
     }
 
     #[test]
+    fn console_reports_explicit_regression_budget_failure_without_profile_gate() {
+        let mut benchmark = summary("regressed", 80.0, QualityClass::Acceptable);
+        benchmark.budgets.max_regression_pct = Some(5.0);
+        let mut run = run_with_summaries(vec![benchmark]);
+        let profile_config = crate::config::StressRunnerConfig::new().profile_config();
+        run.run_profile = profile_config.profile;
+        run.environment.profile_config = profile_config;
+        run.comparisons = vec![ComparisonResult {
+            benchmark_id: "regressed".to_string(),
+            current_quality: QualityClass::Acceptable,
+            baseline_quality: Some(QualityClass::Acceptable),
+            primary_metric: PrimaryMetric::Throughput,
+            baseline_value: Some(100.0),
+            current_value: Some(80.0),
+            change_percent: Some(-20.0),
+            threshold: 0.05,
+            confidence_intervals_overlap: Some(false),
+            classification: ComparisonClass::Regression,
+            reason: None,
+        }];
+
+        let report = format_console_output(&run);
+
+        assert!(report.contains("regressed against baseline"));
+        assert!(report
+            .trim_end()
+            .ends_with("result: failed (suite: failed budget)"));
+    }
+
+    #[test]
     fn human_console_lists_budget_regression_and_micro_issues() {
         let mut budget = summary("budget", 100.0, QualityClass::Untrustworthy);
         budget.budget_results = vec![BudgetResult {
@@ -2794,6 +3993,31 @@ mod tests {
         assert!(!console.contains("mode=duration"));
         assert!(markdown.contains("| Trust | Mode | Question |"));
         assert!(markdown.contains("diagnostic"));
+    }
+
+    #[test]
+    fn console_preserves_fallible_benchmark_identity_and_error_message() {
+        let mut benchmark = summary(
+            "storage::load_fixture::benchmark error",
+            0.0,
+            QualityClass::Untrustworthy,
+        );
+        benchmark.trust_class = TrustClass::Invalid;
+        benchmark.correctness.passed = false;
+        benchmark.correctness.counters.attempted = 1;
+        benchmark.correctness.counters.failures = 1;
+        benchmark.metadata.insert(
+            "benchmark_error".to_string(),
+            "fixture is unavailable".to_string(),
+        );
+        let run = run_with_summaries(vec![benchmark]);
+
+        let console = format_console_output(&run);
+
+        assert!(console.contains("Benchmark error"));
+        assert!(console.contains("storage::load_fixture::benchmark error"));
+        assert!(console.contains("fixture is unavailable"));
+        assert!(!console.contains("failed correctness checks"));
     }
 
     #[test]

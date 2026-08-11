@@ -1,0 +1,5 @@
+error: cntryl-stress tiers are 1 through 6
+ --> tests/ui/fail/attribute_tier_too_high.rs:3:10
+  |
+3 | #[stress(tier = 7)]
+  |          ^^^^^^^^

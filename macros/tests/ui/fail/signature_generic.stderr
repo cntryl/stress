@@ -1,0 +1,5 @@
+error: #[stress] benchmark functions cannot be generic
+ --> tests/ui/fail/signature_generic.rs:4:13
+  |
+4 | fn benchmark<T>(_ctx: &mut stress_alias::StressContext) {}
+  |             ^^^

@@ -1,17 +1,27 @@
 //! Proc macros for cntryl-stress.
 
 use proc_macro::TokenStream;
+use proc_macro2::{Span, TokenStream as TokenStream2};
+use proc_macro_crate::{crate_name, FoundCrate};
 use quote::quote;
+use std::collections::HashSet;
 use syn::parse::Parser;
-use syn::{parse_macro_input, Expr, ExprLit, ItemFn, Lit, Meta, MetaNameValue, Token};
+use syn::{
+    parse_macro_input, Expr, ExprLit, FnArg, ItemFn, Lit, Meta, MetaNameValue, Signature, Token,
+    Type,
+};
 
 const MAX_TIER: u32 = 6;
 
 /// Mark a function as a stress benchmark.
 ///
+/// Benchmark functions take exactly one `&mut StressContext`, may be synchronous
+/// or asynchronous, and return `()`, `Result<(), E>`, or `StressResult`.
+///
 /// Common usage stays intentionally small:
 ///
 /// ```rust,ignore
+/// # use stress_alias as cntryl_stress;
 /// use cntryl_stress::{black_box, stress, StressContext};
 ///
 /// #[stress(tier = 1)]
@@ -22,7 +32,7 @@ const MAX_TIER: u32 = 6;
 ///
 /// #[stress(tier = 2)]
 /// fn write_batch(ctx: &mut StressContext) {
-///     ctx.measure("write batch", || write_the_batch());
+///     ctx.measure("write batch", || black_box([1_u8, 2, 3]));
 /// }
 /// ```
 ///
@@ -31,6 +41,7 @@ const MAX_TIER: u32 = 6;
 /// - `tier = 1` through `6` (defaults to `2`)
 /// - `name = "custom_name"`
 /// - `ignore`
+/// - `role = "gate"`, `"diagnostic"`, or `"experimental"`
 /// - `max_ns_per_op = 1000`
 /// - `max_allocs_per_op = 0`
 /// - `max_bytes_per_op = 0`
@@ -48,11 +59,18 @@ pub fn stress(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(attrs) => attrs,
         Err(error) => return error.to_compile_error().into(),
     };
+    if let Err(error) = validate_stress_signature(&input.sig) {
+        return error.to_compile_error().into();
+    }
     if let Some(error) = tier_error(attrs.tier) {
         return syn::Error::new_spanned(fn_name, error)
             .to_compile_error()
             .into();
     }
+    let stress_crate = match stress_crate_path() {
+        Ok(path) => path,
+        Err(error) => return error.to_compile_error().into(),
+    };
 
     let benchmark_name = attrs.name.unwrap_or_else(|| fn_name_str.clone());
     let is_ignored = attrs.ignore;
@@ -63,35 +81,34 @@ pub fn stress(attr: TokenStream, item: TokenStream) -> TokenStream {
             .into();
     };
     let mode_kind = derived_mode;
-    let mode = mode_kind.tokens();
+    let mode = mode_kind.tokens(&stress_crate);
     let max_ns_per_op = option_f64_tokens(attrs.budgets.ns_per_op);
     let max_allocs_per_op = option_f64_tokens(attrs.budgets.allocs_per_op);
     let max_bytes_per_op = option_f64_tokens(attrs.budgets.bytes_per_op);
     let max_regression_pct = option_f64_tokens(attrs.budgets.regression_pct);
     let max_rsd_pct = option_f64_tokens(attrs.budgets.rsd_pct);
-    let metadata_keys = attrs.metadata.iter().map(|(key, _)| key);
-    let metadata_values = attrs.metadata.iter().map(|(_, value)| value);
+    let mut metadata = attrs.metadata;
+    if let Some(role) = attrs.role {
+        metadata.push(("trust_class".to_string(), role));
+    }
+    let metadata_keys = metadata.iter().map(|(key, _)| key);
+    let metadata_values = metadata.iter().map(|(_, value)| value);
     let submit_ident = syn::Ident::new(
         &format!("__STRESS_BENCH_{}", fn_name_str.to_uppercase()),
         fn_name.span(),
     );
-    let wrapper_ident = syn::Ident::new(
-        &format!("__stress_sync_wrapper_{fn_name_str}"),
-        fn_name.span(),
-    );
-    let wrapper = if is_async {
+    let wrapper_ident = syn::Ident::new(&format!("__stress_wrapper_{fn_name_str}"), fn_name.span());
+    let invocation = if is_async {
         quote! {
-            fn #wrapper_ident(ctx: &mut ::cntryl_stress::StressContext) {
-                ::cntryl_stress::__private::block_on(#fn_name(ctx));
-            }
+            #stress_crate::__private::block_on(#fn_name(ctx))
         }
     } else {
-        quote! {}
+        quote! { #fn_name(ctx) }
     };
-    let func = if is_async {
-        quote! { #wrapper_ident }
-    } else {
-        quote! { #fn_name }
+    let wrapper = quote! {
+        fn #wrapper_ident(ctx: &mut #stress_crate::StressContext) -> #stress_crate::StressResult {
+            #stress_crate::__private::IntoStressResult::into_stress_result(#invocation)
+        }
     };
 
     quote! {
@@ -99,17 +116,17 @@ pub fn stress(attr: TokenStream, item: TokenStream) -> TokenStream {
         #wrapper
 
         #[allow(non_upper_case_globals)]
-        #[::cntryl_stress::__private::linkme::distributed_slice(::cntryl_stress::__private::STRESS_BENCHMARKS)]
-        #[linkme(crate = ::cntryl_stress::__private::linkme)]
-        static #submit_ident: ::cntryl_stress::__private::BenchmarkEntry = ::cntryl_stress::__private::BenchmarkEntry {
+        #[#stress_crate::__private::linkme::distributed_slice(#stress_crate::__private::STRESS_BENCHMARKS)]
+        #[linkme(crate = #stress_crate::__private::linkme)]
+        static #submit_ident: #stress_crate::__private::BenchmarkEntry = #stress_crate::__private::BenchmarkEntry {
             name: #benchmark_name,
             function_name: #fn_name_str,
-            func: #func,
+            func: #wrapper_ident,
             ignored: #is_ignored,
             module_path: module_path!(),
             tier: #tier,
             mode: #mode,
-            budgets: ::cntryl_stress::artifact::BenchmarkBudgets {
+            budgets: #stress_crate::artifact::BenchmarkBudgets {
                 max_ns_per_op: #max_ns_per_op,
                 max_allocs_per_op: #max_allocs_per_op,
                 max_bytes_per_op: #max_bytes_per_op,
@@ -127,6 +144,7 @@ struct StressAttrs {
     name: Option<String>,
     tier: u32,
     ignore: bool,
+    role: Option<String>,
     budgets: StressBudgets,
     metadata: Vec<(String, String)>,
 }
@@ -146,6 +164,7 @@ impl Default for StressAttrs {
             name: None,
             tier: 2,
             ignore: false,
+            role: None,
             budgets: StressBudgets::default(),
             metadata: Vec::new(),
         }
@@ -157,15 +176,36 @@ impl StressAttrs {
         let parser = syn::punctuated::Punctuated::<Meta, Token![,]>::parse_terminated;
         let metas = parser.parse2(attr)?;
         let mut attrs = Self::default();
+        let mut singleton_attributes = HashSet::new();
 
         for meta in metas {
             match meta {
-                Meta::Path(path) if path.is_ident("ignore") => attrs.ignore = true,
+                Meta::Path(path) if path.is_ident("ignore") => {
+                    mark_singleton(&mut singleton_attributes, "ignore", &path)?;
+                    attrs.ignore = true;
+                }
                 Meta::NameValue(name_value) if name_value.path.is_ident("name") => {
-                    attrs.name = Some(string_value(&name_value)?);
+                    mark_singleton(&mut singleton_attributes, "name", &name_value)?;
+                    let name = string_value(&name_value)?;
+                    if name.trim().is_empty() {
+                        return Err(syn::Error::new_spanned(
+                            &name_value.value,
+                            "stress benchmark name must not be empty or whitespace",
+                        ));
+                    }
+                    attrs.name = Some(name);
                 }
                 Meta::NameValue(name_value) if name_value.path.is_ident("tier") => {
-                    attrs.tier = int_value(&name_value)?;
+                    mark_singleton(&mut singleton_attributes, "tier", &name_value)?;
+                    let tier = int_value(&name_value)?;
+                    if let Some(error) = tier_error(tier) {
+                        return Err(syn::Error::new_spanned(name_value, error));
+                    }
+                    attrs.tier = tier;
+                }
+                Meta::NameValue(name_value) if name_value.path.is_ident("role") => {
+                    mark_singleton(&mut singleton_attributes, "role", &name_value)?;
+                    attrs.role = Some(role_value(&name_value)?);
                 }
                 Meta::NameValue(name_value) if name_value.path.is_ident("mode") => {
                     return Err(syn::Error::new_spanned(
@@ -174,33 +214,83 @@ impl StressAttrs {
                     ));
                 }
                 Meta::NameValue(name_value) if name_value.path.is_ident("max_ns_per_op") => {
-                    attrs.budgets.ns_per_op = Some(float_value(&name_value)?);
+                    mark_singleton(&mut singleton_attributes, "max_ns_per_op", &name_value)?;
+                    attrs.budgets.ns_per_op = Some(nonnegative_budget_value(&name_value)?);
                 }
                 Meta::NameValue(name_value) if name_value.path.is_ident("max_allocs_per_op") => {
-                    attrs.budgets.allocs_per_op = Some(float_value(&name_value)?);
+                    mark_singleton(&mut singleton_attributes, "max_allocs_per_op", &name_value)?;
+                    attrs.budgets.allocs_per_op = Some(nonnegative_budget_value(&name_value)?);
                 }
                 Meta::NameValue(name_value) if name_value.path.is_ident("max_bytes_per_op") => {
-                    attrs.budgets.bytes_per_op = Some(float_value(&name_value)?);
+                    mark_singleton(&mut singleton_attributes, "max_bytes_per_op", &name_value)?;
+                    attrs.budgets.bytes_per_op = Some(nonnegative_budget_value(&name_value)?);
                 }
                 Meta::NameValue(name_value) if name_value.path.is_ident("max_regression_pct") => {
-                    attrs.budgets.regression_pct = Some(float_value(&name_value)?);
+                    mark_singleton(&mut singleton_attributes, "max_regression_pct", &name_value)?;
+                    attrs.budgets.regression_pct = Some(percentage_budget_value(&name_value)?);
                 }
                 Meta::NameValue(name_value) if name_value.path.is_ident("max_rsd_pct") => {
-                    attrs.budgets.rsd_pct = Some(float_value(&name_value)?);
+                    mark_singleton(&mut singleton_attributes, "max_rsd_pct", &name_value)?;
+                    attrs.budgets.rsd_pct = Some(nonnegative_budget_value(&name_value)?);
                 }
                 Meta::List(list) if list.path.is_ident("metadata") => {
-                    attrs.metadata.extend(parse_metadata(list.tokens)?);
+                    let metadata = parse_metadata(list.tokens.clone())?;
+                    for (key, value) in metadata {
+                        if key == "trust_class" {
+                            return Err(syn::Error::new_spanned(
+                                &list,
+                                "trust_class is reserved; use role = \"diagnostic\" or role = \"experimental\"",
+                            ));
+                        }
+                        if attrs
+                            .metadata
+                            .iter()
+                            .any(|(existing_key, _)| existing_key == &key)
+                        {
+                            return Err(syn::Error::new_spanned(
+                                &list,
+                                format!("stress metadata key `{key}` may be specified only once"),
+                            ));
+                        }
+                        attrs.metadata.push((key, value));
+                    }
                 }
                 other => {
                     return Err(syn::Error::new_spanned(
                         other,
-                        "unsupported stress attribute",
+                        "unsupported stress attribute; expected tier, name, ignore, role, a max_* budget, or metadata(...)"
                     ));
                 }
             }
         }
 
         Ok(attrs)
+    }
+}
+
+fn mark_singleton(
+    seen: &mut HashSet<&'static str>,
+    name: &'static str,
+    tokens: impl quote::ToTokens,
+) -> syn::Result<()> {
+    if seen.insert(name) {
+        Ok(())
+    } else {
+        Err(syn::Error::new_spanned(
+            tokens,
+            format!("stress attribute `{name}` may be specified only once"),
+        ))
+    }
+}
+
+fn role_value(name_value: &MetaNameValue) -> syn::Result<String> {
+    let value = string_value(name_value)?;
+    match value.as_str() {
+        "gate" | "diagnostic" | "experimental" => Ok(value),
+        _ => Err(syn::Error::new_spanned(
+            &name_value.value,
+            "stress role must be \"gate\", \"diagnostic\", or \"experimental\"",
+        )),
     }
 }
 
@@ -257,7 +347,31 @@ fn float_value(name_value: &MetaNameValue) -> syn::Result<f64> {
     }
 }
 
-fn option_f64_tokens(value: Option<f64>) -> proc_macro2::TokenStream {
+fn nonnegative_budget_value(name_value: &MetaNameValue) -> syn::Result<f64> {
+    let value = float_value(name_value)?;
+    if value.is_finite() && value >= 0.0 {
+        Ok(value)
+    } else {
+        Err(syn::Error::new_spanned(
+            &name_value.value,
+            "stress budgets must be finite non-negative numbers",
+        ))
+    }
+}
+
+fn percentage_budget_value(name_value: &MetaNameValue) -> syn::Result<f64> {
+    let value = nonnegative_budget_value(name_value)?;
+    if value <= 100.0 {
+        Ok(value)
+    } else {
+        Err(syn::Error::new_spanned(
+            &name_value.value,
+            "max_regression_pct must be between 0 and 100",
+        ))
+    }
+}
+
+fn option_f64_tokens(value: Option<f64>) -> TokenStream2 {
     if let Some(value) = value {
         quote! { Some(#value) }
     } else {
@@ -273,16 +387,108 @@ enum ModeKind {
 }
 
 impl ModeKind {
-    fn tokens(self) -> proc_macro2::TokenStream {
+    fn tokens(self, stress_crate: &TokenStream2) -> TokenStream2 {
         match self {
-            Self::Micro => quote! { ::cntryl_stress::artifact::BenchmarkModeKind::Micro },
+            Self::Micro => quote! { #stress_crate::artifact::BenchmarkModeKind::Micro },
             Self::FixedOperations => {
-                quote! { ::cntryl_stress::artifact::BenchmarkModeKind::FixedOperations }
+                quote! { #stress_crate::artifact::BenchmarkModeKind::FixedOperations }
             }
             Self::FixedDuration => {
-                quote! { ::cntryl_stress::artifact::BenchmarkModeKind::FixedDuration }
+                quote! { #stress_crate::artifact::BenchmarkModeKind::FixedDuration }
             }
         }
+    }
+}
+
+fn validate_stress_signature(signature: &Signature) -> syn::Result<()> {
+    if let Some(unsafety) = &signature.unsafety {
+        return Err(syn::Error::new_spanned(
+            unsafety,
+            "#[stress] benchmark functions cannot be unsafe",
+        ));
+    }
+    if let Some(abi) = &signature.abi {
+        return Err(syn::Error::new_spanned(
+            abi,
+            "#[stress] benchmark functions cannot use an extern ABI",
+        ));
+    }
+    if !signature.generics.params.is_empty() || signature.generics.where_clause.is_some() {
+        return Err(syn::Error::new_spanned(
+            &signature.generics,
+            "#[stress] benchmark functions cannot be generic",
+        ));
+    }
+    if let Some(variadic) = &signature.variadic {
+        return Err(syn::Error::new_spanned(
+            variadic,
+            "#[stress] benchmark functions cannot be variadic",
+        ));
+    }
+    if let Some(FnArg::Receiver(receiver)) = signature
+        .inputs
+        .iter()
+        .find(|parameter| matches!(parameter, FnArg::Receiver(_)))
+    {
+        return Err(syn::Error::new_spanned(
+            receiver,
+            "#[stress] benchmark functions cannot have a self receiver; use a free function with &mut StressContext",
+        ));
+    }
+    if signature.inputs.len() != 1 {
+        return Err(syn::Error::new_spanned(
+            &signature.inputs,
+            "#[stress] benchmark functions require exactly one parameter: &mut StressContext",
+        ));
+    }
+
+    let parameter = signature
+        .inputs
+        .first()
+        .expect("one benchmark parameter was checked above");
+    let FnArg::Typed(parameter) = parameter else {
+        unreachable!("self receivers were rejected above");
+    };
+    if !is_mut_stress_context(&parameter.ty) {
+        return Err(syn::Error::new_spanned(
+            &parameter.ty,
+            "#[stress] benchmark parameter must have type &mut StressContext",
+        ));
+    }
+    Ok(())
+}
+
+fn is_mut_stress_context(ty: &Type) -> bool {
+    let Type::Reference(reference) = ty else {
+        return false;
+    };
+    if reference.mutability.is_none() || reference.lifetime.is_some() {
+        return false;
+    }
+    let Type::Path(path) = reference.elem.as_ref() else {
+        return false;
+    };
+    path.qself.is_none()
+        && path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "StressContext" && segment.arguments.is_empty())
+}
+
+fn stress_crate_path() -> syn::Result<TokenStream2> {
+    match crate_name("cntryl-stress") {
+        Ok(FoundCrate::Itself) => Ok(quote! { ::cntryl_stress }),
+        Ok(FoundCrate::Name(name)) => {
+            let ident = syn::Ident::new(&name, Span::call_site());
+            Ok(quote! { ::#ident })
+        }
+        Err(error) => Err(syn::Error::new(
+            Span::call_site(),
+            format!(
+                "could not find the cntryl-stress dependency: {error}; add cntryl-stress to Cargo.toml"
+            ),
+        )),
     }
 }
 
@@ -308,9 +514,13 @@ fn tier_error(tier: u32) -> Option<String> {
 /// Generate a `main` function for stress benchmark binaries.
 #[proc_macro]
 pub fn stress_main(_input: TokenStream) -> TokenStream {
+    let stress_crate = match stress_crate_path() {
+        Ok(path) => path,
+        Err(error) => return error.to_compile_error().into(),
+    };
     quote! {
         fn main() {
-            ::cntryl_stress::__private::stress_binary_main();
+            #stress_crate::__private::stress_binary_main();
         }
     }
     .into()

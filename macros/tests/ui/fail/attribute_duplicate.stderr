@@ -1,0 +1,71 @@
+error: stress attribute `name` may be specified only once
+ --> tests/ui/fail/attribute_duplicate.rs:3:26
+  |
+3 | #[stress(name = "first", name = "second")]
+  |                          ^^^^^^^^^^^^^^^
+
+error: stress attribute `tier` may be specified only once
+ --> tests/ui/fail/attribute_duplicate.rs:6:20
+  |
+6 | #[stress(tier = 1, tier = 2)]
+  |                    ^^^^^^^^
+
+error: stress attribute `ignore` may be specified only once
+ --> tests/ui/fail/attribute_duplicate.rs:9:18
+  |
+9 | #[stress(ignore, ignore)]
+  |                  ^^^^^^
+
+error: stress attribute `role` may be specified only once
+  --> tests/ui/fail/attribute_duplicate.rs:12:25
+   |
+12 | #[stress(role = "gate", role = "diagnostic")]
+   |                         ^^^^^^^^^^^^^^^^^^^
+
+error: stress attribute `max_ns_per_op` may be specified only once
+  --> tests/ui/fail/attribute_duplicate.rs:15:30
+   |
+15 | #[stress(max_ns_per_op = 10, max_ns_per_op = 20)]
+   |                              ^^^^^^^^^^^^^^^^^^
+
+error: stress attribute `max_allocs_per_op` may be specified only once
+  --> tests/ui/fail/attribute_duplicate.rs:18:33
+   |
+18 | #[stress(max_allocs_per_op = 0, max_allocs_per_op = 1)]
+   |                                 ^^^^^^^^^^^^^^^^^^^^^
+
+error: stress attribute `max_bytes_per_op` may be specified only once
+  --> tests/ui/fail/attribute_duplicate.rs:21:32
+   |
+21 | #[stress(max_bytes_per_op = 0, max_bytes_per_op = 1)]
+   |                                ^^^^^^^^^^^^^^^^^^^^
+
+error: stress attribute `max_regression_pct` may be specified only once
+  --> tests/ui/fail/attribute_duplicate.rs:24:34
+   |
+24 | #[stress(max_regression_pct = 5, max_regression_pct = 100)]
+   |                                  ^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: stress attribute `max_rsd_pct` may be specified only once
+  --> tests/ui/fail/attribute_duplicate.rs:27:27
+   |
+27 | #[stress(max_rsd_pct = 5, max_rsd_pct = 100)]
+   |                           ^^^^^^^^^^^^^^^^^
+
+error: stress metadata key `intent` may be specified only once
+  --> tests/ui/fail/attribute_duplicate.rs:30:10
+   |
+30 | #[stress(metadata(intent = "read", intent = "write"))]
+   |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: stress metadata key `validated_micro` may be specified only once
+  --> tests/ui/fail/attribute_duplicate.rs:33:46
+   |
+33 | #[stress(metadata(validated_micro = "true"), metadata(validated_micro = "false"))]
+   |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: stress benchmark name must not be empty or whitespace
+  --> tests/ui/fail/attribute_duplicate.rs:36:17
+   |
+36 | #[stress(name = "   ")]
+   |                 ^^^^^

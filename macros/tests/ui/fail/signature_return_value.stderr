@@ -1,0 +1,17 @@
+error[E0277]: the trait bound `usize: cntryl_stress::__private::IntoStressResult` is not satisfied
+ --> tests/ui/fail/signature_return_value.rs:3:1
+  |
+3 | #[stress]
+  | ^^^^^^^^^ the trait `cntryl_stress::__private::IntoStressResult` is not implemented for `usize`
+  |
+help: the following other types implement trait `cntryl_stress::__private::IntoStressResult`
+ --> $WORKSPACE/core/src/error.rs
+  |
+  |   impl IntoStressResult for () {
+  |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `()`
+...
+  | / impl<E> IntoStressResult for Result<(), E>
+  | | where
+  | |     E: fmt::Display,
+  | |____________________^ `Result<(), E>`
+  = note: this error originates in the attribute macro `stress` (in Nightly builds, run with -Z macro-backtrace for more info)

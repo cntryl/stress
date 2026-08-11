@@ -3,149 +3,1001 @@ name: Publish
 on:
   workflow_dispatch:
 
-permissions:
-  contents: write
-  id-token: write
+permissions: {}
+
+concurrency:
+  group: publish-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  publish:
+  release-identity:
+    name: Verify release identity and CI
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      release-sha: ${{ steps.release.outputs.release_sha }}
+      version: ${{ steps.release.outputs.version }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - name: Checkout repository without persisted credentials
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Update Rust toolchain
-        run: |
-          rustup update stable
-          rustup default stable
-          rustup component add clippy
-
-      - name: Check clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::pedantic
-
-      - name: Build release
-        run: cargo build --release
-
-      - name: Login
-        id: auth
-        uses: rust-lang/crates-io-auth-action@v1.0.4
-
-      - name: Publish crates to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      - name: Verify annotated tag, versions, and publish-ready documentation
+        id: release
         shell: bash
         run: |
           set -euo pipefail
 
-          resolve_version() {
-            local crate="$1"
-
-            cargo metadata --format-version=1 --no-deps \
-              | python3 -c 'import json, sys; crate = sys.argv[1]; metadata = json.load(sys.stdin); matches = [package["version"] for package in metadata["packages"] if package["name"] == crate]; print(matches[0]) if matches else sys.exit(f"package {crate} not found in cargo metadata")' "$crate"
-          }
-
-          check_crates_io_version() {
-            local crate="$1"
-            local version="$2"
-            local url="https://crates.io/api/v1/crates/${crate}/${version}"
-            local response_file
-            local status
-
-            response_file="$(mktemp)"
-            status="$(curl --silent --show-error --location --retry 3 --retry-delay 2 \
-              --output "$response_file" \
-              --write-out "%{http_code}" \
-              "$url")" || {
-              echo "::error title=crates.io check failed::Failed to check ${crate} ${version}" >&2
-              cat "$response_file" >&2 || true
-              rm -f "$response_file"
-              return 2
-            }
-
-            case "$status" in
-              200)
-                rm -f "$response_file"
-                return 0
-                ;;
-              404)
-                rm -f "$response_file"
-                return 1
-                ;;
-              *)
-                echo "::error title=unexpected crates.io response::${crate} ${version} returned HTTP ${status}" >&2
-                cat "$response_file" >&2
-                rm -f "$response_file"
-                return 2
-                ;;
-            esac
-          }
-
-          publish_if_missing() {
-            local crate="$1"
-            local version="$2"
-            local check_status
-
-            set +e
-            check_crates_io_version "$crate" "$version"
-            check_status="$?"
-            set -e
-
-            case "$check_status" in
-              0)
-                echo "::notice title=${crate} ${version}::Already published on crates.io; skipping."
-                PUBLISH_RESULT="skipped"
-                ;;
-              1)
-                echo "Publishing ${crate} ${version} to crates.io"
-                cargo publish --locked -p "$crate"
-                PUBLISH_RESULT="published"
-                ;;
-              *)
-                exit "$check_status"
-                ;;
-            esac
-          }
-
-          wait_for_crates_io_version() {
-            local crate="$1"
-            local version="$2"
-            local attempt
-            local check_status
-
-            for attempt in {1..12}; do
-              set +e
-              check_crates_io_version "$crate" "$version"
-              check_status="$?"
-              set -e
-
-              case "$check_status" in
-                0)
-                  echo "${crate} ${version} is visible on crates.io."
-                  return 0
-                  ;;
-                1)
-                  echo "Waiting for ${crate} ${version} to become visible on crates.io (${attempt}/12)."
-                  sleep 10
-                  ;;
-                *)
-                  exit "$check_status"
-                  ;;
-              esac
-            done
-
-            echo "::error title=crates.io visibility timeout::${crate} ${version} was not visible after waiting." >&2
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            echo "::error::Run this workflow from an annotated vX.Y.Z tag."
             exit 1
-          }
-
-          macros_crate="cntryl-stress-macros"
-          core_crate="cntryl-stress"
-
-          macros_version="$(resolve_version "$macros_crate")"
-          core_version="$(resolve_version "$core_crate")"
-
-          publish_if_missing "$macros_crate" "$macros_version"
-          if [[ "$PUBLISH_RESULT" == "published" ]]; then
-            wait_for_crates_io_version "$macros_crate" "$macros_version"
           fi
 
-          publish_if_missing "$core_crate" "$core_version"
+          tag_ref="refs/tags/${GITHUB_REF_NAME}"
+          if [[ "$(git cat-file -t "$tag_ref")" != "tag" ]]; then
+            echo "::error::${GITHUB_REF_NAME} must be an annotated tag."
+            exit 1
+          fi
+
+          release_sha="$(git rev-parse "${tag_ref}^{commit}")"
+          checkout_sha="$(git rev-parse HEAD)"
+          if [[ "$release_sha" != "$checkout_sha" ]]; then
+            echo "::error::The selected tag resolves to ${release_sha}, not checked-out commit ${checkout_sha}."
+            exit 1
+          fi
+
+          core_version="$(cargo metadata --locked --format-version=1 --no-deps | python3 -c 'import json, sys; data = json.load(sys.stdin); print(next(package["version"] for package in data["packages"] if package["name"] == "cntryl-stress"))')"
+          macros_version="$(cargo metadata --locked --format-version=1 --no-deps | python3 -c 'import json, sys; data = json.load(sys.stdin); print(next(package["version"] for package in data["packages"] if package["name"] == "cntryl-stress-macros"))')"
+          test "$core_version" = "$macros_version"
+          test "${GITHUB_REF_NAME}" = "v${core_version}"
+
+          dependency_version="${core_version%.*}"
+          if ! grep -Fqx "cntryl-stress = \"${dependency_version}\"" README.md \
+            || ! grep -Eq '^cargo install cntryl-stress([[:space:]]|$)' README.md \
+            || grep -Eq '^[[:space:]]*cntryl-stress = .*git =|^[[:space:]]*cargo install --git .*cntryl-stress|unreleased [0-9]+\.[0-9]+ API|crates\.io and docs\.rs serve [0-9]+\.[0-9]+\.x' README.md; then
+            echo "::error::Publish-ready README must describe the registry release, use registry dependency/install commands, and contain no active Git or unreleased-version guidance."
+            exit 1
+          fi
+
+          echo "release_sha=${release_sha}" >> "$GITHUB_OUTPUT"
+          echo "version=${core_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Require successful exact-SHA CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ steps.release.outputs.release_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ci_run_url="$({
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${RELEASE_SHA}&status=completed&per_page=100"
+          } | python3 -c '
+          import json
+          import sys
+
+          sha = sys.argv[1]
+          runs = json.load(sys.stdin)["workflow_runs"]
+          matches = [
+              run for run in runs
+              if run["head_sha"] == sha
+              and run["event"] == "push"
+              and run["status"] == "completed"
+          ]
+          if not matches:
+              raise SystemExit(f"no completed push CI run found for exact SHA {sha}")
+          run = max(matches, key=lambda item: (item["run_number"], item["run_attempt"]))
+          if run["conclusion"] != "success":
+              conclusion = run["conclusion"]
+              url = run["html_url"]
+              raise SystemExit(
+                  f"newest completed push CI for exact SHA {sha} concluded "
+                  f"{conclusion}: {url}"
+              )
+          print(run["html_url"])
+          ' "$RELEASE_SHA")"
+
+          echo "Exact-SHA CI: ${ci_run_url}"
+          echo "Exact-SHA CI: ${ci_run_url}" >> "$GITHUB_STEP_SUMMARY"
+
+  validate-stable:
+    name: Validate stable and release archives
+    needs: release-identity
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact release commit without persisted credentials
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.release-identity.outputs.release-sha }}
+
+      - name: Update stable Rust toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add clippy rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings -D clippy::pedantic
+
+      - name: Test all targets and features
+        run: cargo test --locked --workspace --all-targets --all-features
+
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --workspace --all-features --no-deps
+
+      - name: Check minimal feature set
+        run: cargo test --locked -p cntryl-stress --no-default-features
+
+      - name: Compile benchmark targets
+        run: cargo bench --locked -p cntryl-stress-demo --no-run
+
+      - name: Run smoke benchmark
+        run: cargo bench --locked -p cntryl-stress-demo --bench stress-demo1 -- --profile smoke --no-progress
+
+      - name: Validate emitted artifact against JSON Schema
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_path="$(find . -path '*/target/stress/stress-demo1/latest.json' -print -quit)"
+          test -n "$artifact_path"
+          npx --yes ajv-cli@5 validate --spec=draft2020 --strict=false \
+            -s core/schema/cntryl-stress.v2.schema.json \
+            -d "$artifact_path"
+
+      - name: Verify both package archives before publishing
+        env:
+          RELEASE_SHA: ${{ needs.release-identity.outputs.release-sha }}
+          RELEASE_VERSION: ${{ needs.release-identity.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          test -z "$(git status --short)"
+
+          # Package with the fixed MSRV toolchain so a later retry reproduces
+          # the same bytes even after the stable channel advances.
+          rustup toolchain install 1.85.0 --profile minimal
+          cargo +1.85.0 package --locked -p cntryl-stress-macros
+          macros_package="target/package/cntryl-stress-macros-${RELEASE_VERSION}"
+          macros_archive="${macros_package}.crate"
+          test -f "$macros_archive"
+          cargo +1.85.0 test --locked --manifest-path "${macros_package}/Cargo.toml" --all-targets
+          cargo +1.85.0 test --locked --manifest-path "${macros_package}/Cargo.toml" --doc
+
+          # crates.io cannot resolve the new core package until the matching
+          # macros version is public. This local-only patch verifies the exact
+          # core archive against the exact macros source before either write.
+          cargo +1.85.0 package --locked -p cntryl-stress \
+            --config 'patch.crates-io.cntryl-stress-macros.path="macros"'
+          core_package="target/package/cntryl-stress-${RELEASE_VERSION}"
+          core_archive="target/package/cntryl-stress-${RELEASE_VERSION}.crate"
+          test -f "$core_archive"
+
+          # CARGO_HOME propagates this patch into the wrapper's nested Cargo
+          # subprocesses, so the normalized archive's complete test suite can
+          # run before the matching macros version exists on crates.io.
+          preflight_cargo_home="${RUNNER_TEMP}/core-preflight-cargo-home"
+          mkdir -p "$preflight_cargo_home"
+          python3 - "$GITHUB_WORKSPACE/macros" "${preflight_cargo_home}/config.toml" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          macros_path = json.dumps(sys.argv[1])
+          pathlib.Path(sys.argv[2]).write_text(
+              f'[patch.crates-io]\ncntryl-stress-macros = {{ path = {macros_path} }}\n',
+              encoding='utf-8',
+          )
+          PY
+          CARGO_HOME="$preflight_cargo_home" RUSTUP_TOOLCHAIN=1.85.0 \
+            cargo test --locked --manifest-path "${core_package}/Cargo.toml" --all-targets --all-features
+          CARGO_HOME="$preflight_cargo_home" RUSTUP_TOOLCHAIN=1.85.0 \
+            cargo test --locked --manifest-path "${core_package}/Cargo.toml" --doc --all-features
+          test -z "$(git status --short)"
+
+          handoff="target/release-handoff"
+          mkdir -p "$handoff"
+          git bundle create "${handoff}/release.bundle" HEAD
+          cp "$macros_archive" "$handoff/"
+          cp "$core_archive" "${handoff}/cntryl-stress-${RELEASE_VERSION}.preflight.crate"
+          printf '%s\n' '1.85.0' > "${handoff}/RUST_TOOLCHAIN"
+          (
+            cd "$handoff"
+            sha256sum \
+              release.bundle \
+              RUST_TOOLCHAIN \
+              "cntryl-stress-macros-${RELEASE_VERSION}.crate" \
+              "cntryl-stress-${RELEASE_VERSION}.preflight.crate" \
+              > SHA256SUMS
+          )
+
+      - name: Upload validated release handoff
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-preflight-${{ needs.release-identity.outputs.release-sha }}
+          path: target/release-handoff/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
+
+  validate-msrv:
+    name: Validate minimum supported Rust
+    needs: release-identity
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact release commit without persisted credentials
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.release-identity.outputs.release-sha }}
+
+      - name: Check all targets at MSRV
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal
+          cargo +1.85.0 check --locked --workspace --all-targets --all-features
+
+  publish-macros:
+    name: Publish macros crate
+    needs:
+      - release-identity
+      - validate-stable
+      - validate-msrv
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - name: Download validated release handoff
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-preflight-${{ needs.release-identity.outputs.release-sha }}
+          path: ${{ runner.temp }}/release-handoff
+
+      - name: Reproduce macros archive without executing repository code
+        env:
+          CARGO_HOME: ${{ runner.temp }}/cargo-home
+          RELEASE_SHA: ${{ needs.release-identity.outputs.release-sha }}
+          RELEASE_VERSION: ${{ needs.release-identity.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          handoff="${RUNNER_TEMP}/release-handoff"
+          (
+            cd "$handoff"
+            sha256sum --check SHA256SUMS
+          )
+
+          rust_toolchain="$(cat "${handoff}/RUST_TOOLCHAIN")"
+          [[ "$rust_toolchain" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          rustup toolchain install "$rust_toolchain" --profile minimal
+          rustup default "$rust_toolchain"
+
+          source_dir="${RUNNER_TEMP}/release-source"
+          git clone --quiet "${handoff}/release.bundle" "$source_dir"
+          test "$(git -C "$source_dir" rev-parse HEAD)" = "$RELEASE_SHA"
+          test -z "$(git -C "$source_dir" status --short)"
+
+          cd "$RUNNER_TEMP"
+          cargo package --locked --no-verify \
+            --manifest-path "${source_dir}/Cargo.toml" \
+            -p cntryl-stress-macros
+
+          reproduced="${source_dir}/target/package/cntryl-stress-macros-${RELEASE_VERSION}.crate"
+          expected="${handoff}/cntryl-stress-macros-${RELEASE_VERSION}.crate"
+          cmp "$expected" "$reproduced"
+
+      - name: Check macros registry state
+        id: registry
+        env:
+          RELEASE_VERSION: ${{ needs.release-identity.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          crate="cntryl-stress-macros"
+          expected="${RUNNER_TEMP}/release-handoff/${crate}-${RELEASE_VERSION}.crate"
+          downloaded="${RUNNER_TEMP}/${crate}-${RELEASE_VERSION}.registry.crate"
+          metadata="${RUNNER_TEMP}/${crate}-${RELEASE_VERSION}.metadata.json"
+          expected_checksum="$(sha256sum "$expected" | awk '{print $1}')"
+          status="$(curl --silent --show-error --location \
+            --retry 5 --retry-all-errors --retry-delay 2 \
+            --header "User-Agent: cntryl-stress-release/${GITHUB_RUN_ID}" \
+            --header "Accept: application/json" \
+            --header "Cache-Control: no-cache" \
+            --output "$metadata" \
+            --write-out '%{http_code}' \
+            "https://crates.io/api/v1/crates/${crate}/${RELEASE_VERSION}")"
+
+          case "$status" in
+            200)
+              python3 - "$metadata" "$crate" "$RELEASE_VERSION" "$expected_checksum" <<'PY'
+          import json
+          import sys
+
+          metadata_path, expected_crate, expected_version, expected_checksum = sys.argv[1:]
+          with open(metadata_path, encoding="utf-8") as metadata_file:
+              version = json.load(metadata_file).get("version")
+          if not isinstance(version, dict):
+              raise SystemExit("crates.io response is missing version metadata")
+          if version.get("crate") != expected_crate or version.get("num") != expected_version:
+              raise SystemExit("crates.io returned metadata for an unexpected crate version")
+          if version.get("yanked") is not False:
+              raise SystemExit(f"{expected_crate} {expected_version} is yanked")
+          if version.get("checksum") != expected_checksum:
+              raise SystemExit(
+                  f"{expected_crate} {expected_version} has an unexpected registry checksum"
+              )
+          PY
+
+              download_status="$(curl --silent --show-error --location \
+                --retry 5 --retry-all-errors --retry-delay 2 \
+                --header "User-Agent: cntryl-stress-release/${GITHUB_RUN_ID}" \
+                --output "$downloaded" \
+                --write-out '%{http_code}' \
+                "https://crates.io/api/v1/crates/${crate}/${RELEASE_VERSION}/download")"
+              if [[ "$download_status" != "200" ]]; then
+                echo "::error::Unexpected crates.io archive response ${download_status} for ${crate} ${RELEASE_VERSION}."
+                exit 1
+              fi
+              if ! cmp "$expected" "$downloaded"; then
+                echo "::error::${crate} ${RELEASE_VERSION} already exists with different package bytes."
+                exit 1
+              fi
+              echo "needs_publish=false" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "needs_publish=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::Unexpected crates.io response ${status} for ${crate} ${RELEASE_VERSION}."
+              exit 1
+              ;;
+          esac
+
+      - name: Authenticate to crates.io
+        if: steps.registry.outputs.needs_publish == 'true'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
+
+      - name: Revalidate remote tag immediately before macros publication
+        if: steps.registry.outputs.needs_publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.release-identity.outputs.release-sha }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          response="$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
+          object_type="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["object"]["type"])' <<< "$response")"
+          object_sha="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["object"]["sha"])' <<< "$response")"
+
+          if [[ "$object_type" != "tag" ]]; then
+            echo "::error::Remote ${RELEASE_TAG} is no longer an annotated tag."
+            exit 1
+          fi
+
+          for depth in {1..8}; do
+            response="$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}")"
+            object_type="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["object"]["type"])' <<< "$response")"
+            object_sha="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["object"]["sha"])' <<< "$response")"
+            [[ "$object_type" == "tag" ]] || break
+          done
+
+          if [[ "$object_type" != "commit" ]]; then
+            echo "::error::Remote ${RELEASE_TAG} does not resolve to a commit within eight tag objects."
+            exit 1
+          fi
+          if [[ "$object_sha" != "$RELEASE_SHA" ]]; then
+            echo "::error::Remote ${RELEASE_TAG} moved from validated commit ${RELEASE_SHA} to ${object_sha}."
+            exit 1
+          fi
+
+      - name: Publish macros crate without executing package code
+        if: steps.registry.outputs.needs_publish == 'true'
+        env:
+          CARGO_HOME: ${{ runner.temp }}/cargo-home
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          cargo publish --locked --no-verify \
+            --manifest-path "${RUNNER_TEMP}/release-source/Cargo.toml" \
+            -p cntryl-stress-macros
+
+      - name: Verify visible macros archive
+        env:
+          RELEASE_VERSION: ${{ needs.release-identity.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          crate="cntryl-stress-macros"
+          expected="${RUNNER_TEMP}/release-handoff/${crate}-${RELEASE_VERSION}.crate"
+          downloaded="${RUNNER_TEMP}/${crate}-${RELEASE_VERSION}.verified.crate"
+          metadata="${RUNNER_TEMP}/${crate}-${RELEASE_VERSION}.verified.json"
+          expected_checksum="$(sha256sum "$expected" | awk '{print $1}')"
+
+          for attempt in {1..18}; do
+            metadata_status="$(curl --silent --show-error --location \
+              --retry 5 --retry-all-errors --retry-delay 2 \
+              --header "User-Agent: cntryl-stress-release/${GITHUB_RUN_ID}" \
+              --header "Accept: application/json" \
+              --header "Cache-Control: no-cache" \
+              --output "$metadata" \
+              --write-out '%{http_code}' \
+              "https://crates.io/api/v1/crates/${crate}/${RELEASE_VERSION}")"
+            if [[ "$metadata_status" == "200" ]]; then
+              python3 - "$metadata" "$crate" "$RELEASE_VERSION" "$expected_checksum" <<'PY'
+          import json
+          import sys
+
+          metadata_path, expected_crate, expected_version, expected_checksum = sys.argv[1:]
+          with open(metadata_path, encoding="utf-8") as metadata_file:
+              version = json.load(metadata_file).get("version")
+          if not isinstance(version, dict):
+              raise SystemExit("crates.io response is missing version metadata")
+          if version.get("crate") != expected_crate or version.get("num") != expected_version:
+              raise SystemExit("crates.io returned metadata for an unexpected crate version")
+          if version.get("yanked") is not False:
+              raise SystemExit(f"{expected_crate} {expected_version} is yanked")
+          if version.get("checksum") != expected_checksum:
+              raise SystemExit(
+                  f"{expected_crate} {expected_version} has an unexpected registry checksum"
+              )
+          PY
+
+              archive_status="$(curl --silent --show-error --location \
+                --retry 5 --retry-all-errors --retry-delay 2 \
+                --header "User-Agent: cntryl-stress-release/${GITHUB_RUN_ID}" \
+                --output "$downloaded" \
+                --write-out '%{http_code}' \
+                "https://crates.io/api/v1/crates/${crate}/${RELEASE_VERSION}/download")"
+              if [[ "$archive_status" == "200" ]]; then
+                cmp "$expected" "$downloaded" || {
+                  echo "::error::Visible ${crate} ${RELEASE_VERSION} does not match the validated archive."
+                  exit 1
+                }
+                exit 0
+              fi
+              if [[ "$archive_status" != "404" ]]; then
+                echo "::error::Unexpected crates.io archive response ${archive_status} for ${crate} ${RELEASE_VERSION}."
+                exit 1
+              fi
+            elif [[ "$metadata_status" != "404" ]]; then
+              echo "::error::Unexpected crates.io metadata response ${metadata_status} for ${crate} ${RELEASE_VERSION}."
+              exit 1
+            fi
+            echo "Waiting for ${crate} ${RELEASE_VERSION} to become visible (${attempt}/18)."
+            sleep 10
+          done
+
+          echo "::error::${crate} ${RELEASE_VERSION} was not visible after waiting."
+          exit 1
+
+  validate-core-archive:
+    name: Validate registry-resolved core archive
+    needs:
+      - release-identity
+      - publish-macros
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - name: Download validated release handoff
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-preflight-${{ needs.release-identity.outputs.release-sha }}
+          path: ${{ runner.temp }}/release-handoff
+
+      - name: Package and test core against published macros
+        env:
+          RELEASE_SHA: ${{ needs.release-identity.outputs.release-sha }}
+          RELEASE_VERSION: ${{ needs.release-identity.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          handoff="${RUNNER_TEMP}/release-handoff"
+          (
+            cd "$handoff"
+            sha256sum --check SHA256SUMS
+          )
+
+          rust_toolchain="$(cat "${handoff}/RUST_TOOLCHAIN")"
+          [[ "$rust_toolchain" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          rustup toolchain install "$rust_toolchain" --profile minimal
+          rustup default "$rust_toolchain"
+
+          source_dir="${RUNNER_TEMP}/release-source"
+          git clone --quiet "${handoff}/release.bundle" "$source_dir"
+          test "$(git -C "$source_dir" rev-parse HEAD)" = "$RELEASE_SHA"
+          test -z "$(git -C "$source_dir" status --short)"
+
+          cd "$RUNNER_TEMP"
+          cargo package --locked \
+            --manifest-path "${source_dir}/Cargo.toml" \
+            -p cntryl-stress
+
+          core_package="${source_dir}/target/package/cntryl-stress-${RELEASE_VERSION}"
+          core_archive="${core_package}.crate"
+          test -f "$core_archive"
+
+          # Only Cargo.lock may differ from the preflight archive: before the
+          # first write it resolved macros through the local verification
+          # patch, while this archive must resolve the public registry entry.
+          python3 - \
+            "${handoff}/cntryl-stress-${RELEASE_VERSION}.preflight.crate" \
+            "$core_archive" <<'PY'
+          import sys
+          import tarfile
+
+          def payload(path):
+              with tarfile.open(path, "r:gz") as archive:
+                  return {
+                      member.name: archive.extractfile(member).read()
+                      for member in archive.getmembers()
+                      if member.isfile() and not member.name.endswith("/Cargo.lock")
+                  }
+
+          before = payload(sys.argv[1])
+          after = payload(sys.argv[2])
+          if before != after:
+              changed = sorted(set(before) ^ set(after) | {
+                  name for name in set(before) & set(after) if before[name] != after[name]
+              })
+              raise SystemExit(f"core package payload changed after macros publication: {changed}")
+          PY
+
+          cargo metadata --locked --format-version=1 \
+            --manifest-path "${core_package}/Cargo.toml" \
+            | python3 -c '
+          import json
+          import sys
+
+          packages = json.load(sys.stdin)["packages"]
+          macros = next(package for package in packages if package["name"] == "cntryl-stress-macros")
+          if not (macros["source"] or "").startswith("registry+"):
+              raise SystemExit("packaged core did not resolve cntryl-stress-macros from a registry")
+          '
+
+          cargo test --locked --manifest-path "${core_package}/Cargo.toml" --all-targets --all-features
+          cargo test --locked --manifest-path "${core_package}/Cargo.toml" --doc --all-features
+
+          core_handoff="${RUNNER_TEMP}/core-release-handoff"
+          mkdir -p "$core_handoff"
+          cp "${handoff}/release.bundle" "$core_handoff/"
+          cp "${handoff}/RUST_TOOLCHAIN" "$core_handoff/"
+          cp "$core_archive" "$core_handoff/"
+          (
+            cd "$core_handoff"
+            sha256sum \
+              release.bundle \
+              RUST_TOOLCHAIN \
+              "cntryl-stress-${RELEASE_VERSION}.crate" \
+              > SHA256SUMS
+          )
+
+      - name: Upload registry-resolved core handoff
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: core-release-${{ needs.release-identity.outputs.release-sha }}
+          path: ${{ runner.temp }}/core-release-handoff/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
+
+  publish-core:
+    name: Publish core crate
+    needs:
+      - release-identity
+      - validate-core-archive
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - name: Download validated core handoff
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: core-release-${{ needs.release-identity.outputs.release-sha }}
+          path: ${{ runner.temp }}/core-release-handoff
+
+      - name: Reproduce core archive without executing repository code
+        env:
+          CARGO_HOME: ${{ runner.temp }}/cargo-home
+          RELEASE_SHA: ${{ needs.release-identity.outputs.release-sha }}
+          RELEASE_VERSION: ${{ needs.release-identity.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          handoff="${RUNNER_TEMP}/core-release-handoff"
+          (
+            cd "$handoff"
+            sha256sum --check SHA256SUMS
+          )
+
+          rust_toolchain="$(cat "${handoff}/RUST_TOOLCHAIN")"
+          [[ "$rust_toolchain" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          rustup toolchain install "$rust_toolchain" --profile minimal
+          rustup default "$rust_toolchain"
+
+          source_dir="${RUNNER_TEMP}/release-source"
+          git clone --quiet "${handoff}/release.bundle" "$source_dir"
+          test "$(git -C "$source_dir" rev-parse HEAD)" = "$RELEASE_SHA"
+          test -z "$(git -C "$source_dir" status --short)"
+
+          cd "$RUNNER_TEMP"
+          cargo package --locked --no-verify \
+            --manifest-path "${source_dir}/Cargo.toml" \
+            -p cntryl-stress
+
+          reproduced="${source_dir}/target/package/cntryl-stress-${RELEASE_VERSION}.crate"
+          expected="${handoff}/cntryl-stress-${RELEASE_VERSION}.crate"
+          cmp "$expected" "$reproduced"
+
+      - name: Check core registry state
+        id: registry
+        env:
+          RELEASE_VERSION: ${{ needs.release-identity.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          crate="cntryl-stress"
+          expected="${RUNNER_TEMP}/core-release-handoff/${crate}-${RELEASE_VERSION}.crate"
+          downloaded="${RUNNER_TEMP}/${crate}-${RELEASE_VERSION}.registry.crate"
+          metadata="${RUNNER_TEMP}/${crate}-${RELEASE_VERSION}.metadata.json"
+          expected_checksum="$(sha256sum "$expected" | awk '{print $1}')"
+          status="$(curl --silent --show-error --location \
+            --retry 5 --retry-all-errors --retry-delay 2 \
+            --header "User-Agent: cntryl-stress-release/${GITHUB_RUN_ID}" \
+            --header "Accept: application/json" \
+            --header "Cache-Control: no-cache" \
+            --output "$metadata" \
+            --write-out '%{http_code}' \
+            "https://crates.io/api/v1/crates/${crate}/${RELEASE_VERSION}")"
+
+          case "$status" in
+            200)
+              python3 - "$metadata" "$crate" "$RELEASE_VERSION" "$expected_checksum" <<'PY'
+          import json
+          import sys
+
+          metadata_path, expected_crate, expected_version, expected_checksum = sys.argv[1:]
+          with open(metadata_path, encoding="utf-8") as metadata_file:
+              version = json.load(metadata_file).get("version")
+          if not isinstance(version, dict):
+              raise SystemExit("crates.io response is missing version metadata")
+          if version.get("crate") != expected_crate or version.get("num") != expected_version:
+              raise SystemExit("crates.io returned metadata for an unexpected crate version")
+          if version.get("yanked") is not False:
+              raise SystemExit(f"{expected_crate} {expected_version} is yanked")
+          if version.get("checksum") != expected_checksum:
+              raise SystemExit(
+                  f"{expected_crate} {expected_version} has an unexpected registry checksum"
+              )
+          PY
+
+              download_status="$(curl --silent --show-error --location \
+                --retry 5 --retry-all-errors --retry-delay 2 \
+                --header "User-Agent: cntryl-stress-release/${GITHUB_RUN_ID}" \
+                --output "$downloaded" \
+                --write-out '%{http_code}' \
+                "https://crates.io/api/v1/crates/${crate}/${RELEASE_VERSION}/download")"
+              if [[ "$download_status" != "200" ]]; then
+                echo "::error::Unexpected crates.io archive response ${download_status} for ${crate} ${RELEASE_VERSION}."
+                exit 1
+              fi
+              if ! cmp "$expected" "$downloaded"; then
+                echo "::error::${crate} ${RELEASE_VERSION} already exists with different package bytes."
+                exit 1
+              fi
+              echo "needs_publish=false" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "needs_publish=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::Unexpected crates.io response ${status} for ${crate} ${RELEASE_VERSION}."
+              exit 1
+              ;;
+          esac
+
+      - name: Authenticate to crates.io
+        if: steps.registry.outputs.needs_publish == 'true'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
+
+      - name: Revalidate remote tag immediately before core publication
+        if: steps.registry.outputs.needs_publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.release-identity.outputs.release-sha }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          response="$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
+          object_type="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["object"]["type"])' <<< "$response")"
+          object_sha="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["object"]["sha"])' <<< "$response")"
+
+          if [[ "$object_type" != "tag" ]]; then
+            echo "::error::Remote ${RELEASE_TAG} is no longer an annotated tag."
+            exit 1
+          fi
+
+          for depth in {1..8}; do
+            response="$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}")"
+            object_type="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["object"]["type"])' <<< "$response")"
+            object_sha="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["object"]["sha"])' <<< "$response")"
+            [[ "$object_type" == "tag" ]] || break
+          done
+
+          if [[ "$object_type" != "commit" ]]; then
+            echo "::error::Remote ${RELEASE_TAG} does not resolve to a commit within eight tag objects."
+            exit 1
+          fi
+          if [[ "$object_sha" != "$RELEASE_SHA" ]]; then
+            echo "::error::Remote ${RELEASE_TAG} moved from validated commit ${RELEASE_SHA} to ${object_sha}."
+            exit 1
+          fi
+
+      - name: Publish core crate without executing package code
+        if: steps.registry.outputs.needs_publish == 'true'
+        env:
+          CARGO_HOME: ${{ runner.temp }}/cargo-home
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          cargo publish --locked --no-verify \
+            --manifest-path "${RUNNER_TEMP}/release-source/Cargo.toml" \
+            -p cntryl-stress
+
+      - name: Verify visible core archive
+        env:
+          RELEASE_VERSION: ${{ needs.release-identity.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          crate="cntryl-stress"
+          expected="${RUNNER_TEMP}/core-release-handoff/${crate}-${RELEASE_VERSION}.crate"
+          downloaded="${RUNNER_TEMP}/${crate}-${RELEASE_VERSION}.verified.crate"
+          metadata="${RUNNER_TEMP}/${crate}-${RELEASE_VERSION}.verified.json"
+          expected_checksum="$(sha256sum "$expected" | awk '{print $1}')"
+
+          for attempt in {1..18}; do
+            metadata_status="$(curl --silent --show-error --location \
+              --retry 5 --retry-all-errors --retry-delay 2 \
+              --header "User-Agent: cntryl-stress-release/${GITHUB_RUN_ID}" \
+              --header "Accept: application/json" \
+              --header "Cache-Control: no-cache" \
+              --output "$metadata" \
+              --write-out '%{http_code}' \
+              "https://crates.io/api/v1/crates/${crate}/${RELEASE_VERSION}")"
+            if [[ "$metadata_status" == "200" ]]; then
+              python3 - "$metadata" "$crate" "$RELEASE_VERSION" "$expected_checksum" <<'PY'
+          import json
+          import sys
+
+          metadata_path, expected_crate, expected_version, expected_checksum = sys.argv[1:]
+          with open(metadata_path, encoding="utf-8") as metadata_file:
+              version = json.load(metadata_file).get("version")
+          if not isinstance(version, dict):
+              raise SystemExit("crates.io response is missing version metadata")
+          if version.get("crate") != expected_crate or version.get("num") != expected_version:
+              raise SystemExit("crates.io returned metadata for an unexpected crate version")
+          if version.get("yanked") is not False:
+              raise SystemExit(f"{expected_crate} {expected_version} is yanked")
+          if version.get("checksum") != expected_checksum:
+              raise SystemExit(
+                  f"{expected_crate} {expected_version} has an unexpected registry checksum"
+              )
+          PY
+
+              archive_status="$(curl --silent --show-error --location \
+                --retry 5 --retry-all-errors --retry-delay 2 \
+                --header "User-Agent: cntryl-stress-release/${GITHUB_RUN_ID}" \
+                --output "$downloaded" \
+                --write-out '%{http_code}' \
+                "https://crates.io/api/v1/crates/${crate}/${RELEASE_VERSION}/download")"
+              if [[ "$archive_status" == "200" ]]; then
+                cmp "$expected" "$downloaded" || {
+                  echo "::error::Visible ${crate} ${RELEASE_VERSION} does not match the validated archive."
+                  exit 1
+                }
+                exit 0
+              fi
+              if [[ "$archive_status" != "404" ]]; then
+                echo "::error::Unexpected crates.io archive response ${archive_status} for ${crate} ${RELEASE_VERSION}."
+                exit 1
+              fi
+            elif [[ "$metadata_status" != "404" ]]; then
+              echo "::error::Unexpected crates.io metadata response ${metadata_status} for ${crate} ${RELEASE_VERSION}."
+              exit 1
+            fi
+            echo "Waiting for ${crate} ${RELEASE_VERSION} to become visible (${attempt}/18)."
+            sleep 10
+          done
+
+          echo "::error::${crate} ${RELEASE_VERSION} was not visible after waiting."
+          exit 1
+
+  github-release:
+    name: Create GitHub release
+    needs:
+      - release-identity
+      - publish-core
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create release for verified tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.release-identity.outputs.release-sha }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ needs.release-identity.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          resolve_remote_annotated_tag() {
+            local object_sha
+            local object_type
+            local response
+            local depth=0
+
+            response="$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
+            object_type="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["object"]["type"])' <<< "$response")"
+            object_sha="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["object"]["sha"])' <<< "$response")"
+
+            if [[ "$object_type" != "tag" ]]; then
+              echo "::error::Remote ${RELEASE_TAG} is no longer an annotated tag." >&2
+              return 1
+            fi
+
+            while [[ "$object_type" == "tag" ]]; do
+              depth=$((depth + 1))
+              if (( depth > 8 )); then
+                echo "::error::Remote ${RELEASE_TAG} has an unexpectedly deep tag chain." >&2
+                return 1
+              fi
+
+              response="$(gh api \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "/repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}")"
+              object_type="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["object"]["type"])' <<< "$response")"
+              object_sha="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["object"]["sha"])' <<< "$response")"
+            done
+
+            if [[ "$object_type" != "commit" ]]; then
+              echo "::error::Remote ${RELEASE_TAG} resolves to ${object_type}, not a commit." >&2
+              return 1
+            fi
+
+            printf '%s\n' "$object_sha"
+          }
+
+          require_unyanked_registry_version() {
+            local crate="$1"
+            local metadata="${RUNNER_TEMP}/${crate}-${RELEASE_VERSION}.release.json"
+            local status
+
+            status="$(curl --silent --show-error --location \
+              --retry 5 --retry-all-errors --retry-delay 2 \
+              --header "User-Agent: cntryl-stress-release/${GITHUB_RUN_ID}" \
+              --header "Accept: application/json" \
+              --header "Cache-Control: no-cache" \
+              --output "$metadata" \
+              --write-out '%{http_code}' \
+              "https://crates.io/api/v1/crates/${crate}/${RELEASE_VERSION}")"
+            if [[ "$status" != "200" ]]; then
+              echo "::error::Expected crates.io metadata for ${crate} ${RELEASE_VERSION}, got ${status}." >&2
+              return 1
+            fi
+
+            python3 - "$metadata" "$crate" "$RELEASE_VERSION" <<'PY'
+          import json
+          import re
+          import sys
+
+          metadata_path, expected_crate, expected_version = sys.argv[1:]
+          with open(metadata_path, encoding="utf-8") as metadata_file:
+              version = json.load(metadata_file).get("version")
+          if not isinstance(version, dict):
+              raise SystemExit("crates.io response is missing version metadata")
+          if version.get("crate") != expected_crate or version.get("num") != expected_version:
+              raise SystemExit("crates.io returned metadata for an unexpected crate version")
+          if version.get("yanked") is not False:
+              raise SystemExit(f"{expected_crate} {expected_version} is yanked")
+          if not re.fullmatch(r"[0-9a-f]{64}", version.get("checksum", "")):
+              raise SystemExit("crates.io returned an invalid archive checksum")
+          PY
+          }
+
+          before_sha="$(resolve_remote_annotated_tag)"
+          if [[ "$before_sha" != "$RELEASE_SHA" ]]; then
+            echo "::error::Remote ${RELEASE_TAG} moved from validated commit ${RELEASE_SHA} to ${before_sha}."
+            exit 1
+          fi
+
+          require_unyanked_registry_version cntryl-stress-macros
+          require_unyanked_registry_version cntryl-stress
+
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --generate-notes
+
+          gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease \
+            | python3 -c '
+          import json
+          import sys
+
+          expected_tag = sys.argv[1]
+          release = json.load(sys.stdin)
+          if release["tagName"] != expected_tag:
+              actual_tag = release["tagName"]
+              raise SystemExit(
+                  f"release tag mismatch: expected {expected_tag}, got {actual_tag}"
+              )
+          if release["isDraft"]:
+              raise SystemExit(f"release {expected_tag} is still a draft")
+          if release["isPrerelease"]:
+              raise SystemExit(f"release {expected_tag} is unexpectedly a prerelease")
+          ' "$RELEASE_TAG"
+
+          after_sha="$(resolve_remote_annotated_tag)"
+          if [[ "$after_sha" != "$RELEASE_SHA" ]]; then
+            echo "::error::Remote ${RELEASE_TAG} moved from validated commit ${RELEASE_SHA} to ${after_sha}."
+            exit 1
+          fi

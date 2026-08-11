@@ -1,0 +1,5 @@
+error: #[stress] benchmark functions require exactly one parameter: &mut StressContext
+ --> tests/ui/fail/signature_two_parameters.rs:4:14
+  |
+4 | fn benchmark(_first: &mut stress_alias::StressContext, _second: &mut stress_alias::StressContext) {}
+  |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

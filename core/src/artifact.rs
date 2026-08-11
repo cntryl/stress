@@ -1,13 +1,19 @@
 //! Raw-sample result types and current artifact helpers.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
 /// Authoritative JSON schema version for current cntryl-stress artifacts.
 pub const SCHEMA_VERSION: &str = "cntryl-stress.v2";
+
+/// Machine-readable JSON Schema for [`StressRun`] artifacts.
+pub const ARTIFACT_JSON_SCHEMA: &str = include_str!("../schema/cntryl-stress.v2.schema.json");
+
+const LATENCY_ESTIMATOR_METADATA_KEY: &str = "cntryl_stress_latency_estimator";
+const PER_SAMPLE_P95_STUDENT_T_ESTIMATOR: &str = "per_sample_p95_mean_student_t_95";
 
 /// Highest defined benchmark tier.
 pub const MAX_TIER: u32 = 6;
@@ -568,8 +574,20 @@ pub struct SummaryStats {
 impl SummaryStats {
     /// Compute summary statistics from raw values.
     #[must_use]
-    #[allow(clippy::cast_precision_loss)]
     pub fn from_values(values: &[f64]) -> Option<Self> {
+        Self::from_values_with_critical_value(values, |_| 1.96)
+    }
+
+    #[must_use]
+    fn from_values_with_student_t(values: &[f64]) -> Option<Self> {
+        Self::from_values_with_critical_value(values, student_t_critical_value_95)
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn from_values_with_critical_value(
+        values: &[f64],
+        critical_value: impl Fn(usize) -> f64,
+    ) -> Option<Self> {
         let mut sorted: Vec<f64> = values
             .iter()
             .copied()
@@ -607,7 +625,7 @@ impl SummaryStats {
         let half_width = if len < 2 {
             0.0
         } else {
-            1.96 * (std_dev / (len as f64).sqrt())
+            critical_value(len - 1) * (std_dev / (len as f64).sqrt())
         };
 
         Some(Self {
@@ -625,6 +643,22 @@ impl SummaryStats {
             p95: percentile_sorted(&sorted, 0.95),
             p99: percentile_sorted(&sorted, 0.99),
         })
+    }
+}
+
+fn student_t_critical_value_95(degrees_of_freedom: usize) -> f64 {
+    const SMALL_SAMPLE: [f64; 31] = [
+        0.0, 12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179,
+        2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086, 2.080, 2.074, 2.069, 2.064, 2.060,
+        2.056, 2.052, 2.048, 2.045, 2.042,
+    ];
+    match degrees_of_freedom {
+        0 => 0.0,
+        1..=30 => SMALL_SAMPLE[degrees_of_freedom],
+        31..=40 => 2.042,
+        41..=60 => 2.021,
+        61..=120 => 2.0,
+        _ => 1.98,
     }
 }
 
@@ -749,7 +783,7 @@ pub struct ProfileConfig {
     /// Optional strict diagnostic gate threshold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny_diagnostics: Option<DiagnosticSeverity>,
-    /// Regression/improvement threshold.
+    /// Regression/improvement threshold as a fraction (`0.05` means 5%).
     pub regression_threshold: f64,
     /// Default fixed-duration sample budget.
     #[serde(with = "duration_serde")]
@@ -987,11 +1021,38 @@ impl BenchmarkSummary {
         let stats = self.stats.as_ref()?;
         match self.primary_metric {
             PrimaryMetric::Throughput | PrimaryMetric::NsPerOp => Some(stats.mean),
+            PrimaryMetric::LatencyP95
+                if self
+                    .metadata
+                    .get(LATENCY_ESTIMATOR_METADATA_KEY)
+                    .is_some_and(|estimator| estimator == PER_SAMPLE_P95_STUDENT_T_ESTIMATOR) =>
+            {
+                Some(stats.mean)
+            }
             PrimaryMetric::LatencyP95 => Some(stats.p95),
         }
     }
 
-    /// Whether this row participates in quality and regression gates.
+    /// Author-selected trust class before measurement-derived downgrades.
+    ///
+    /// An absent override preserves the default gate obligation. An invalid
+    /// serialized override fails closed as [`TrustClass::Invalid`].
+    #[must_use]
+    pub fn intended_trust_class(&self) -> TrustClass {
+        self.metadata
+            .get("trust_class")
+            .map_or(TrustClass::Gate, |value| {
+                value.parse::<TrustClass>().unwrap_or(TrustClass::Invalid)
+            })
+    }
+
+    /// Whether the author selected this row as a performance gate.
+    #[must_use]
+    pub fn is_intended_gate(&self) -> bool {
+        self.intended_trust_class() == TrustClass::Gate
+    }
+
+    /// Whether measurement-derived trust permits this row to drive gates.
     #[must_use]
     pub const fn is_gate(&self) -> bool {
         matches!(self.trust_class, TrustClass::Gate)
@@ -1101,6 +1162,51 @@ impl StressRun {
         }
     }
 
+    /// Validate that canonical raw evidence and its serialized summaries form
+    /// one internally consistent current-schema run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actionable error when top-level identity disagrees with the
+    /// captured environment, or when specs, samples, and summaries do not
+    /// describe the same evidence.
+    pub fn validate_canonical_evidence(&self) -> Result<(), String> {
+        self.canonical_baseline_summaries().map(|_| ())
+    }
+
+    /// Recompute comparison summaries from canonical specs and raw samples,
+    /// rejecting serialized summaries that do not match their source data.
+    pub(crate) fn canonical_baseline_summaries(&self) -> Result<Vec<BenchmarkSummary>, String> {
+        if self.schema_version != SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported schema_version {:?}; expected {SCHEMA_VERSION:?}",
+                self.schema_version
+            ));
+        }
+        if self.tool_version != self.environment.tool_version {
+            return Err(format!(
+                "run tool version {:?} does not match environment tool version {:?}",
+                self.tool_version, self.environment.tool_version
+            ));
+        }
+        if self.run_profile != self.environment.profile_config.profile {
+            return Err(format!(
+                "run profile {:?} does not match environment profile {:?}",
+                self.run_profile, self.environment.profile_config.profile
+            ));
+        }
+        validate_baseline_shape(self)?;
+        if self.benchmark_specs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let topology = BaselineTopology::from_run(self)?;
+        topology.validate_samples(&self.samples, &self.environment)?;
+        let (canonical, legacy) = recompute_baseline_summaries(self);
+        validate_serialized_baseline_summaries(&topology.summaries_by_id, &canonical, &legacy)?;
+        Ok(canonical)
+    }
+
     /// Whether every measured summary passed correctness.
     #[must_use]
     pub fn correctness_passed(&self) -> bool {
@@ -1109,13 +1215,36 @@ impl StressRun {
             .all(|summary| summary.correctness.passed)
     }
 
-    /// Whether every summary satisfies the requested minimum quality.
+    /// Whether at least one intended gate exists and every intended gate is
+    /// trustworthy and satisfies the requested minimum quality.
     #[must_use]
     pub fn meets_min_quality(&self, min_quality: QualityClass) -> bool {
-        self.summaries
+        let mut intended_gates = self
+            .summaries
             .iter()
-            .filter(|summary| summary.is_gate())
-            .all(|summary| quality_rank(summary.quality) >= quality_rank(min_quality))
+            .filter(|summary| summary.is_intended_gate());
+        let Some(first) = intended_gates.next() else {
+            return false;
+        };
+        std::iter::once(first).chain(intended_gates).all(|summary| {
+            summary.is_gate() && quality_rank(summary.quality) >= quality_rank(min_quality)
+        })
+    }
+
+    /// Whether the selected gate set is non-empty and every intended gate
+    /// retained gate-quality trust after measurement diagnostics.
+    #[must_use]
+    pub fn gate_obligations_satisfied(&self) -> bool {
+        let mut intended_gates = self
+            .summaries
+            .iter()
+            .filter(|summary| summary.is_intended_gate());
+        let Some(first) = intended_gates.next() else {
+            return false;
+        };
+        std::iter::once(first)
+            .chain(intended_gates)
+            .all(BenchmarkSummary::is_gate)
     }
 
     /// Meaningful regression rows.
@@ -1124,13 +1253,33 @@ impl StressRun {
         let gate_rows = self
             .summaries
             .iter()
-            .filter(|summary| summary.is_gate())
+            .filter(|summary| summary.is_intended_gate() && summary.is_gate())
             .map(|summary| summary.benchmark_id.as_str())
             .collect::<std::collections::BTreeSet<_>>();
         self.comparisons
             .iter()
             .filter(|comparison| comparison.classification == ComparisonClass::Regression)
             .filter(|comparison| gate_rows.contains(comparison.benchmark_id.as_str()))
+            .collect()
+    }
+
+    /// Supplied baseline comparisons that could not validly cover an intended gate.
+    #[must_use]
+    pub fn rejected_gate_comparisons(&self) -> Vec<&ComparisonResult> {
+        let gate_rows = self
+            .summaries
+            .iter()
+            .filter(|summary| summary.is_intended_gate())
+            .map(|summary| summary.benchmark_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        self.comparisons
+            .iter()
+            .filter(|comparison| gate_rows.contains(comparison.benchmark_id.as_str()))
+            .filter(|comparison| {
+                comparison.classification == ComparisonClass::MissingBaseline
+                    || (comparison.classification == ComparisonClass::Inconclusive
+                        && comparison.reason.is_some())
+            })
             .collect()
     }
 
@@ -1145,6 +1294,32 @@ impl StressRun {
         })
     }
 
+    /// Whether every explicit regression budget covered by supplied baseline
+    /// comparisons passed or remained statistically inconclusive.
+    ///
+    /// A run without baseline comparisons leaves regression budgets unevaluated
+    /// so ordinary collection can still produce a future baseline.
+    #[must_use]
+    pub fn regression_budgets_passed(&self) -> bool {
+        if self.comparisons.is_empty() {
+            return true;
+        }
+        self.summaries
+            .iter()
+            .filter(|summary| summary.budgets.max_regression_pct.is_some())
+            .all(|summary| {
+                self.comparisons
+                    .iter()
+                    .find(|comparison| comparison.benchmark_id == summary.benchmark_id)
+                    .is_some_and(|comparison| {
+                        comparison.classification != ComparisonClass::Regression
+                            && comparison.classification != ComparisonClass::MissingBaseline
+                            && !(comparison.classification == ComparisonClass::Inconclusive
+                                && comparison.reason.is_some())
+                    })
+            })
+    }
+
     /// Whether every diagnostic is below the configured strict threshold.
     #[must_use]
     pub fn diagnostics_passed(&self, threshold: DiagnosticSeverity) -> bool {
@@ -1152,6 +1327,310 @@ impl StressRun {
             .iter()
             .all(|diagnostic| !diagnostic.severity.at_least(threshold))
     }
+}
+
+fn validate_baseline_shape(run: &StressRun) -> Result<(), String> {
+    if run.benchmark_specs.is_empty() {
+        return if run.samples.is_empty() && run.summaries.is_empty() {
+            Ok(())
+        } else {
+            Err("baseline is summary-only or has samples without benchmark specs; v2 baseline comparison requires canonical raw samples and benchmark specs"
+                .to_string())
+        };
+    }
+    if run.samples.is_empty() {
+        return Err(
+            "baseline has benchmark specs but no canonical raw samples; regenerate the v2 baseline"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+struct BaselineTopology<'a> {
+    specs_by_id: HashMap<&'a str, &'a BenchmarkSpec>,
+    summaries_by_id: HashMap<&'a str, &'a BenchmarkSummary>,
+}
+
+impl<'a> BaselineTopology<'a> {
+    fn from_run(run: &'a StressRun) -> Result<Self, String> {
+        let mut specs_by_id = HashMap::new();
+        for spec in &run.benchmark_specs {
+            if specs_by_id.insert(spec.id.as_str(), spec).is_some() {
+                return Err(format!(
+                    "baseline contains duplicate benchmark spec id {:?}",
+                    spec.id
+                ));
+            }
+        }
+
+        let mut summaries_by_id = HashMap::new();
+        for summary in &run.summaries {
+            if summaries_by_id
+                .insert(summary.benchmark_id.as_str(), summary)
+                .is_some()
+            {
+                return Err(format!(
+                    "baseline contains duplicate serialized summary id {:?}",
+                    summary.benchmark_id
+                ));
+            }
+            if !specs_by_id.contains_key(summary.benchmark_id.as_str()) {
+                return Err(format!(
+                    "baseline serialized summary {:?} has no matching benchmark spec",
+                    summary.benchmark_id
+                ));
+            }
+        }
+        if summaries_by_id.len() != specs_by_id.len() {
+            let missing = specs_by_id
+                .keys()
+                .find(|id| !summaries_by_id.contains_key(**id))
+                .copied()
+                .unwrap_or("<unknown>");
+            return Err(format!(
+                "baseline benchmark spec {missing:?} has no serialized summary"
+            ));
+        }
+
+        Ok(Self {
+            specs_by_id,
+            summaries_by_id,
+        })
+    }
+
+    fn validate_samples(
+        &self,
+        samples: &'a [Sample],
+        run_environment: &EnvironmentInfo,
+    ) -> Result<(), String> {
+        let mut sample_numbers = HashSet::new();
+        let mut measured_ids = HashSet::new();
+        let mut sample_parameters = HashMap::<&str, &BTreeMap<String, String>>::new();
+        for sample in samples {
+            let Some(spec) = self.specs_by_id.get(sample.benchmark_id.as_str()).copied() else {
+                return Err(format!(
+                    "baseline raw sample references unknown benchmark id {:?}",
+                    sample.benchmark_id
+                ));
+            };
+            if sample.intent != spec.intent {
+                return Err(format!(
+                    "baseline raw sample intent {:?} does not match benchmark spec intent {:?} for {:?}",
+                    sample.intent, spec.intent, sample.benchmark_id
+                ));
+            }
+            if let Some(reason) =
+                incompatible_environment_reason(&sample.environment, run_environment)
+            {
+                return Err(format!(
+                    "baseline raw sample {} for benchmark id {:?} has an environment incompatible with the run-level environment: {reason}",
+                    sample.sample_number, sample.benchmark_id
+                ));
+            }
+            if let Some(expected) = sample_parameters.get(sample.benchmark_id.as_str()) {
+                if *expected != &sample.parameters {
+                    return Err(format!(
+                        "baseline raw sample {} for benchmark id {:?} changed parameters from {expected:?} to {:?}; every sample for one benchmark must describe the same workload",
+                        sample.sample_number, sample.benchmark_id, sample.parameters
+                    ));
+                }
+            } else {
+                sample_parameters.insert(sample.benchmark_id.as_str(), &sample.parameters);
+            }
+            if !sample_numbers.insert((sample.benchmark_id.as_str(), sample.sample_number)) {
+                return Err(format!(
+                    "baseline contains duplicate sample number {} for benchmark id {:?}",
+                    sample.sample_number, sample.benchmark_id
+                ));
+            }
+            if sample.phase == SamplePhase::Measured {
+                measured_ids.insert(sample.benchmark_id.as_str());
+            }
+        }
+        if let Some(id) = self
+            .specs_by_id
+            .keys()
+            .find(|id| !measured_ids.contains(**id))
+        {
+            return Err(format!(
+                "baseline benchmark spec {id:?} has no measured raw samples"
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn recompute_baseline_summaries(run: &StressRun) -> (Vec<BenchmarkSummary>, Vec<BenchmarkSummary>) {
+    let mut canonical = run
+        .benchmark_specs
+        .iter()
+        .map(|spec| summarize_benchmark(spec, &run.samples))
+        .collect::<Vec<_>>();
+    attach_measurement_mode_mismatch_diagnostics(&mut canonical);
+    let mut legacy = run
+        .benchmark_specs
+        .iter()
+        .map(|spec| {
+            summarize_benchmark_with_latency_estimator(
+                spec,
+                &run.samples,
+                LatencyEstimator::LegacyPooledObservations,
+            )
+        })
+        .collect::<Vec<_>>();
+    attach_measurement_mode_mismatch_diagnostics(&mut legacy);
+    (canonical, legacy)
+}
+
+fn validate_serialized_baseline_summaries(
+    serialized_by_id: &HashMap<&str, &BenchmarkSummary>,
+    canonical: &[BenchmarkSummary],
+    legacy: &[BenchmarkSummary],
+) -> Result<(), String> {
+    for (canonical_summary, legacy_summary) in canonical.iter().zip(legacy) {
+        let serialized = serialized_by_id
+            .get(canonical_summary.benchmark_id.as_str())
+            .copied()
+            .expect("summary topology validated");
+        let expected =
+            expected_serialized_baseline_summary(serialized, canonical_summary, legacy_summary)?;
+        let serialized_value = normalized_summary_for_validation(serialized)?;
+        let expected_value = normalized_summary_for_validation(expected)?;
+        if let Some(difference) =
+            first_json_difference(&serialized_value, &expected_value, "summary")
+        {
+            return Err(format!(
+                "baseline serialized summary {:?} does not match its canonical raw samples and benchmark spec: {difference}",
+                serialized.benchmark_id,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn expected_serialized_baseline_summary<'a>(
+    serialized: &BenchmarkSummary,
+    canonical: &'a BenchmarkSummary,
+    legacy: &'a BenchmarkSummary,
+) -> Result<&'a BenchmarkSummary, String> {
+    let estimator = serialized
+        .metadata
+        .get(LATENCY_ESTIMATOR_METADATA_KEY)
+        .map(String::as_str);
+    match (serialized.primary_metric, estimator) {
+        (PrimaryMetric::LatencyP95, Some(PER_SAMPLE_P95_STUDENT_T_ESTIMATOR)) => Ok(canonical),
+        (PrimaryMetric::LatencyP95, None) => Ok(legacy),
+        (PrimaryMetric::LatencyP95, Some(other)) => Err(format!(
+            "baseline summary {:?} uses unsupported latency estimator {other:?}",
+            serialized.benchmark_id
+        )),
+        (_, None) => Ok(canonical),
+        (_, Some(other)) => Err(format!(
+            "baseline summary {:?} declares latency estimator {other:?} for a non-latency metric",
+            serialized.benchmark_id
+        )),
+    }
+}
+
+fn normalized_summary_for_validation(
+    summary: &BenchmarkSummary,
+) -> Result<serde_json::Value, String> {
+    let mut normalized = summary.clone();
+    normalized.diagnostics.retain(|diagnostic| {
+        !matches!(
+            diagnostic.code.as_str(),
+            "regression" | "baseline_semantics_changed"
+        )
+    });
+    serde_json::to_value(normalized)
+        .map_err(|error| format!("failed to normalize baseline summary: {error}"))
+}
+
+fn first_json_difference(
+    actual: &serde_json::Value,
+    expected: &serde_json::Value,
+    path: &str,
+) -> Option<String> {
+    if actual == expected {
+        return None;
+    }
+    match (actual, expected) {
+        (serde_json::Value::Object(actual), serde_json::Value::Object(expected)) => {
+            let keys = actual
+                .keys()
+                .chain(expected.keys())
+                .collect::<std::collections::BTreeSet<_>>();
+            keys.into_iter().find_map(|key| {
+                let child_path = format!("{path}.{key}");
+                match (actual.get(key), expected.get(key)) {
+                    (Some(actual), Some(expected)) => {
+                        first_json_difference(actual, expected, &child_path)
+                    }
+                    (actual, expected) => {
+                        Some(format!("{child_path} is {actual:?}, expected {expected:?}"))
+                    }
+                }
+            })
+        }
+        (serde_json::Value::Array(actual), serde_json::Value::Array(expected)) => {
+            if actual.len() != expected.len() {
+                return Some(format!(
+                    "{path} has length {}, expected {}",
+                    actual.len(),
+                    expected.len()
+                ));
+            }
+            actual
+                .iter()
+                .zip(expected)
+                .enumerate()
+                .find_map(|(index, (actual, expected))| {
+                    first_json_difference(actual, expected, &format!("{path}[{index}]"))
+                })
+        }
+        (serde_json::Value::Number(actual), serde_json::Value::Number(expected))
+            if json_floats_nearly_equal(actual, expected) =>
+        {
+            None
+        }
+        (serde_json::Value::String(actual), serde_json::Value::String(expected))
+            if diagnostic_evidence_floats_nearly_equal(path, actual, expected) =>
+        {
+            None
+        }
+        _ => Some(format!("{path} is {actual}, expected {expected}")),
+    }
+}
+
+fn json_floats_nearly_equal(actual: &serde_json::Number, expected: &serde_json::Number) -> bool {
+    if !actual.is_f64() || !expected.is_f64() {
+        return false;
+    }
+    let (Some(actual), Some(expected)) = (actual.as_f64(), expected.as_f64()) else {
+        return false;
+    };
+    floats_nearly_equal(actual, expected)
+}
+
+fn diagnostic_evidence_floats_nearly_equal(path: &str, actual: &str, expected: &str) -> bool {
+    if !path.contains(".diagnostics[") || !path.contains("].evidence.") {
+        return false;
+    }
+    let (Ok(actual), Ok(expected)) = (actual.parse::<f64>(), expected.parse::<f64>()) else {
+        return false;
+    };
+    actual.is_finite() && expected.is_finite() && floats_nearly_equal(actual, expected)
+}
+
+fn floats_nearly_equal(actual: f64, expected: f64) -> bool {
+    // Summary statistics combine reductions, division, and square roots. The
+    // same canonical inputs can therefore land a few dozen representable
+    // floats apart across optimized targets while remaining many orders of
+    // magnitude below a meaningful evidence change.
+    const CROSS_PLATFORM_ROUNDING_EPSILONS: f64 = 64.0;
+    let scale = actual.abs().max(expected.abs()).max(1.0);
+    (actual - expected).abs() <= f64::EPSILON * CROSS_PLATFORM_ROUNDING_EPSILONS * scale
 }
 
 pub(crate) fn diagnostic_summary_for_run(
@@ -1185,18 +1664,49 @@ pub(crate) fn diagnostic_summary_for_run(
 /// Summarize one benchmark from raw samples.
 #[must_use]
 pub(crate) fn summarize_benchmark(spec: &BenchmarkSpec, samples: &[Sample]) -> BenchmarkSummary {
-    let measured: Vec<&Sample> = samples
+    summarize_benchmark_with_latency_estimator(spec, samples, LatencyEstimator::PerSampleP95)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LatencyEstimator {
+    PerSampleP95,
+    LegacyPooledObservations,
+}
+
+struct PhaseSamples<'a> {
+    measured: Vec<&'a Sample>,
+    warmup_samples: usize,
+    cooldown_samples: usize,
+}
+
+fn phase_samples<'a>(spec: &BenchmarkSpec, samples: &'a [Sample]) -> PhaseSamples<'a> {
+    let measured = samples
         .iter()
         .filter(|sample| sample.benchmark_id == spec.id && sample.phase == SamplePhase::Measured)
         .collect();
-    let warmup_samples = samples
-        .iter()
-        .filter(|sample| sample.benchmark_id == spec.id && sample.phase == SamplePhase::Warmup)
-        .count();
-    let cooldown_samples = samples
-        .iter()
-        .filter(|sample| sample.benchmark_id == spec.id && sample.phase == SamplePhase::Cooldown)
-        .count();
+    let count_phase = |phase| {
+        samples
+            .iter()
+            .filter(|sample| sample.benchmark_id == spec.id && sample.phase == phase)
+            .count()
+    };
+    PhaseSamples {
+        measured,
+        warmup_samples: count_phase(SamplePhase::Warmup),
+        cooldown_samples: count_phase(SamplePhase::Cooldown),
+    }
+}
+
+fn summarize_benchmark_with_latency_estimator(
+    spec: &BenchmarkSpec,
+    samples: &[Sample],
+    latency_estimator: LatencyEstimator,
+) -> BenchmarkSummary {
+    let PhaseSamples {
+        measured,
+        warmup_samples,
+        cooldown_samples,
+    } = phase_samples(spec, samples);
     let correctness = summarize_correctness(&measured);
     let primary_metric = infer_primary_metric(spec, &measured);
     let ns_per_op = SummaryStats::from_values(&per_op_values(&measured, |sample| {
@@ -1211,8 +1721,14 @@ pub(crate) fn summarize_benchmark(spec: &BenchmarkSpec, samples: &[Sample]) -> B
         SummaryStats::from_values(&per_op_values(&measured, |sample| sample.allocs_per_op));
     let bytes_per_op =
         SummaryStats::from_values(&per_op_values(&measured, |sample| sample.bytes_per_op));
-    let values = primary_values(primary_metric, &measured);
-    let stats = SummaryStats::from_values(&values);
+    let values = primary_values(primary_metric, &measured, latency_estimator);
+    let stats = if primary_metric == PrimaryMetric::LatencyP95
+        && latency_estimator == LatencyEstimator::PerSampleP95
+    {
+        SummaryStats::from_values_with_student_t(&values)
+    } else {
+        SummaryStats::from_values(&values)
+    };
     let wall_clock = SummaryStats::from_values(&wall_clock_values(&measured));
     let completed_operations = completed_operation_stats(&measured);
     let total_wall_clock_ns = samples
@@ -1258,6 +1774,8 @@ pub(crate) fn summarize_benchmark(spec: &BenchmarkSpec, samples: &[Sample]) -> B
         completed_operations.as_ref(),
     );
 
+    let metadata = summary_metadata(spec, primary_metric, latency_estimator);
+
     BenchmarkSummary {
         benchmark_id: spec.id.clone(),
         name: spec.name.clone(),
@@ -1282,8 +1800,31 @@ pub(crate) fn summarize_benchmark(spec: &BenchmarkSpec, samples: &[Sample]) -> B
         diagnostics,
         correctness,
         parameters: merged_parameters(spec, &measured),
-        metadata: spec.metadata.clone(),
+        metadata,
     }
+}
+
+fn summary_metadata(
+    spec: &BenchmarkSpec,
+    primary_metric: PrimaryMetric,
+    latency_estimator: LatencyEstimator,
+) -> BTreeMap<String, String> {
+    let mut metadata = spec.metadata.clone();
+    if primary_metric != PrimaryMetric::LatencyP95 {
+        return metadata;
+    }
+    match latency_estimator {
+        LatencyEstimator::PerSampleP95 => {
+            metadata.insert(
+                LATENCY_ESTIMATOR_METADATA_KEY.to_string(),
+                PER_SAMPLE_P95_STUDENT_T_ESTIMATOR.to_string(),
+            );
+        }
+        LatencyEstimator::LegacyPooledObservations => {
+            metadata.remove(LATENCY_ESTIMATOR_METADATA_KEY);
+        }
+    }
+    metadata
 }
 
 /// Compare current summaries to baseline summaries.
@@ -1293,25 +1834,210 @@ pub(crate) fn compare_summaries(
     baseline: &[BenchmarkSummary],
     threshold: f64,
 ) -> Vec<ComparisonResult> {
-    let by_id: HashMap<&str, &BenchmarkSummary> = baseline
-        .iter()
-        .map(|summary| (summary.benchmark_id.as_str(), summary))
-        .collect();
-    let by_name: HashMap<&str, &BenchmarkSummary> = baseline
-        .iter()
-        .map(|summary| (summary.name.as_str(), summary))
-        .collect();
+    let mut by_id = HashMap::<&str, Vec<&BenchmarkSummary>>::new();
+    for summary in baseline {
+        by_id
+            .entry(summary.benchmark_id.as_str())
+            .or_default()
+            .push(summary);
+    }
 
     current
         .iter()
         .map(|summary| {
-            let baseline_summary = by_id
-                .get(summary.benchmark_id.as_str())
-                .copied()
-                .or_else(|| by_name.get(summary.name.as_str()).copied());
-            compare_one_summary(summary, baseline_summary, threshold)
+            let Some(matches) = by_id.get(summary.benchmark_id.as_str()) else {
+                return compare_one_summary(summary, None, threshold);
+            };
+            if matches.len() != 1 {
+                return rejected_comparison(
+                    summary,
+                    matches.first().copied(),
+                    comparison_threshold(summary, threshold),
+                    format!(
+                        "baseline contains {} rows with exact benchmark id {:?}; comparison requires exactly one",
+                        matches.len(),
+                        summary.benchmark_id
+                    ),
+                );
+            }
+            compare_one_summary(summary, matches.first().copied(), threshold)
         })
         .collect()
+}
+
+/// Compare summaries while also requiring exact concrete benchmark specs.
+#[must_use]
+pub(crate) fn compare_summaries_with_specs(
+    current: &[BenchmarkSummary],
+    current_specs: &[BenchmarkSpec],
+    current_environment: &EnvironmentInfo,
+    baseline: &[BenchmarkSummary],
+    baseline_specs: &[BenchmarkSpec],
+    baseline_environment: &EnvironmentInfo,
+    threshold: f64,
+) -> Vec<ComparisonResult> {
+    let mut comparisons = compare_summaries(current, baseline, threshold);
+    for (summary, comparison) in current.iter().zip(&mut comparisons) {
+        let baseline_matches = baseline
+            .iter()
+            .filter(|candidate| candidate.benchmark_id == summary.benchmark_id)
+            .collect::<Vec<_>>();
+        let [baseline_summary] = baseline_matches.as_slice() else {
+            continue;
+        };
+        let current_spec = unique_comparison_spec(current_specs, &summary.benchmark_id, "current");
+        let baseline_spec =
+            unique_comparison_spec(baseline_specs, &summary.benchmark_id, "baseline");
+        let incompatibility = match (current_spec, baseline_spec) {
+            (Ok(current_spec), Ok(baseline_spec)) if current_spec.mode != baseline_spec.mode => {
+                Some(format!(
+                    "benchmark mode changed from {:?} to {:?}; use a baseline with the identical operation count or duration",
+                    baseline_spec.mode, current_spec.mode
+                ))
+            }
+            (Ok(current_spec), Ok(baseline_spec))
+                if current_spec.parameters != baseline_spec.parameters =>
+            {
+                Some(format!(
+                    "benchmark specification parameters changed from {:?} to {:?}; compare only identical parameter rows",
+                    baseline_spec.parameters, current_spec.parameters
+                ))
+            }
+            (Ok(_), Ok(_)) => None,
+            (Err(reason), _) | (_, Err(reason)) => Some(reason),
+        };
+        if let Some(reason) = incompatibility {
+            *comparison = rejected_comparison(
+                summary,
+                Some(baseline_summary),
+                comparison_threshold(summary, threshold),
+                reason,
+            );
+        }
+    }
+    if let Some(reason) = incompatible_environment_reason(current_environment, baseline_environment)
+    {
+        for (summary, comparison) in current.iter().zip(&mut comparisons) {
+            let baseline_summary = baseline
+                .iter()
+                .find(|candidate| candidate.benchmark_id == summary.benchmark_id);
+            *comparison = rejected_comparison(
+                summary,
+                baseline_summary,
+                comparison_threshold(summary, threshold),
+                reason.clone(),
+            );
+        }
+    }
+    comparisons
+}
+
+fn incompatible_environment_reason(
+    current: &EnvironmentInfo,
+    baseline: &EnvironmentInfo,
+) -> Option<String> {
+    let mismatches = [
+        (
+            "CPU model",
+            current.cpu_model.as_str(),
+            baseline.cpu_model.as_str(),
+        ),
+        ("OS/architecture", current.os.as_str(), baseline.os.as_str()),
+        (
+            "allocator",
+            current.allocator.as_str(),
+            baseline.allocator.as_str(),
+        ),
+        (
+            "build profile/input identity",
+            current.build_profile.as_str(),
+            baseline.build_profile.as_str(),
+        ),
+        (
+            "rustc version",
+            current.rustc_version.as_str(),
+            baseline.rustc_version.as_str(),
+        ),
+        (
+            "cntryl-stress version",
+            current.tool_version.as_str(),
+            baseline.tool_version.as_str(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(field, current, baseline)| {
+        required_environment_difference(field, current, baseline)
+    })
+    .collect::<Vec<_>>();
+    let mut mismatches = mismatches;
+    if let Some(difference) =
+        required_core_count_difference(current.core_count, baseline.core_count)
+    {
+        mismatches.push(difference);
+    }
+
+    (!mismatches.is_empty()).then(|| {
+        format!(
+            "baseline environment is incompatible with the current run: {}; compare only runs with known, matching CPU, core count, OS/architecture, allocator, build profile/input identity, rustc version, and cntryl-stress version",
+            mismatches.join("; ")
+        )
+    })
+}
+
+fn required_environment_difference(field: &str, current: &str, baseline: &str) -> Option<String> {
+    match (
+        known_environment_value(current),
+        known_environment_value(baseline),
+    ) {
+        (Some(current), Some(baseline)) if current == baseline => None,
+        (Some(current), Some(baseline)) => Some(format!(
+            "{field} differs (baseline {baseline:?}, current {current:?})"
+        )),
+        (None, None) => Some(format!("{field} is unknown in both runs")),
+        (None, Some(_)) => Some(format!("{field} is unknown in the current run")),
+        (Some(_), None) => Some(format!("{field} is unknown in the baseline")),
+    }
+}
+
+fn required_core_count_difference(
+    current: Option<usize>,
+    baseline: Option<usize>,
+) -> Option<String> {
+    match (current, baseline) {
+        (Some(current), Some(baseline)) if current == baseline => None,
+        (Some(current), Some(baseline)) => Some(format!(
+            "logical core count differs (baseline {baseline}, current {current})"
+        )),
+        (None, None) => Some("logical core count is unknown in both runs".to_string()),
+        (None, Some(_)) => Some("logical core count is unknown in the current run".to_string()),
+        (Some(_), None) => Some("logical core count is unknown in the baseline".to_string()),
+    }
+}
+
+fn known_environment_value(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty() && !value.eq_ignore_ascii_case("unknown")).then_some(value)
+}
+
+fn unique_comparison_spec<'a>(
+    specs: &'a [BenchmarkSpec],
+    benchmark_id: &str,
+    artifact: &str,
+) -> Result<&'a BenchmarkSpec, String> {
+    let matches = specs
+        .iter()
+        .filter(|spec| spec.id == benchmark_id)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [spec] => Ok(spec),
+        [] => Err(format!(
+            "{artifact} benchmark specification is missing for exact benchmark id {benchmark_id:?}"
+        )),
+        _ => Err(format!(
+            "{artifact} artifact contains {} benchmark specifications for exact benchmark id {benchmark_id:?}; comparison requires exactly one",
+            matches.len()
+        )),
+    }
 }
 
 /// Add regression diagnostics to summaries after baseline comparison.
@@ -1350,7 +2076,10 @@ pub(crate) fn attach_regression_diagnostics(
     }
 
     for comparison in comparisons.iter().filter(|comparison| {
-        comparison.classification == ComparisonClass::Inconclusive && comparison.reason.is_some()
+        matches!(
+            comparison.classification,
+            ComparisonClass::Inconclusive | ComparisonClass::MissingBaseline
+        ) && comparison.reason.is_some()
     }) {
         let Some(summary) = summaries
             .iter_mut()
@@ -1433,10 +2162,7 @@ fn compare_one_summary(
     baseline: Option<&BenchmarkSummary>,
     threshold: f64,
 ) -> ComparisonResult {
-    let threshold = current
-        .budgets
-        .max_regression_pct
-        .map_or(threshold, |pct| pct / 100.0);
+    let threshold = comparison_threshold(current, threshold);
     let Some(baseline) = baseline else {
         return ComparisonResult {
             benchmark_id: current.benchmark_id.clone(),
@@ -1449,29 +2175,20 @@ fn compare_one_summary(
             threshold,
             confidence_intervals_overlap: None,
             classification: ComparisonClass::MissingBaseline,
-            reason: None,
+            reason: Some(format!(
+                "no baseline row has exact benchmark id {:?}",
+                current.benchmark_id
+            )),
         };
     };
+    if let Some(reason) = baseline_incompatibility_reason(current, baseline) {
+        return rejected_comparison(current, Some(baseline), threshold, reason);
+    }
     let baseline_value = baseline.primary_value();
     let current_value = current.primary_value();
     let change_percent = baseline_value
         .zip(current_value)
         .map(|(base, current)| ((current / base) - 1.0) * 100.0);
-    if let Some(reason) = ns_per_op_basis_change_reason(current, baseline) {
-        return ComparisonResult {
-            benchmark_id: current.benchmark_id.clone(),
-            current_quality: current.quality,
-            baseline_quality: Some(baseline.quality),
-            primary_metric: current.primary_metric,
-            baseline_value,
-            current_value,
-            change_percent,
-            threshold,
-            confidence_intervals_overlap: None,
-            classification: ComparisonClass::Inconclusive,
-            reason: Some(reason),
-        };
-    }
     let confidence_intervals_overlap =
         baseline
             .stats
@@ -1502,6 +2219,103 @@ fn compare_one_summary(
         classification,
         reason: None,
     }
+}
+
+fn comparison_threshold(current: &BenchmarkSummary, default_threshold: f64) -> f64 {
+    current
+        .budgets
+        .max_regression_pct
+        .map_or(default_threshold, |pct| pct / 100.0)
+}
+
+fn rejected_comparison(
+    current: &BenchmarkSummary,
+    baseline: Option<&BenchmarkSummary>,
+    threshold: f64,
+    reason: String,
+) -> ComparisonResult {
+    ComparisonResult {
+        benchmark_id: current.benchmark_id.clone(),
+        current_quality: current.quality,
+        baseline_quality: baseline.map(|summary| summary.quality),
+        primary_metric: current.primary_metric,
+        baseline_value: baseline.and_then(BenchmarkSummary::primary_value),
+        current_value: current.primary_value(),
+        change_percent: None,
+        threshold,
+        confidence_intervals_overlap: None,
+        classification: ComparisonClass::Inconclusive,
+        reason: Some(reason),
+    }
+}
+
+fn baseline_incompatibility_reason(
+    current: &BenchmarkSummary,
+    baseline: &BenchmarkSummary,
+) -> Option<String> {
+    if current.primary_metric != baseline.primary_metric {
+        return Some(format!(
+            "primary metric changed from {:?} to {:?}; use a baseline with identical measurement semantics",
+            baseline.primary_metric, current.primary_metric
+        ));
+    }
+    if current.tier != baseline.tier {
+        return Some(format!(
+            "tier changed from {} to {}; use a baseline from the same tier",
+            baseline.tier, current.tier
+        ));
+    }
+    let current_mode = measurement_mode(current);
+    let baseline_mode = measurement_mode(baseline);
+    if current_mode != baseline_mode {
+        return Some(format!(
+            "measurement mode changed from {baseline_mode} to {current_mode}; use a baseline with the same mode"
+        ));
+    }
+    if current.intent != baseline.intent {
+        return Some(format!(
+            "measurement intent changed from {} to {}; use a baseline with the same intent",
+            baseline.intent, current.intent
+        ));
+    }
+    let current_unit = current.parameters.get("logical_unit");
+    let baseline_unit = baseline.parameters.get("logical_unit");
+    if current_unit != baseline_unit {
+        return Some(format!(
+            "logical unit changed from {} to {}; use a baseline normalized to the same unit",
+            baseline_unit.map_or("<unset>", String::as_str),
+            current_unit.map_or("<unset>", String::as_str)
+        ));
+    }
+    let current_normalization = normalization_basis_from_parameters(&current.parameters);
+    let baseline_normalization = normalization_basis_from_parameters(&baseline.parameters);
+    if current_normalization != baseline_normalization {
+        return Some(format!(
+            "logical unit normalization changed from {baseline_normalization:?} to {current_normalization:?}; use an identically normalized baseline"
+        ));
+    }
+    if current.parameters != baseline.parameters {
+        return Some(format!(
+            "parameters changed from {:?} to {:?}; compare only identical parameter rows",
+            baseline.parameters, current.parameters
+        ));
+    }
+    if let Some(reason) = ns_per_op_basis_change_reason(current, baseline) {
+        return Some(reason);
+    }
+    if !baseline.is_gate() {
+        return Some(format!(
+            "baseline trust is {}; regression gates require a gate-trusted baseline",
+            baseline.trust_class
+        ));
+    }
+    if quality_rank(baseline.quality) < quality_rank(QualityClass::Acceptable) {
+        return Some(format!(
+            "baseline quality is {}; regression gates require at least acceptable quality",
+            baseline.quality
+        ));
+    }
+    None
 }
 
 fn ns_per_op_basis_change_reason(
@@ -1615,18 +2429,42 @@ fn infer_primary_metric(spec: &BenchmarkSpec, samples: &[&Sample]) -> PrimaryMet
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn primary_values(metric: PrimaryMetric, samples: &[&Sample]) -> Vec<f64> {
+fn primary_values(
+    metric: PrimaryMetric,
+    samples: &[&Sample],
+    latency_estimator: LatencyEstimator,
+) -> Vec<f64> {
     match metric {
         PrimaryMetric::Throughput => samples.iter().map(|sample| sample.throughput).collect(),
-        PrimaryMetric::LatencyP95 => samples
-            .iter()
-            .flat_map(|sample| sample.latency_ns.iter().map(|latency| *latency as f64))
-            .collect(),
+        PrimaryMetric::LatencyP95 => match latency_estimator {
+            LatencyEstimator::PerSampleP95 => samples
+                .iter()
+                .filter_map(|sample| latency_percentile(sample, 0.95))
+                .collect(),
+            LatencyEstimator::LegacyPooledObservations => samples
+                .iter()
+                .flat_map(|sample| sample.latency_ns.iter().map(|latency| *latency as f64))
+                .collect(),
+        },
         PrimaryMetric::NsPerOp => samples
             .iter()
             .filter_map(|sample| sample.net_ns_per_op.or_else(|| elapsed_ns_per_op(sample)))
             .collect(),
     }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn latency_percentile(sample: &Sample, quantile: f64) -> Option<f64> {
+    let mut values = sample
+        .latency_ns
+        .iter()
+        .map(|latency| *latency as f64)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    Some(percentile_sorted(&values, quantile))
 }
 
 fn per_op_values<F>(samples: &[&Sample], mut value_for: F) -> Vec<f64>
@@ -1846,7 +2684,7 @@ fn summary_diagnostics(input: DiagnosticInputs<'_>) -> Vec<BenchmarkDiagnostic> 
             vec!["Inspect the failing budget, then either reduce measured cost or intentionally update the budget.".to_string()],
         ));
     }
-    if high_allocation_stats(allocs_per_op, bytes_per_op) {
+    if has_unbudgeted_high_allocations(spec, allocs_per_op, bytes_per_op) {
         diagnostics.push(diagnostic_with_evidence(
             "high_allocations",
             high_allocation_severity(spec),
@@ -1866,7 +2704,7 @@ fn summary_diagnostics(input: DiagnosticInputs<'_>) -> Vec<BenchmarkDiagnostic> 
                     .map(|stats| stats.mean.to_string())
                     .unwrap_or_default(),
             )],
-            ["Vary inputs, accumulate observable outputs, and use validated_micro=true only after anti-DCE is explicit."],
+            ["Vary inputs, accumulate observable outputs, and use #[stress(metadata(validated_micro = \"true\"))] only after anti-DCE is explicit."],
         ));
     } else if should_flag_tiny_micro_timing(spec, ns_per_op) {
         diagnostics.push(diagnostic(
@@ -1879,7 +2717,7 @@ fn summary_diagnostics(input: DiagnosticInputs<'_>) -> Vec<BenchmarkDiagnostic> 
                     .map(|stats| stats.mean.to_string())
                     .unwrap_or_default(),
             )],
-            ["Batch more logical work per sample, or keep the row as a validated diagnostic with an explicit trust_class downgrade."],
+            ["Batch more logical work per sample, or declare role = \"diagnostic\" after validating the microbenchmark shape."],
         ));
     }
     if batch_unit_ambiguous(spec) {
@@ -2179,12 +3017,14 @@ fn budget_failure_evidence(budget_results: &[BudgetResult]) -> BTreeMap<String, 
         .collect()
 }
 
-fn high_allocation_stats(
+fn has_unbudgeted_high_allocations(
+    spec: &BenchmarkSpec,
     allocs_per_op: Option<&SummaryStats>,
     bytes_per_op: Option<&SummaryStats>,
 ) -> bool {
-    allocs_per_op.is_some_and(|stats| stats.mean > 0.0)
-        || bytes_per_op.is_some_and(|stats| stats.mean > 0.0)
+    spec.budgets.max_allocs_per_op.is_none() && allocs_per_op.is_some_and(|stats| stats.mean > 0.0)
+        || spec.budgets.max_bytes_per_op.is_none()
+            && bytes_per_op.is_some_and(|stats| stats.mean > 0.0)
 }
 
 fn high_allocation_severity(spec: &BenchmarkSpec) -> DiagnosticSeverity {
@@ -2313,11 +3153,16 @@ fn flat_or_capped_throughput(
     wall_clock: Option<&SummaryStats>,
     samples: &[&Sample],
 ) -> bool {
-    measurement_mode_for_spec(spec) == MeasurementMode::Duration
+    samples.len() >= 3
+        && measurement_mode_for_spec(spec) == MeasurementMode::Duration
         && infer_primary_metric(spec, samples) == PrimaryMetric::Throughput
         && stats.is_some_and(|stats| stats.relative_std_dev <= 0.02)
         && wall_clock.is_some_and(|stats| stats.relative_std_dev <= 0.02)
-        && completed_operation_stats(samples).is_some_and(|stats| stats.relative_std_dev <= 0.005)
+        && samples.split_first().is_some_and(|(first, remaining)| {
+            remaining
+                .iter()
+                .all(|sample| sample.operations_completed == first.operations_completed)
+        })
 }
 
 fn flat_or_capped_throughput_evidence(
@@ -2488,7 +3333,7 @@ fn derive_trust_class_inner(
         || diagnostics.iter().any(|diagnostic| {
             matches!(
                 diagnostic.code.as_str(),
-                "tiny_micro_timing" | "flat_or_capped_throughput" | "high_variance"
+                "tiny_micro_timing" | "too_fast" | "flat_or_capped_throughput" | "high_variance"
             )
         })
     {
@@ -2533,7 +3378,7 @@ fn derive_trust_class_inner_from_summary(summary: &BenchmarkSummary) -> TrustCla
         || summary.diagnostics.iter().any(|diagnostic| {
             matches!(
                 diagnostic.code.as_str(),
-                "tiny_micro_timing" | "flat_or_capped_throughput" | "high_variance"
+                "tiny_micro_timing" | "too_fast" | "flat_or_capped_throughput" | "high_variance"
             )
         })
     {
@@ -2562,9 +3407,13 @@ fn blocking_trust_diagnostic(code: &str) -> bool {
 }
 
 fn apply_trust_class_override(override_value: Option<&String>, derived: TrustClass) -> TrustClass {
-    override_value
-        .and_then(|value| value.parse::<TrustClass>().ok())
-        .map_or(derived, |override_class| derived.min(override_class))
+    override_value.map_or(derived, |value| {
+        value
+            .parse::<TrustClass>()
+            .map_or(TrustClass::Invalid, |override_class| {
+                derived.min(override_class)
+            })
+    })
 }
 
 fn classify_quality(
@@ -2662,7 +3511,18 @@ mod tests {
     use super::*;
 
     fn test_env() -> EnvironmentInfo {
-        EnvironmentInfo::unknown(ProfileConfig::default())
+        EnvironmentInfo {
+            cpu_model: "test cpu".to_string(),
+            core_count: Some(4),
+            os: "test-os test-arch".to_string(),
+            rustc_version: "rustc test".to_string(),
+            allocator: "test allocator".to_string(),
+            build_profile: "release".to_string(),
+            git_commit: None,
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
+            command_line: Vec::new(),
+            profile_config: ProfileConfig::default(),
+        }
     }
 
     fn spec(id: &str) -> BenchmarkSpec {
@@ -2837,7 +3697,7 @@ mod tests {
     }
 
     #[test]
-    fn latency_primary_metric_uses_raw_latency_samples() {
+    fn latency_primary_metric_uses_per_sample_p95_estimates() {
         let mut spec = spec("latency");
         spec.metadata
             .insert("primary_metric".to_string(), "latency".to_string());
@@ -2849,9 +3709,86 @@ mod tests {
         let summary = summarize_benchmark(&spec, &[s, s2]);
 
         assert_eq!(summary.primary_metric, PrimaryMetric::LatencyP95);
-        assert_close(summary.stats.as_ref().expect("stats").p50, 101.0);
-        assert_close(summary.stats.as_ref().expect("stats").p95, 190.0);
-        assert_close(summary.stats.as_ref().expect("stats").p99, 198.0);
+        assert_close(summary.stats.as_ref().expect("stats").mean, 145.0);
+        assert_close(summary.primary_value().expect("primary value"), 145.0);
+        assert!(
+            summary
+                .stats
+                .as_ref()
+                .expect("stats")
+                .confidence_interval_95
+                .lower
+                < 95.0
+        );
+        assert!(
+            summary
+                .stats
+                .as_ref()
+                .expect("stats")
+                .confidence_interval_95
+                .upper
+                > 195.0
+        );
+    }
+
+    #[test]
+    fn latency_observation_count_does_not_narrow_the_p95_interval() {
+        fn latency_summary(observations_per_sample: usize) -> BenchmarkSummary {
+            let mut spec = spec("latency");
+            spec.metadata
+                .insert("primary_metric".to_string(), "latency".to_string());
+            let samples = [90_u128, 95, 100, 105, 110]
+                .into_iter()
+                .enumerate()
+                .map(|(index, latency)| {
+                    let mut sample = sample("latency", SamplePhase::Measured, index, 1_000_000);
+                    sample.latency_ns = vec![latency; observations_per_sample];
+                    sample
+                })
+                .collect::<Vec<_>>();
+            summarize_benchmark(&spec, &samples)
+        }
+
+        let sparse = latency_summary(1);
+        let dense = latency_summary(1_000);
+        let sparse_interval = sparse.stats.expect("sparse stats").confidence_interval_95;
+        let dense_interval = dense.stats.expect("dense stats").confidence_interval_95;
+
+        assert_eq!(sparse.quality, QualityClass::Acceptable);
+        assert_eq!(dense.quality, QualityClass::Acceptable);
+        assert_close(sparse_interval.lower, dense_interval.lower);
+        assert_close(sparse_interval.upper, dense_interval.upper);
+        assert!(dense_interval.upper - dense_interval.lower > 15.0);
+    }
+
+    #[test]
+    fn dense_latency_observations_cannot_create_a_spurious_regression() {
+        fn latency_summary(id: &str, estimates: [u128; 5]) -> BenchmarkSummary {
+            let mut spec = spec(id);
+            spec.metadata
+                .insert("primary_metric".to_string(), "latency".to_string());
+            let samples = estimates
+                .into_iter()
+                .enumerate()
+                .map(|(index, latency)| {
+                    let mut sample = sample(id, SamplePhase::Measured, index, 1_000_000);
+                    sample.latency_ns = vec![latency; 1_000];
+                    sample
+                })
+                .collect::<Vec<_>>();
+            summarize_benchmark(&spec, &samples)
+        }
+
+        let baseline = latency_summary("latency", [90, 95, 100, 105, 110]);
+        let current = latency_summary("latency", [102, 107, 112, 117, 122]);
+        let comparison = compare_summaries(&[current], &[baseline], 0.05)
+            .into_iter()
+            .next()
+            .expect("comparison");
+
+        assert_eq!(comparison.classification, ComparisonClass::Inconclusive);
+        assert_eq!(comparison.confidence_intervals_overlap, Some(true));
+        assert_eq!(comparison.reason, None);
     }
 
     #[test]
@@ -2961,6 +3898,23 @@ mod tests {
     }
 
     #[test]
+    fn sub_microsecond_non_micro_samples_cannot_remain_gate_trusted() {
+        let spec = spec("too-fast");
+        let samples = (0..5)
+            .map(|i| sample("too-fast", SamplePhase::Measured, i, 100 + i as u128))
+            .collect::<Vec<_>>();
+
+        let summary = summarize_benchmark(&spec, &samples);
+
+        assert!(summary
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "too_fast"));
+        assert_eq!(summary.trust_class, TrustClass::Diagnostic);
+        assert!(!summary.is_gate());
+    }
+
+    #[test]
     fn failed_absolute_budget_makes_summary_untrustworthy() {
         let mut spec = micro_spec("budgeted");
         spec.budgets.max_ns_per_op = Some(10.0);
@@ -2977,6 +3931,31 @@ mod tests {
             .any(|diagnostic| diagnostic.code == "budget_failure"));
         assert_eq!(summary.budget_results.len(), 1);
         assert!(!summary.budget_results[0].passed);
+    }
+
+    #[test]
+    fn passing_explicit_allocation_budgets_do_not_emit_an_allocation_warning() {
+        let mut spec = spec("budgeted-allocation");
+        spec.budgets.max_allocs_per_op = Some(2.0);
+        spec.budgets.max_bytes_per_op = Some(64.0);
+        let samples = (0..5)
+            .map(|sample_number| {
+                let mut sample = completed_sample("budgeted-allocation", sample_number, 100_000, 1);
+                sample.allocs = Some(1);
+                sample.bytes = Some(32);
+                sample.allocs_per_op = Some(1.0);
+                sample.bytes_per_op = Some(32.0);
+                sample
+            })
+            .collect::<Vec<_>>();
+
+        let summary = summarize_benchmark(&spec, &samples);
+
+        assert!(summary.budget_results.iter().all(|result| result.passed));
+        assert!(!summary
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "high_allocations"));
     }
 
     #[test]
@@ -3056,6 +4035,44 @@ mod tests {
     }
 
     #[test]
+    fn stable_duration_throughput_with_varying_work_remains_gate_trusted() {
+        let spec = tier3_spec("stable-throughput");
+        let samples = [1_000_000, 1_001_000, 999_000, 1_002_000, 998_000]
+            .into_iter()
+            .enumerate()
+            .map(|(sample_number, completed)| {
+                completed_sample("stable-throughput", sample_number, 100_000_000, completed)
+            })
+            .collect::<Vec<_>>();
+
+        let summary = summarize_benchmark(&spec, &samples);
+
+        assert_eq!(summary.trust_class, TrustClass::Gate);
+        assert!(!summary
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "flat_or_capped_throughput"));
+    }
+
+    #[test]
+    fn one_sample_smoke_evidence_is_not_labeled_as_capped_throughput() {
+        let spec = tier3_spec("smoke-throughput");
+        let samples = vec![completed_sample(
+            "smoke-throughput",
+            0,
+            100_000_000,
+            1_000_000,
+        )];
+
+        let summary = summarize_benchmark(&spec, &samples);
+
+        assert!(!summary
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "flat_or_capped_throughput"));
+    }
+
+    #[test]
     fn trust_class_override_can_downgrade_but_not_promote() {
         let mut downgrade_spec = spec("downgrade");
         downgrade_spec
@@ -3087,11 +4104,30 @@ mod tests {
     }
 
     #[test]
+    fn malformed_serialized_trust_class_fails_closed() {
+        let mut malformed_spec = spec("malformed-role");
+        malformed_spec
+            .metadata
+            .insert("trust_class".to_string(), "gatte".to_string());
+
+        let summary = summarize_benchmark(
+            &malformed_spec,
+            &(0..5)
+                .map(|i| sample("malformed-role", SamplePhase::Measured, i, 100 + i as u128))
+                .collect::<Vec<_>>(),
+        );
+
+        assert_eq!(summary.trust_class, TrustClass::Invalid);
+        assert_eq!(summary.intended_trust_class(), TrustClass::Invalid);
+        assert!(!summary.is_intended_gate());
+    }
+
+    #[test]
     fn run_filters_quality_and_regressions_by_gate_trust() {
         let gate = summarize_benchmark(
             &spec("gate"),
             &(0..5)
-                .map(|i| sample("gate", SamplePhase::Measured, i, 100 + i as u128))
+                .map(|i| sample("gate", SamplePhase::Measured, i, 100_000 + i as u128))
                 .collect::<Vec<_>>(),
         );
         let mut diagnostic = summarize_benchmark(
@@ -3103,6 +4139,9 @@ mod tests {
             ],
         );
         diagnostic.trust_class = TrustClass::Diagnostic;
+        diagnostic
+            .metadata
+            .insert("trust_class".to_string(), "diagnostic".to_string());
 
         let mut run = StressRun {
             schema_version: SCHEMA_VERSION.to_string(),
@@ -3240,13 +4279,13 @@ mod tests {
         let mut baseline = summarize_benchmark(
             &spec("bench"),
             &(0..10)
-                .map(|i| sample("bench", SamplePhase::Measured, i, 100 + i as u128))
+                .map(|i| sample("bench", SamplePhase::Measured, i, 100_000 + i as u128))
                 .collect::<Vec<_>>(),
         );
         let mut current = summarize_benchmark(
             &spec("bench"),
             &(0..10)
-                .map(|i| sample("bench", SamplePhase::Measured, i, 200 + i as u128))
+                .map(|i| sample("bench", SamplePhase::Measured, i, 200_000 + i as u128))
                 .collect::<Vec<_>>(),
         );
 
@@ -3283,6 +4322,164 @@ mod tests {
             compare_summaries(&[current], &[baseline], 0.05)[0].classification,
             ComparisonClass::Inconclusive
         );
+    }
+
+    #[test]
+    fn comparison_matches_baselines_by_exact_id_only() {
+        let current = summarize_benchmark(
+            &spec("current-id"),
+            &(0..10)
+                .map(|i| sample("current-id", SamplePhase::Measured, i, 200 + i as u128))
+                .collect::<Vec<_>>(),
+        );
+        let mut baseline = summarize_benchmark(
+            &spec("baseline-id"),
+            &(0..10)
+                .map(|i| sample("baseline-id", SamplePhase::Measured, i, 100 + i as u128))
+                .collect::<Vec<_>>(),
+        );
+        baseline.name.clone_from(&current.name);
+
+        let comparison = compare_summaries(&[current], &[baseline], 0.05)
+            .into_iter()
+            .next()
+            .expect("comparison");
+
+        assert_eq!(comparison.classification, ComparisonClass::MissingBaseline);
+        assert_eq!(comparison.baseline_value, None);
+        assert!(comparison
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("exact benchmark id")));
+    }
+
+    #[test]
+    fn comparison_rejects_incompatible_semantics_before_computing_a_delta() {
+        let current = summarize_benchmark(
+            &spec("bench"),
+            &(0..10)
+                .map(|i| sample("bench", SamplePhase::Measured, i, 200_000 + i as u128))
+                .collect::<Vec<_>>(),
+        );
+        let baseline = summarize_benchmark(
+            &spec("bench"),
+            &(0..10)
+                .map(|i| sample("bench", SamplePhase::Measured, i, 100_000 + i as u128))
+                .collect::<Vec<_>>(),
+        );
+
+        let mut cases = Vec::new();
+
+        let mut metric = baseline.clone();
+        metric.primary_metric = PrimaryMetric::LatencyP95;
+        cases.push(("primary metric", metric));
+
+        let mut tier = baseline.clone();
+        tier.tier = 3;
+        cases.push(("tier", tier));
+
+        let mut mode = baseline.clone();
+        mode.parameters
+            .insert("measurement_mode".to_string(), "duration".to_string());
+        cases.push(("measurement mode", mode));
+
+        let mut unit = baseline.clone();
+        unit.parameters
+            .insert("logical_unit".to_string(), "request".to_string());
+        cases.push(("logical unit", unit));
+
+        let mut parameters = baseline.clone();
+        parameters
+            .parameters
+            .insert("clients".to_string(), "2".to_string());
+        cases.push(("parameters", parameters));
+
+        let mut weak_quality = baseline.clone();
+        weak_quality.quality = QualityClass::Noisy;
+        cases.push(("baseline quality", weak_quality));
+
+        let mut weak_trust = baseline;
+        weak_trust.trust_class = TrustClass::Diagnostic;
+        cases.push(("baseline trust", weak_trust));
+
+        for (expected_reason, incompatible_baseline) in cases {
+            let comparison = compare_summaries(
+                std::slice::from_ref(&current),
+                &[incompatible_baseline],
+                0.05,
+            )
+            .into_iter()
+            .next()
+            .expect("comparison");
+
+            assert_eq!(comparison.classification, ComparisonClass::Inconclusive);
+            assert_eq!(comparison.change_percent, None);
+            assert!(
+                comparison
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains(expected_reason)),
+                "expected incompatibility reason containing {expected_reason:?}, got {:?}",
+                comparison.reason
+            );
+        }
+    }
+
+    #[test]
+    fn comparison_rejects_concrete_benchmark_mode_changes() {
+        let mut current_spec = spec("bench");
+        current_spec.mode = BenchmarkMode::FixedOperations {
+            operations_per_sample: 2,
+        };
+        let baseline_spec = spec("bench");
+        let current = summarize_benchmark(
+            &current_spec,
+            &(0..10)
+                .map(|i| sample("bench", SamplePhase::Measured, i, 200 + i as u128))
+                .collect::<Vec<_>>(),
+        );
+        let baseline = summarize_benchmark(
+            &baseline_spec,
+            &(0..10)
+                .map(|i| sample("bench", SamplePhase::Measured, i, 100 + i as u128))
+                .collect::<Vec<_>>(),
+        );
+
+        let comparison = compare_summaries_with_specs(
+            &[current],
+            &[current_spec],
+            &test_env(),
+            &[baseline],
+            &[baseline_spec],
+            &test_env(),
+            0.05,
+        )
+        .into_iter()
+        .next()
+        .expect("comparison");
+
+        assert_eq!(comparison.classification, ComparisonClass::Inconclusive);
+        assert_eq!(comparison.change_percent, None);
+        assert!(comparison
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("benchmark mode changed")));
+    }
+
+    #[test]
+    fn comparison_rejects_unknown_or_changed_required_environment_identity() {
+        let known = test_env();
+        let mut changed_cores = known.clone();
+        changed_cores.core_count = Some(8);
+        let core_reason = incompatible_environment_reason(&known, &changed_cores)
+            .expect("different core counts are incompatible");
+        assert!(core_reason.contains("logical core count differs"));
+
+        let mut unknown_cpu = known.clone();
+        unknown_cpu.cpu_model = "unknown".to_string();
+        let unknown_reason = incompatible_environment_reason(&unknown_cpu, &known)
+            .expect("unknown required environment identity is incompatible");
+        assert!(unknown_reason.contains("CPU model is unknown in the current run"));
     }
 
     #[test]
@@ -3363,13 +4560,13 @@ mod tests {
         let mut baseline = summarize_benchmark(
             &spec("bench"),
             &(0..10)
-                .map(|i| sample("bench", SamplePhase::Measured, i, 200 + i as u128))
+                .map(|i| sample("bench", SamplePhase::Measured, i, 200_000 + i as u128))
                 .collect::<Vec<_>>(),
         );
         let mut current = summarize_benchmark(
             &spec("bench"),
             &(0..10)
-                .map(|i| sample("bench", SamplePhase::Measured, i, 100 + i as u128))
+                .map(|i| sample("bench", SamplePhase::Measured, i, 100_000 + i as u128))
                 .collect::<Vec<_>>(),
         );
         baseline
@@ -3418,6 +4615,86 @@ mod tests {
 
         assert_eq!(json["schema_version"], SCHEMA_VERSION);
         assert_eq!(json["samples"].as_array().expect("samples").len(), 0);
+    }
+
+    #[test]
+    fn checked_in_json_schema_matches_the_runtime_version() {
+        let schema = serde_json::from_str::<serde_json::Value>(ARTIFACT_JSON_SCHEMA)
+            .expect("artifact JSON Schema is valid JSON");
+
+        assert_eq!(
+            schema["properties"]["schema_version"]["const"],
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            schema["$schema"],
+            "https://json-schema.org/draft/2020-12/schema"
+        );
+        let top_level_required = schema["required"]
+            .as_array()
+            .expect("top-level required fields");
+        assert!(!top_level_required
+            .iter()
+            .any(|field| field == "diagnostics_summary"));
+        let profile_required = schema["$defs"]["profileConfig"]["required"]
+            .as_array()
+            .expect("profile required fields");
+        assert!(!profile_required
+            .iter()
+            .any(|field| field == "console_names" || field == "progress"));
+    }
+
+    #[test]
+    fn canonical_diff_tolerates_only_round_trip_numeric_diagnostic_evidence() {
+        let actual = serde_json::Value::String("1.8148496747016907".to_string());
+        let expected = serde_json::Value::String("1.814849674701691".to_string());
+
+        assert_eq!(
+            first_json_difference(
+                &actual,
+                &expected,
+                "summary.diagnostics[1].evidence.mean_ns_per_op",
+            ),
+            None,
+        );
+        assert!(
+            first_json_difference(&actual, &expected, "summary.parameters.logical_unit",).is_some()
+        );
+
+        let actual = serde_json::Value::String("fixed operations".to_string());
+        let expected = serde_json::Value::String("fixed duration".to_string());
+        assert!(first_json_difference(
+            &actual,
+            &expected,
+            "summary.diagnostics[0].evidence.measurement_mode",
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn canonical_diff_tolerates_cross_platform_summary_float_roundoff_only() {
+        let linux = serde_json::json!(11.504_349_562_202_778);
+        let recomputed = serde_json::json!(11.504_349_562_202_858);
+
+        assert_eq!(
+            first_json_difference(&linux, &recomputed, "summary.stats.std_dev"),
+            None,
+        );
+
+        let tampered = serde_json::json!(11.504_350_562_202_858);
+        assert!(first_json_difference(&tampered, &recomputed, "summary.stats.std_dev").is_some());
+        assert!(first_json_difference(
+            &serde_json::json!(11),
+            &serde_json::json!(12),
+            "summary.correctness.attempted",
+        )
+        .is_some());
+        assert!(first_json_difference(
+            &serde_json::json!("11.504349562202778"),
+            &serde_json::json!("11.504349562202858"),
+            "summary.stats.std_dev",
+        )
+        .is_some());
     }
 
     #[test]
@@ -3490,6 +4767,203 @@ mod tests {
             ConsoleNameMode::Compact
         );
         assert!(parsed.environment.profile_config.progress);
+    }
+
+    #[test]
+    fn canonical_baseline_accepts_verified_legacy_pooled_latency_but_recomputes_it() {
+        let mut spec = spec("latency");
+        spec.metadata
+            .insert("primary_metric".to_string(), "latency".to_string());
+        let samples = [90_u128, 95, 100, 105, 110]
+            .into_iter()
+            .enumerate()
+            .map(|(index, latency)| {
+                let mut sample = sample("latency", SamplePhase::Measured, index, 1_000_000);
+                sample.latency_ns = vec![latency; 100];
+                sample
+            })
+            .collect::<Vec<_>>();
+        let legacy_summary = summarize_benchmark_with_latency_estimator(
+            &spec,
+            &samples,
+            LatencyEstimator::LegacyPooledObservations,
+        );
+        assert_eq!(legacy_summary.primary_value(), Some(110.0));
+        let run = StressRun {
+            schema_version: SCHEMA_VERSION.to_string(),
+            tool_version: "0.3.0".to_string(),
+            suite: "suite".to_string(),
+            run_profile: RunProfile::Default,
+            environment: test_env(),
+            benchmark_specs: vec![spec],
+            samples,
+            summaries: vec![legacy_summary],
+            comparisons: Vec::new(),
+            diagnostics_summary: Vec::new(),
+            started_at: "123".to_string(),
+            total_elapsed_ns: 0,
+            metadata: BTreeMap::new(),
+        };
+
+        let canonical = run
+            .canonical_baseline_summaries()
+            .expect("verified legacy raw baseline");
+
+        assert_eq!(canonical.len(), 1);
+        assert_eq!(canonical[0].primary_value(), Some(100.0));
+        assert_eq!(
+            canonical[0]
+                .metadata
+                .get(LATENCY_ESTIMATOR_METADATA_KEY)
+                .map(String::as_str),
+            Some(PER_SAMPLE_P95_STUDENT_T_ESTIMATOR)
+        );
+    }
+
+    #[test]
+    fn canonical_baseline_rejects_sample_environment_different_from_run_environment() {
+        let benchmark_spec = spec("bench");
+        let mut samples = (0..5)
+            .map(|index| sample("bench", SamplePhase::Measured, index, 100 + index as u128))
+            .collect::<Vec<_>>();
+        let summary = summarize_benchmark(&benchmark_spec, &samples);
+        samples[2].environment.cpu_model = "different cpu".to_string();
+        let run = StressRun {
+            schema_version: SCHEMA_VERSION.to_string(),
+            tool_version: "0.3.0".to_string(),
+            suite: "suite".to_string(),
+            run_profile: RunProfile::Default,
+            environment: test_env(),
+            benchmark_specs: vec![benchmark_spec],
+            samples,
+            summaries: vec![summary],
+            comparisons: Vec::new(),
+            diagnostics_summary: Vec::new(),
+            started_at: "123".to_string(),
+            total_elapsed_ns: 0,
+            metadata: BTreeMap::new(),
+        };
+
+        let error = run
+            .canonical_baseline_summaries()
+            .expect_err("sample environment drift must invalidate a baseline");
+
+        assert!(error.contains("sample 2"));
+        assert!(error.contains("CPU model differs"));
+    }
+
+    #[test]
+    fn canonical_evidence_rejects_inconsistent_top_level_identity() {
+        let benchmark_spec = spec("bench");
+        let samples = (0..5)
+            .map(|index| sample("bench", SamplePhase::Measured, index, 100_000))
+            .collect::<Vec<_>>();
+        let summary = summarize_benchmark(&benchmark_spec, &samples);
+        let run = StressRun {
+            schema_version: SCHEMA_VERSION.to_string(),
+            tool_version: "0.3.0".to_string(),
+            suite: "suite".to_string(),
+            run_profile: RunProfile::Default,
+            environment: test_env(),
+            benchmark_specs: vec![benchmark_spec],
+            samples,
+            summaries: vec![summary],
+            comparisons: Vec::new(),
+            diagnostics_summary: Vec::new(),
+            started_at: "123".to_string(),
+            total_elapsed_ns: 0,
+            metadata: BTreeMap::new(),
+        };
+        run.validate_canonical_evidence()
+            .expect("consistent evidence");
+
+        let mut wrong_tool = run.clone();
+        wrong_tool.tool_version = "9.9.9".to_string();
+        assert!(wrong_tool
+            .validate_canonical_evidence()
+            .expect_err("tool identity mismatch")
+            .contains("tool version"));
+
+        let mut wrong_profile = run;
+        wrong_profile.run_profile = RunProfile::Release;
+        assert!(wrong_profile
+            .validate_canonical_evidence()
+            .expect_err("profile identity mismatch")
+            .contains("run profile"));
+    }
+
+    #[test]
+    fn canonical_baseline_rejects_parameters_that_change_between_samples() {
+        let benchmark_spec = spec("bench");
+        let mut samples = (0..5)
+            .map(|index| {
+                sample(
+                    "bench",
+                    SamplePhase::Measured,
+                    index,
+                    100_000 + index as u128,
+                )
+            })
+            .collect::<Vec<_>>();
+        let summary = summarize_benchmark(&benchmark_spec, &samples);
+        samples[2]
+            .parameters
+            .insert("clients".to_string(), "16".to_string());
+        let run = StressRun {
+            schema_version: SCHEMA_VERSION.to_string(),
+            tool_version: "0.3.0".to_string(),
+            suite: "suite".to_string(),
+            run_profile: RunProfile::Default,
+            environment: test_env(),
+            benchmark_specs: vec![benchmark_spec],
+            samples,
+            summaries: vec![summary],
+            comparisons: Vec::new(),
+            diagnostics_summary: Vec::new(),
+            started_at: "123".to_string(),
+            total_elapsed_ns: 0,
+            metadata: BTreeMap::new(),
+        };
+
+        let error = run
+            .canonical_baseline_summaries()
+            .expect_err("parameter drift must invalidate a baseline");
+
+        assert!(error.contains("sample 2"));
+        assert!(error.contains("parameters"));
+    }
+
+    #[test]
+    fn summary_only_v2_artifacts_are_readable_but_rejected_as_baselines() {
+        let spec = spec("summary-only");
+        let samples = (0..5)
+            .map(|index| sample("summary-only", SamplePhase::Measured, index, 100))
+            .collect::<Vec<_>>();
+        let summary = summarize_benchmark(&spec, &samples);
+        let run = StressRun {
+            schema_version: SCHEMA_VERSION.to_string(),
+            tool_version: "0.3.0".to_string(),
+            suite: "suite".to_string(),
+            run_profile: RunProfile::Default,
+            environment: EnvironmentInfo::unknown(ProfileConfig::default()),
+            benchmark_specs: Vec::new(),
+            samples: Vec::new(),
+            summaries: vec![summary],
+            comparisons: Vec::new(),
+            diagnostics_summary: Vec::new(),
+            started_at: "123".to_string(),
+            total_elapsed_ns: 0,
+            metadata: BTreeMap::new(),
+        };
+        let json = serde_json::to_string(&run).expect("serialize");
+        let parsed = StressRun::from_json_str(&json).expect("summary-only v2 remains readable");
+
+        let error = parsed
+            .canonical_baseline_summaries()
+            .expect_err("summary-only baseline must be rejected");
+
+        assert!(error.contains("summary-only"));
+        assert!(error.contains("canonical raw samples"));
     }
 
     #[test]

@@ -1,0 +1,5 @@
+error: stress role must be "gate", "diagnostic", or "experimental"
+ --> tests/ui/fail/attribute_role_invalid.rs:3:17
+  |
+3 | #[stress(role = "invalid")]
+  |                 ^^^^^^^^^

@@ -2,6 +2,7 @@
 name = "cntryl-stress-demo"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 description = "Demonstration benchmarks for cntryl-stress"
 license = "Apache-2.0"
 repository = "https://github.com/cntryl/stress"

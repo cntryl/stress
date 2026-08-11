@@ -1,0 +1,5 @@
+error: mode is not a public stress attribute; choose tier = 1 through 6
+ --> tests/ui/fail/attribute_mode.rs:3:10
+  |
+3 | #[stress(mode = "micro")]
+  |          ^^^^^^^^^^^^^^

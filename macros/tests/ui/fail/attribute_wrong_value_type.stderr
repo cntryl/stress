@@ -1,0 +1,5 @@
+error: expected string literal
+ --> tests/ui/fail/attribute_wrong_value_type.rs:3:17
+  |
+3 | #[stress(name = 42)]
+  |                 ^^

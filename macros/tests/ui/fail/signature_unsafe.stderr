@@ -1,0 +1,5 @@
+error: #[stress] benchmark functions cannot be unsafe
+ --> tests/ui/fail/signature_unsafe.rs:4:1
+  |
+4 | unsafe fn benchmark(_ctx: &mut stress_alias::StressContext) {}
+  | ^^^^^^

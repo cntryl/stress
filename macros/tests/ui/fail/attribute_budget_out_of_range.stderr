@@ -1,0 +1,5 @@
+error: max_regression_pct must be between 0 and 100
+ --> tests/ui/fail/attribute_budget_out_of_range.rs:3:31
+  |
+3 | #[stress(max_regression_pct = 101)]
+  |                               ^^^

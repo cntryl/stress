@@ -1,0 +1,374 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/cntryl/stress/main/core/schema/cntryl-stress.v2.schema.json",
+  "title": "cntryl-stress v2 artifact",
+  "description": "Canonical raw-sample-first artifact emitted by cntryl-stress.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "tool_version",
+    "suite",
+    "run_profile",
+    "environment",
+    "benchmark_specs",
+    "samples",
+    "summaries",
+    "comparisons",
+    "started_at",
+    "total_elapsed_ns",
+    "metadata"
+  ],
+  "properties": {
+    "schema_version": { "const": "cntryl-stress.v2" },
+    "tool_version": { "type": "string" },
+    "suite": { "type": "string", "minLength": 1 },
+    "run_profile": { "$ref": "#/$defs/runProfile" },
+    "environment": { "$ref": "#/$defs/environment" },
+    "benchmark_specs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/benchmarkSpec" }
+    },
+    "samples": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/sample" }
+    },
+    "summaries": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/benchmarkSummary" }
+    },
+    "comparisons": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/comparison" }
+    },
+    "diagnostics_summary": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/diagnosticSummary" }
+    },
+    "started_at": { "type": "string", "minLength": 1 },
+    "total_elapsed_ns": { "$ref": "#/$defs/nonNegativeInteger" },
+    "metadata": { "$ref": "#/$defs/stringMap" }
+  },
+  "$defs": {
+    "nonNegativeInteger": { "type": "integer", "minimum": 0 },
+    "positiveInteger": { "type": "integer", "minimum": 1 },
+    "nullableNumber": { "type": ["number", "null"] },
+    "nullableInteger": { "type": ["integer", "null"], "minimum": 0 },
+    "stringMap": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "runProfile": {
+      "enum": ["default", "smoke", "lab", "release"]
+    },
+    "qualityClass": {
+      "enum": ["authoritative", "acceptable", "noisy", "untrustworthy"]
+    },
+    "trustClass": {
+      "enum": ["gate", "diagnostic", "experimental", "invalid"]
+    },
+    "measurementIntent": {
+      "enum": ["general", "batch", "async", "threaded", "pipeline", "io", "external"]
+    },
+    "primaryMetric": {
+      "enum": ["throughput", "latency_p95", "ns_per_op"]
+    },
+    "diagnosticSeverity": {
+      "enum": ["info", "warning", "error"]
+    },
+    "summaryStats": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mean", "median", "min", "max", "std_dev", "relative_std_dev",
+        "confidence_interval_95", "p50", "p95", "p99"
+      ],
+      "properties": {
+        "mean": { "type": "number" },
+        "median": { "type": "number" },
+        "min": { "type": "number" },
+        "max": { "type": "number" },
+        "std_dev": { "type": "number", "minimum": 0 },
+        "relative_std_dev": { "$ref": "#/$defs/nullableNumber" },
+        "confidence_interval_95": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["lower", "upper"],
+          "properties": {
+            "lower": { "type": "number" },
+            "upper": { "type": "number" }
+          }
+        },
+        "p50": { "type": "number" },
+        "p95": { "type": "number" },
+        "p99": { "type": "number" }
+      }
+    },
+    "profileConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile", "measured_samples", "warmup_samples", "cooldown_samples",
+        "min_quality", "fail_on_quality", "fail_on_regression",
+        "regression_threshold", "sample_duration", "operations_per_sample",
+        "micro_sample_duration", "report_depth"
+      ],
+      "properties": {
+        "profile": { "$ref": "#/$defs/runProfile" },
+        "measured_samples": { "$ref": "#/$defs/positiveInteger" },
+        "warmup_samples": { "$ref": "#/$defs/nonNegativeInteger" },
+        "cooldown_samples": { "$ref": "#/$defs/nonNegativeInteger" },
+        "min_quality": { "$ref": "#/$defs/qualityClass" },
+        "fail_on_quality": { "type": "boolean" },
+        "fail_on_regression": { "type": "boolean" },
+        "deny_diagnostics": { "$ref": "#/$defs/diagnosticSeverity" },
+        "regression_threshold": { "type": "number", "minimum": 0, "maximum": 1 },
+        "sample_duration": { "$ref": "#/$defs/positiveInteger" },
+        "operations_per_sample": { "$ref": "#/$defs/positiveInteger" },
+        "micro_sample_duration": { "$ref": "#/$defs/positiveInteger" },
+        "report_depth": { "type": "string" },
+        "console_names": { "enum": ["compact", "full"] },
+        "progress": { "type": "boolean" }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cpu_model", "core_count", "os", "rustc_version", "allocator",
+        "build_profile", "git_commit", "tool_version", "command_line", "profile_config"
+      ],
+      "properties": {
+        "cpu_model": { "type": "string" },
+        "core_count": { "$ref": "#/$defs/nullableInteger" },
+        "os": { "type": "string" },
+        "rustc_version": { "type": "string" },
+        "allocator": { "type": "string" },
+        "build_profile": { "type": "string" },
+        "git_commit": { "type": ["string", "null"] },
+        "tool_version": { "type": "string" },
+        "command_line": { "type": "array", "items": { "type": "string" } },
+        "profile_config": { "$ref": "#/$defs/profileConfig" }
+      }
+    },
+    "benchmarkMode": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "target_sample_duration"],
+          "properties": {
+            "type": { "const": "micro" },
+            "target_sample_duration": { "$ref": "#/$defs/positiveInteger" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "sample_duration"],
+          "properties": {
+            "type": { "const": "fixed_duration" },
+            "sample_duration": { "$ref": "#/$defs/positiveInteger" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "operations_per_sample"],
+          "properties": {
+            "type": { "const": "fixed_operations" },
+            "operations_per_sample": { "$ref": "#/$defs/positiveInteger" }
+          }
+        }
+      ]
+    },
+    "budgets": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_ns_per_op": { "type": "number", "minimum": 0 },
+        "max_allocs_per_op": { "type": "number", "minimum": 0 },
+        "max_bytes_per_op": { "type": "number", "minimum": 0 },
+        "max_regression_pct": { "type": "number", "minimum": 0, "maximum": 100 },
+        "max_rsd_pct": { "type": "number", "minimum": 0 }
+      }
+    },
+    "benchmarkSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "tier", "mode", "intent", "budgets", "parameters", "metadata"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "tier": { "type": "integer", "minimum": 1, "maximum": 6 },
+        "mode": { "$ref": "#/$defs/benchmarkMode" },
+        "intent": { "$ref": "#/$defs/measurementIntent" },
+        "budgets": { "$ref": "#/$defs/budgets" },
+        "parameters": { "$ref": "#/$defs/stringMap" },
+        "metadata": { "$ref": "#/$defs/stringMap" }
+      }
+    },
+    "counters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attempted", "completed", "failures", "timeouts", "duplicates", "dropped", "validation_errors"],
+      "properties": {
+        "attempted": { "$ref": "#/$defs/nonNegativeInteger" },
+        "completed": { "$ref": "#/$defs/nonNegativeInteger" },
+        "failures": { "$ref": "#/$defs/nonNegativeInteger" },
+        "timeouts": { "$ref": "#/$defs/nonNegativeInteger" },
+        "duplicates": { "$ref": "#/$defs/nonNegativeInteger" },
+        "dropped": { "$ref": "#/$defs/nonNegativeInteger" },
+        "validation_errors": { "$ref": "#/$defs/nonNegativeInteger" }
+      }
+    },
+    "sample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "benchmark_id", "intent", "sample_number", "phase", "elapsed_ns", "wall_clock_ns",
+        "operations_attempted", "operations_completed", "throughput", "latency_ns",
+        "parameters", "counters", "environment"
+      ],
+      "properties": {
+        "benchmark_id": { "type": "string", "minLength": 1 },
+        "intent": { "$ref": "#/$defs/measurementIntent" },
+        "sample_number": { "$ref": "#/$defs/nonNegativeInteger" },
+        "phase": { "enum": ["warmup", "measured", "cooldown"] },
+        "elapsed_ns": { "$ref": "#/$defs/nonNegativeInteger" },
+        "wall_clock_ns": { "$ref": "#/$defs/nonNegativeInteger" },
+        "operations_attempted": { "$ref": "#/$defs/nonNegativeInteger" },
+        "operations_completed": { "$ref": "#/$defs/nonNegativeInteger" },
+        "throughput": { "type": "number", "minimum": 0 },
+        "calibrated_iterations": { "$ref": "#/$defs/nonNegativeInteger" },
+        "gross_elapsed_ns": { "$ref": "#/$defs/nonNegativeInteger" },
+        "overhead_ns": { "$ref": "#/$defs/nonNegativeInteger" },
+        "net_elapsed_ns": { "$ref": "#/$defs/nonNegativeInteger" },
+        "gross_ns_per_op": { "type": "number" },
+        "overhead_ns_per_op": { "type": "number" },
+        "net_ns_per_op": { "type": "number" },
+        "allocs": { "$ref": "#/$defs/nonNegativeInteger" },
+        "bytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "allocs_per_op": { "type": "number" },
+        "bytes_per_op": { "type": "number" },
+        "latency_ns": { "type": "array", "items": { "$ref": "#/$defs/nonNegativeInteger" } },
+        "parameters": { "$ref": "#/$defs/stringMap" },
+        "counters": { "$ref": "#/$defs/counters" },
+        "environment": { "$ref": "#/$defs/environment" }
+      }
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "severity", "reason", "suggestions"],
+      "properties": {
+        "code": { "type": "string" },
+        "severity": { "$ref": "#/$defs/diagnosticSeverity" },
+        "reason": { "type": "string" },
+        "evidence": { "$ref": "#/$defs/stringMap" },
+        "suggestions": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "budgetResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metric", "limit", "passed"],
+      "properties": {
+        "metric": { "type": "string" },
+        "limit": { "type": "number" },
+        "actual": { "type": "number" },
+        "passed": { "type": "boolean" },
+        "reason": { "type": "string" }
+      }
+    },
+    "correctnessSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["passed", "counters", "errors"],
+      "properties": {
+        "passed": { "type": "boolean" },
+        "counters": { "$ref": "#/$defs/counters" },
+        "errors": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "benchmarkSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "benchmark_id", "name", "tier", "intent", "primary_metric", "measured_samples",
+        "warmup_samples", "cooldown_samples", "stats", "total_wall_clock_ns", "quality",
+        "trust_class", "budgets", "correctness", "parameters", "metadata"
+      ],
+      "properties": {
+        "benchmark_id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "tier": { "type": "integer", "minimum": 1, "maximum": 6 },
+        "intent": { "$ref": "#/$defs/measurementIntent" },
+        "primary_metric": { "$ref": "#/$defs/primaryMetric" },
+        "measured_samples": { "$ref": "#/$defs/nonNegativeInteger" },
+        "warmup_samples": { "$ref": "#/$defs/nonNegativeInteger" },
+        "cooldown_samples": { "$ref": "#/$defs/nonNegativeInteger" },
+        "stats": { "oneOf": [{ "$ref": "#/$defs/summaryStats" }, { "type": "null" }] },
+        "wall_clock": { "$ref": "#/$defs/summaryStats" },
+        "total_wall_clock_ns": { "$ref": "#/$defs/nonNegativeInteger" },
+        "ns_per_op": { "$ref": "#/$defs/summaryStats" },
+        "gross_ns_per_op": { "$ref": "#/$defs/summaryStats" },
+        "overhead_ns_per_op": { "$ref": "#/$defs/summaryStats" },
+        "allocs_per_op": { "$ref": "#/$defs/summaryStats" },
+        "bytes_per_op": { "$ref": "#/$defs/summaryStats" },
+        "quality": { "$ref": "#/$defs/qualityClass" },
+        "trust_class": { "$ref": "#/$defs/trustClass" },
+        "budgets": { "$ref": "#/$defs/budgets" },
+        "budget_results": { "type": "array", "items": { "$ref": "#/$defs/budgetResult" } },
+        "diagnostics": { "type": "array", "items": { "$ref": "#/$defs/diagnostic" } },
+        "correctness": { "$ref": "#/$defs/correctnessSummary" },
+        "parameters": { "$ref": "#/$defs/stringMap" },
+        "metadata": { "$ref": "#/$defs/stringMap" }
+      }
+    },
+    "comparison": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "benchmark_id", "current_quality", "baseline_quality", "primary_metric",
+        "baseline_value", "current_value", "change_percent", "threshold",
+        "confidence_intervals_overlap", "classification"
+      ],
+      "properties": {
+        "benchmark_id": { "type": "string" },
+        "current_quality": { "$ref": "#/$defs/qualityClass" },
+        "baseline_quality": { "oneOf": [{ "$ref": "#/$defs/qualityClass" }, { "type": "null" }] },
+        "primary_metric": { "$ref": "#/$defs/primaryMetric" },
+        "baseline_value": { "$ref": "#/$defs/nullableNumber" },
+        "current_value": { "$ref": "#/$defs/nullableNumber" },
+        "change_percent": { "$ref": "#/$defs/nullableNumber" },
+        "threshold": { "type": "number", "minimum": 0 },
+        "confidence_intervals_overlap": { "type": ["boolean", "null"] },
+        "classification": { "enum": ["regression", "improvement", "inconclusive", "missing_baseline"] },
+        "reason": { "type": "string" }
+      }
+    },
+    "diagnosticSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "suite", "benchmark_id", "name", "tier", "code", "severity", "reason",
+        "suggestions", "quality", "trust_class", "parameters"
+      ],
+      "properties": {
+        "suite": { "type": "string" },
+        "benchmark_id": { "type": "string" },
+        "name": { "type": "string" },
+        "tier": { "type": "integer", "minimum": 1, "maximum": 6 },
+        "code": { "type": "string" },
+        "severity": { "$ref": "#/$defs/diagnosticSeverity" },
+        "reason": { "type": "string" },
+        "evidence": { "$ref": "#/$defs/stringMap" },
+        "suggestions": { "type": "array", "items": { "type": "string" } },
+        "quality": { "$ref": "#/$defs/qualityClass" },
+        "trust_class": { "$ref": "#/$defs/trustClass" },
+        "parameters": { "$ref": "#/$defs/stringMap" }
+      }
+    }
+  }
+}

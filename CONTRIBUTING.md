@@ -26,7 +26,7 @@ Be respectful and inclusive. We're building a community where everyone feels wel
 
 ### Prerequisites
 
-- Rust 1.70+ (uses `rustup update stable`)
+- Rust 1.85+ (the declared minimum supported Rust version)
 - Git
 
 ### Development Setup
@@ -53,19 +53,19 @@ Be respectful and inclusive. We're building a community where everyone feels wel
 ### Building
 
 ```bash
-cargo build
+cargo build --locked --workspace --all-targets --all-features
 ```
 
 ### Testing
 
 Run all tests:
 ```bash
-cargo test --workspace --all-features
+cargo test --locked --workspace --all-targets --all-features
 ```
 
 Run tests in release mode:
 ```bash
-cargo test --workspace --all-features --release
+cargo test --locked --workspace --all-targets --all-features --release
 ```
 
 ### Code Quality
@@ -80,10 +80,10 @@ cargo fmt --all
 cargo fmt --all -- --check
 
 # Lint with clippy
-cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::pedantic
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings -D clippy::pedantic
 
 # Check documentation
-cargo doc --workspace --all-features --no-deps
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --all-features --no-deps
 ```
 
 All of these must pass before submitting a PR.
@@ -94,8 +94,24 @@ Run the demo benchmarks when changing benchmark authoring, reporting, or
 artifact behavior:
 
 ```bash
-cargo bench --bench stress-demo1
-cargo bench --bench stress-demo2
+cargo bench --locked -p cntryl-stress-demo --bench stress-demo1
+cargo bench --locked -p cntryl-stress-demo --bench stress-demo2
+```
+
+Reporting and baseline-publication changes must preserve the six public artifact
+files, immutable history, cross-process serialization and recovery, and final
+receipt ordering. Add focused regressions for publication failures and
+interrupted transactions when changing those paths.
+
+When changing packaging or proc-macro tests, also package the macros crate and
+run tests from Cargo's normalized extracted archive. Workspace-only trybuild
+fixtures must not make the published crate depend on an unpublished sibling:
+
+```bash
+cargo package --locked -p cntryl-stress-macros --allow-dirty
+macro_package="$(find target/package -maxdepth 1 -type d -name 'cntryl-stress-macros-*' -print -quit)"
+cargo test --locked --manifest-path "$macro_package/Cargo.toml" --all-targets
+cargo test --locked --manifest-path "$macro_package/Cargo.toml" --doc
 ```
 
 ## Project Structure
@@ -126,9 +142,9 @@ cargo bench --bench stress-demo2
 5. Ensure all checks pass:
    ```bash
    cargo fmt --all -- --check
-   cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::pedantic
-   cargo test --workspace --all-features
-   cargo doc --workspace --all-features --no-deps
+   cargo clippy --locked --workspace --all-targets --all-features -- -D warnings -D clippy::pedantic
+   cargo test --locked --workspace --all-targets --all-features
+   RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --all-features --no-deps
    ```
 6. Create a pull request with a clear description
 
@@ -154,10 +170,10 @@ cargo bench --bench stress-demo2
 2. Add tests for new functionality
 3. Ensure all checks pass:
    ```bash
-   cargo fmt --all
-   cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::pedantic
-   cargo test --workspace --all-features
-   cargo doc --workspace --all-features --no-deps
+   cargo fmt --all -- --check
+   cargo clippy --locked --workspace --all-targets --all-features -- -D warnings -D clippy::pedantic
+   cargo test --locked --workspace --all-targets --all-features
+   RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --all-features --no-deps
    ```
 4. Write a clear PR description:
    - What problem does it solve?

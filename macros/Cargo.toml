@@ -2,16 +2,26 @@
 name = "cntryl-stress-macros"
 version = "0.3.0"
 edition = "2021"
+rust-version = "1.85"
 description = "Proc macros for the cntryl-stress benchmark framework"
 license = "Apache-2.0"
 repository = "https://github.com/cntryl/stress"
+homepage = "https://github.com/cntryl/stress"
+documentation = "https://docs.rs/cntryl-stress-macros"
+readme = "../README.md"
 keywords = ["benchmark", "stress", "testing", "performance"]
 categories = ["development-tools::profiling", "development-tools::testing"]
+exclude = ["tests/ui.rs", "tests/ui/**"]
 
 [lib]
 proc-macro = true
 
 [dependencies]
+proc-macro-crate = "3.5"
+proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full"] }
-proc-macro2 = "1"
+
+[dev-dependencies]
+stress_alias = { package = "cntryl-stress", path = "../core" }
+trybuild = "=1.0.119"
