@@ -73,6 +73,34 @@
     "primaryMetric": {
       "enum": ["throughput", "latency_p95", "ns_per_op"]
     },
+    "observationUnit": {
+      "enum": ["count", "bytes", "ratio", "nanoseconds", "microseconds"]
+    },
+    "observationDirection": {
+      "enum": ["higher_is_better", "lower_is_better", "informational"]
+    },
+    "scalarObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value", "unit", "direction"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "value": { "type": "number" },
+        "unit": { "$ref": "#/$defs/observationUnit" },
+        "direction": { "$ref": "#/$defs/observationDirection" }
+      }
+    },
+    "observationSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "unit", "direction", "stats"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "unit": { "$ref": "#/$defs/observationUnit" },
+        "direction": { "$ref": "#/$defs/observationDirection" },
+        "stats": { "$ref": "#/$defs/summaryStats" }
+      }
+    },
     "diagnosticSeverity": {
       "enum": ["info", "warning", "error"]
     },
@@ -252,6 +280,7 @@
         "allocs_per_op": { "type": "number" },
         "bytes_per_op": { "type": "number" },
         "latency_ns": { "type": "array", "items": { "$ref": "#/$defs/nonNegativeInteger" } },
+        "observations": { "type": "array", "items": { "$ref": "#/$defs/scalarObservation" } },
         "parameters": { "$ref": "#/$defs/stringMap" },
         "counters": { "$ref": "#/$defs/counters" },
         "environment": { "$ref": "#/$defs/environment" }
@@ -316,6 +345,7 @@
         "overhead_ns_per_op": { "$ref": "#/$defs/summaryStats" },
         "allocs_per_op": { "$ref": "#/$defs/summaryStats" },
         "bytes_per_op": { "$ref": "#/$defs/summaryStats" },
+        "observations": { "type": "array", "items": { "$ref": "#/$defs/observationSummary" } },
         "quality": { "$ref": "#/$defs/qualityClass" },
         "trust_class": { "$ref": "#/$defs/trustClass" },
         "budgets": { "$ref": "#/$defs/budgets" },

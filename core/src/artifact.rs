@@ -235,6 +235,60 @@ pub enum PrimaryMetric {
     NsPerOp,
 }
 
+/// Unit carried by a scalar benchmark observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationUnit {
+    /// Dimensionless count.
+    Count,
+    /// Byte count.
+    Bytes,
+    /// Dimensionless ratio.
+    Ratio,
+    /// Nanoseconds.
+    Nanoseconds,
+    /// Microseconds.
+    Microseconds,
+}
+
+/// Interpretation of movement in a scalar observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationDirection {
+    /// Larger values are preferable.
+    HigherIsBetter,
+    /// Smaller values are preferable.
+    LowerIsBetter,
+    /// Display-only context which never drives quality or regression gates.
+    Informational,
+}
+
+/// One scalar value recorded alongside a raw timing sample.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScalarObservation {
+    /// Stable observation name.
+    pub name: String,
+    /// Observed scalar value.
+    pub value: f64,
+    /// Physical unit.
+    pub unit: ObservationUnit,
+    /// Preferred movement direction.
+    pub direction: ObservationDirection,
+}
+
+/// Aggregated scalar observation across measured samples.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObservationSummary {
+    /// Stable observation name.
+    pub name: String,
+    /// Physical unit.
+    pub unit: ObservationUnit,
+    /// Preferred movement direction.
+    pub direction: ObservationDirection,
+    /// Median, confidence interval, RSD, and other descriptive statistics.
+    pub stats: SummaryStats,
+}
+
 /// Benchmark authoring intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -913,6 +967,9 @@ pub struct Sample {
     pub bytes_per_op: Option<f64>,
     /// Optional raw latency observations in nanoseconds.
     pub latency_ns: Vec<u128>,
+    /// Scalar observations attached to this timing sample.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observations: Vec<ScalarObservation>,
     /// Structured parameters active for this sample.
     pub parameters: BTreeMap<String, String>,
     /// Correctness counters.
@@ -992,6 +1049,9 @@ pub struct BenchmarkSummary {
     /// Allocated bytes per operation statistics when tracked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes_per_op: Option<SummaryStats>,
+    /// Scalar observations aggregated independently from the primary metric.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observations: Vec<ObservationSummary>,
     /// Quality classification.
     pub quality: QualityClass,
     /// Whether the row should participate in performance gates.
@@ -1721,6 +1781,7 @@ fn summarize_benchmark_with_latency_estimator(
         SummaryStats::from_values(&per_op_values(&measured, |sample| sample.allocs_per_op));
     let bytes_per_op =
         SummaryStats::from_values(&per_op_values(&measured, |sample| sample.bytes_per_op));
+    let observations = summarize_observations(&measured);
     let values = primary_values(primary_metric, &measured, latency_estimator);
     let stats = if primary_metric == PrimaryMetric::LatencyP95
         && latency_estimator == LatencyEstimator::PerSampleP95
@@ -1793,6 +1854,7 @@ fn summarize_benchmark_with_latency_estimator(
         overhead_ns_per_op,
         allocs_per_op,
         bytes_per_op,
+        observations,
         quality,
         trust_class,
         budgets: spec.budgets,
@@ -1802,6 +1864,35 @@ fn summarize_benchmark_with_latency_estimator(
         parameters: merged_parameters(spec, &measured),
         metadata,
     }
+}
+
+fn summarize_observations(samples: &[&Sample]) -> Vec<ObservationSummary> {
+    let Some(first) = samples.first() else {
+        return Vec::new();
+    };
+    first
+        .observations
+        .iter()
+        .filter_map(|definition| {
+            let values = samples
+                .iter()
+                .filter_map(|sample| {
+                    sample
+                        .observations
+                        .iter()
+                        .find(|item| item.name == definition.name)
+                        .map(|item| item.value)
+                })
+                .collect::<Vec<_>>();
+            (values.len() == samples.len()).then(|| ObservationSummary {
+                name: definition.name.clone(),
+                unit: definition.unit,
+                direction: definition.direction,
+                stats: SummaryStats::from_values(&values)
+                    .expect("finite observation values produce statistics"),
+            })
+        })
+        .collect()
 }
 
 fn summary_metadata(
@@ -3600,6 +3691,7 @@ mod tests {
             allocs_per_op: None,
             bytes_per_op: None,
             latency_ns: Vec::new(),
+            observations: Vec::new(),
             parameters: BTreeMap::new(),
             counters: CorrectnessCounters {
                 attempted: completed,
@@ -3666,6 +3758,29 @@ mod tests {
         assert_eq!(summary.total_wall_clock_ns, 2_000_000_300);
         assert_close(summary.wall_clock.as_ref().expect("wall").min, 100.0);
         assert_close(summary.stats.as_ref().expect("stats").min, 5_000_000.0);
+    }
+
+    #[test]
+    fn summaries_aggregate_scalar_observations_across_measured_samples() {
+        let spec = spec("bench");
+        let mut samples = vec![
+            sample("bench", SamplePhase::Measured, 0, 100),
+            sample("bench", SamplePhase::Measured, 1, 110),
+            sample("bench", SamplePhase::Measured, 2, 120),
+        ];
+        for (sample, value) in samples.iter_mut().zip([7.0, 8.0, 9.0]) {
+            sample.observations.push(ScalarObservation {
+                name: "records_per_append".to_string(),
+                value,
+                unit: ObservationUnit::Ratio,
+                direction: ObservationDirection::HigherIsBetter,
+            });
+        }
+
+        let summary = summarize_benchmark(&spec, &samples);
+        assert_eq!(summary.observations.len(), 1);
+        assert_close(summary.observations[0].stats.median, 8.0);
+        assert!(summary.observations[0].stats.relative_std_dev > 0.0);
     }
 
     #[test]

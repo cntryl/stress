@@ -556,6 +556,7 @@ impl StressRunner {
             allocs_per_op,
             bytes_per_op,
             latency_ns: record.latency_ns,
+            observations: record.observations,
             parameters: record.parameters,
             counters: record.counters,
             environment: self.environment.clone(),
@@ -864,6 +865,20 @@ fn measurement_spec(
 ) -> BenchmarkSpec {
     let mut metadata = base_spec.metadata.clone();
     metadata.extend(record.metadata.clone());
+    if !record.observations.is_empty() {
+        let topology = record
+            .observations
+            .iter()
+            .map(|observation| {
+                format!(
+                    "{}:{:?}:{:?}",
+                    observation.name, observation.unit, observation.direction
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        metadata.insert("cntryl_stress_observation_topology".to_string(), topology);
+    }
     if record.mode.kind() == BenchmarkModeKind::Micro && record.intent == MeasurementIntent::Batch {
         metadata.insert(
             "ns_per_op_basis".to_string(),

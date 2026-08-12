@@ -2661,6 +2661,7 @@ mod tests {
             overhead_ns_per_op: None,
             allocs_per_op: None,
             bytes_per_op: None,
+            observations: Vec::new(),
             quality,
             trust_class: TrustClass::Gate,
             budgets: BenchmarkBudgets::default(),
@@ -2738,6 +2739,7 @@ mod tests {
                 allocs_per_op: None,
                 bytes_per_op: None,
                 latency_ns: Vec::new(),
+                observations: Vec::new(),
                 parameters: BTreeMap::new(),
                 counters: CorrectnessCounters {
                     attempted: 1,

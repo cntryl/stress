@@ -227,6 +227,7 @@ fn current_schema_run() -> cntryl_stress::artifact::StressRun {
             allocs_per_op: None,
             bytes_per_op: None,
             latency_ns: Vec::new(),
+            observations: Vec::new(),
             parameters: BTreeMap::new(),
             counters: CorrectnessCounters {
                 attempted: 1,
@@ -252,6 +253,7 @@ fn current_schema_run() -> cntryl_stress::artifact::StressRun {
             overhead_ns_per_op: None,
             allocs_per_op: None,
             bytes_per_op: None,
+            observations: Vec::new(),
             quality: QualityClass::Untrustworthy,
             trust_class: cntryl_stress::artifact::TrustClass::Gate,
             budgets: BenchmarkBudgets::default(),

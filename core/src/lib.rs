@@ -70,7 +70,9 @@ static CNTRYL_STRESS_TEST_ALLOCATOR: allocation::StressAllocator =
 static CNTRYL_STRESS_TEST_ALLOCATOR_INSTALLATION: fn() =
     allocation::stress_allocator_installed_marker;
 
-pub use artifact::{RunProfile, TrustClass as BenchmarkRole};
+pub use artifact::{
+    ObservationDirection, ObservationUnit, RunProfile, TrustClass as BenchmarkRole,
+};
 pub use config::StressRunnerConfig;
 pub use context::{LogicalUnit, OperationOutcome, StressContext};
 pub use error::{StressError, StressResult};
@@ -143,8 +145,9 @@ macro_rules! stress_allocator {
 /// Prelude module for benchmark files.
 pub mod prelude {
     pub use crate::{
-        black_box, stress, stress_allocator, stress_main, BenchmarkRole, RunProfile, StressContext,
-        StressError, StressResult, StressRunner, StressRunnerConfig, StressRunnerOptions,
+        black_box, stress, stress_allocator, stress_main, BenchmarkRole, ObservationDirection,
+        ObservationUnit, RunProfile, StressContext, StressError, StressResult, StressRunner,
+        StressRunnerConfig, StressRunnerOptions,
     };
     pub use crate::{LogicalUnit, OperationOutcome};
 }

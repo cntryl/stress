@@ -1,7 +1,10 @@
 //! Benchmark context for named measurements, workload facts, and correctness counters.
 
 use crate::allocation;
-use crate::artifact::{BenchmarkMode, CorrectnessCounters, MeasurementIntent, TrustClass};
+use crate::artifact::{
+    BenchmarkMode, CorrectnessCounters, MeasurementIntent, ObservationDirection, ObservationUnit,
+    ScalarObservation, TrustClass,
+};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
@@ -17,6 +20,7 @@ pub struct StressContext {
     parameters: BTreeMap<String, String>,
     metadata: BTreeMap<String, String>,
     pending_latency_ns: Vec<u128>,
+    pending_observations: Vec<ScalarObservation>,
     pending_counters: CorrectnessCounters,
     pending_has_counters: bool,
 }
@@ -160,6 +164,7 @@ pub(crate) struct MeasurementRecord {
     pub mode: BenchmarkMode,
     pub duration: Duration,
     pub latency_ns: Vec<u128>,
+    pub observations: Vec<ScalarObservation>,
     pub counters: CorrectnessCounters,
     pub operations_hint: Option<u64>,
     pub micro: Option<MicroMeasurement>,
@@ -268,6 +273,7 @@ impl StressContext {
             parameters: BTreeMap::new(),
             metadata: BTreeMap::new(),
             pending_latency_ns: Vec::new(),
+            pending_observations: Vec::new(),
             pending_counters: CorrectnessCounters::default(),
             pending_has_counters: false,
         }
@@ -311,6 +317,53 @@ impl StressContext {
         } else {
             self.pending_latency_ns.push(duration.as_nanos());
         }
+        self
+    }
+
+    /// Record one finite scalar observation for the latest measurement, or the
+    /// next measurement if none has been recorded yet.
+    ///
+    /// Every invocation must record the same names, units, and directions.
+    ///
+    /// # Panics
+    ///
+    /// Panics for an empty name, a non-finite value, or a duplicate name on
+    /// the same measurement.
+    pub fn record_observation(
+        &mut self,
+        name: impl Into<String>,
+        value: f64,
+        unit: ObservationUnit,
+        direction: ObservationDirection,
+    ) -> &mut Self {
+        let observation = ScalarObservation {
+            name: name.into(),
+            value,
+            unit,
+            direction,
+        };
+        assert!(
+            !observation.name.trim().is_empty(),
+            "observation name cannot be empty"
+        );
+        assert!(
+            observation.value.is_finite(),
+            "observation value must be finite"
+        );
+        let observations = self
+            .measurements
+            .last_mut()
+            .map_or(&mut self.pending_observations, |record| {
+                &mut record.observations
+            });
+        assert!(
+            observations
+                .iter()
+                .all(|existing| existing.name != observation.name),
+            "duplicate observation name {:?}",
+            observation.name
+        );
+        observations.push(observation);
         self
     }
 
@@ -1894,12 +1947,14 @@ impl StressContext {
             self.pending_has_counters = false;
         }
         let latency_ns = std::mem::take(&mut self.pending_latency_ns);
+        let observations = std::mem::take(&mut self.pending_observations);
         self.measurements.push(MeasurementRecord {
             name,
             intent,
             mode: self.mode.clone(),
             duration: state.duration,
             latency_ns,
+            observations,
             counters: state.counters,
             operations_hint: state.operations_hint,
             micro: state.micro,
@@ -3275,6 +3330,27 @@ mod tests {
         assert!(!records[1].parameters.contains_key("logical_unit"));
         assert!(!records[1].metadata.contains_key("owner"));
         assert!(!records[1].metadata.contains_key("trust_class"));
+    }
+
+    #[test]
+    fn scalar_observations_attach_to_latest_measurement_with_typed_contract() {
+        let mut ctx = fixed_ops_ctx(1);
+        ctx.measure("write", || std::hint::black_box(1_u64));
+        ctx.record_observation(
+            "commits_per_fsync",
+            8.0,
+            ObservationUnit::Ratio,
+            ObservationDirection::HigherIsBetter,
+        );
+
+        let record = ctx.take_measurements().remove(0);
+        assert_eq!(record.observations.len(), 1);
+        assert_eq!(record.observations[0].name, "commits_per_fsync");
+        assert_eq!(record.observations[0].unit, ObservationUnit::Ratio);
+        assert_eq!(
+            record.observations[0].direction,
+            ObservationDirection::HigherIsBetter
+        );
     }
 
     #[test]

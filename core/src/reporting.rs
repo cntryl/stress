@@ -1075,6 +1075,42 @@ pub(crate) fn format_markdown_report(run: &StressRun) -> String {
             format_duration_ns(summary.total_wall_clock_ns)
         );
     }
+    if run
+        .summaries
+        .iter()
+        .any(|summary| !summary.observations.is_empty())
+    {
+        let _ = writeln!(output);
+        let _ = writeln!(output, "## Observations");
+        let _ = writeln!(output);
+        let _ = writeln!(
+            output,
+            "| Benchmark | Observation | Median | 95% CI | RSD | Direction |"
+        );
+        let _ = writeln!(output, "|---|---|---:|---:|---:|---|");
+        for summary in &run.summaries {
+            for observation in &summary.observations {
+                let stats = &observation.stats;
+                let rsd = if stats.relative_std_dev.is_finite() {
+                    format!("{:.2}%", stats.relative_std_dev * 100.0)
+                } else {
+                    "n/a".to_string()
+                };
+                let _ = writeln!(
+                    output,
+                    "| {} | {} ({:?}) | {:.3} | {:.3}..{:.3} | {} | {:?} |",
+                    summary.name,
+                    observation.name,
+                    observation.unit,
+                    stats.median,
+                    stats.confidence_interval_95.lower,
+                    stats.confidence_interval_95.upper,
+                    rsd,
+                    observation.direction,
+                );
+            }
+        }
+    }
     output
 }
 
@@ -2967,6 +3003,7 @@ mod tests {
             overhead_ns_per_op: None,
             allocs_per_op: None,
             bytes_per_op: None,
+            observations: Vec::new(),
             quality,
             trust_class: TrustClass::Gate,
             budgets: BenchmarkBudgets::default(),
@@ -3030,6 +3067,7 @@ mod tests {
                 allocs_per_op: None,
                 bytes_per_op: None,
                 latency_ns: Vec::new(),
+                observations: Vec::new(),
                 parameters: BTreeMap::new(),
                 counters: CorrectnessCounters {
                     attempted: 1,
