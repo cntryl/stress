@@ -3245,6 +3245,10 @@ fn flat_or_capped_throughput(
     samples: &[&Sample],
 ) -> bool {
     samples.len() >= 3
+        && spec
+            .metadata
+            .get("measurement_shape")
+            .is_none_or(|shape| shape != "fixed_workload")
         && measurement_mode_for_spec(spec) == MeasurementMode::Duration
         && infer_primary_metric(spec, samples) == PrimaryMetric::Throughput
         && stats.is_some_and(|stats| stats.relative_std_dev <= 0.02)
@@ -4178,6 +4182,27 @@ mod tests {
             100_000_000,
             1_000_000,
         )];
+
+        let summary = summarize_benchmark(&spec, &samples);
+
+        assert!(!summary
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "flat_or_capped_throughput"));
+    }
+
+    #[test]
+    fn explicit_fixed_workload_shape_is_not_labeled_as_capped_throughput() {
+        let mut spec = tier3_spec("fixed-workload");
+        spec.metadata.insert(
+            "measurement_shape".to_string(),
+            "fixed_workload".to_string(),
+        );
+        let samples = (0..5)
+            .map(|sample_number| {
+                completed_sample("fixed-workload", sample_number, 100_000_000, 1_000_000)
+            })
+            .collect::<Vec<_>>();
 
         let summary = summarize_benchmark(&spec, &samples);
 
