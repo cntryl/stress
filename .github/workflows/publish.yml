@@ -1,152 +1,90 @@
-name: Publish
+name: Publish to crates.io
 
 on:
-  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
+
+concurrency:
+  group: crates-io-publish
+  cancel-in-progress: false
 
 jobs:
   publish:
+    name: Publish crates to crates.io
     runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+
     steps:
-      - name: Checkout repository
+      - name: Check out release tag
         uses: actions/checkout@v6
 
-      - name: Update Rust toolchain
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify release tag matches published crates
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          rustup update stable
-          rustup default stable
-          rustup component add clippy
+          versions="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c '
+          import json
+          import sys
 
-      - name: Check clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::pedantic
+          metadata = json.load(sys.stdin)
+          names = {"cntryl-stress", "cntryl-stress-macros"}
+          versions = {
+              package["name"]: package["version"]
+              for package in metadata["packages"]
+              if package["name"] in names
+          }
+          if names != versions.keys() or len(set(versions.values())) != 1:
+              raise SystemExit(f"published package versions are inconsistent: {versions}")
+          print(next(iter(versions.values())))
+          ')
+          test "$RELEASE_TAG" = "v$versions"
 
-      - name: Build release
-        run: cargo build --release
+      - name: Verify package contents
+        run: |
+          cargo package --locked -p cntryl-stress-macros
+          cargo package --locked --no-verify -p cntryl-stress
 
-      - name: Login
+      - name: Test workspace
+        run: cargo test --locked --workspace --all-targets --all-features
+
+      - name: Authenticate with crates.io
         id: auth
-        uses: rust-lang/crates-io-auth-action@v1.0.4
+        uses: rust-lang/crates-io-auth-action@v1
 
-      - name: Publish crates to crates.io
+      - name: Publish macros crate
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        shell: bash
+        run: cargo publish --locked -p cntryl-stress-macros
+
+      - name: Wait for macros crate to reach the index
         run: |
-          set -euo pipefail
+          macros_version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c '
+          import json
+          import sys
+          metadata = json.load(sys.stdin)
+          print(next(package["version"] for package in metadata["packages"] if package["name"] == "cntryl-stress-macros"))
+          ')"
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error \
+              "https://crates.io/api/v1/crates/cntryl-stress-macros/$macros_version" >/dev/null; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "cntryl-stress-macros $macros_version did not become visible on crates.io" >&2
+          exit 1
 
-          resolve_version() {
-            local crate="$1"
-
-            cargo metadata --format-version=1 --no-deps \
-              | python3 -c 'import json, sys; crate = sys.argv[1]; metadata = json.load(sys.stdin); matches = [package["version"] for package in metadata["packages"] if package["name"] == crate]; print(matches[0]) if matches else sys.exit(f"package {crate} not found in cargo metadata")' "$crate"
-          }
-
-          check_crates_io_version() {
-            local crate="$1"
-            local version="$2"
-            local url="https://crates.io/api/v1/crates/${crate}/${version}"
-            local response_file
-            local status
-
-            response_file="$(mktemp)"
-            status="$(curl --silent --show-error --location --retry 3 --retry-delay 2 \
-              --user-agent "cntryl-stress-release/${GITHUB_RUN_ID:-local}" \
-              --output "$response_file" \
-              --write-out "%{http_code}" \
-              "$url")" || {
-              echo "::error title=crates.io check failed::Failed to check ${crate} ${version}" >&2
-              cat "$response_file" >&2 || true
-              rm -f "$response_file"
-              return 2
-            }
-
-            case "$status" in
-              200)
-                rm -f "$response_file"
-                return 0
-                ;;
-              404)
-                rm -f "$response_file"
-                return 1
-                ;;
-              *)
-                echo "::error title=unexpected crates.io response::${crate} ${version} returned HTTP ${status}" >&2
-                cat "$response_file" >&2
-                rm -f "$response_file"
-                return 2
-                ;;
-            esac
-          }
-
-          publish_if_missing() {
-            local crate="$1"
-            local version="$2"
-            local check_status
-
-            set +e
-            check_crates_io_version "$crate" "$version"
-            check_status="$?"
-            set -e
-
-            case "$check_status" in
-              0)
-                echo "::notice title=${crate} ${version}::Already published on crates.io; skipping."
-                PUBLISH_RESULT="skipped"
-                ;;
-              1)
-                echo "Publishing ${crate} ${version} to crates.io"
-                cargo publish --locked -p "$crate"
-                PUBLISH_RESULT="published"
-                ;;
-              *)
-                exit "$check_status"
-                ;;
-            esac
-          }
-
-          wait_for_crates_io_version() {
-            local crate="$1"
-            local version="$2"
-            local attempt
-            local check_status
-
-            for attempt in {1..12}; do
-              set +e
-              check_crates_io_version "$crate" "$version"
-              check_status="$?"
-              set -e
-
-              case "$check_status" in
-                0)
-                  echo "${crate} ${version} is visible on crates.io."
-                  return 0
-                  ;;
-                1)
-                  echo "Waiting for ${crate} ${version} to become visible on crates.io (${attempt}/12)."
-                  sleep 10
-                  ;;
-                *)
-                  exit "$check_status"
-                  ;;
-              esac
-            done
-
-            echo "::error title=crates.io visibility timeout::${crate} ${version} was not visible after waiting." >&2
-            exit 1
-          }
-
-          macros_crate="cntryl-stress-macros"
-          core_crate="cntryl-stress"
-
-          macros_version="$(resolve_version "$macros_crate")"
-          core_version="$(resolve_version "$core_crate")"
-
-          publish_if_missing "$macros_crate" "$macros_version"
-          if [[ "$PUBLISH_RESULT" == "published" ]]; then
-            wait_for_crates_io_version "$macros_crate" "$macros_version"
-          fi
-
-          publish_if_missing "$core_crate" "$core_version"
+      - name: Publish core crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked -p cntryl-stress
