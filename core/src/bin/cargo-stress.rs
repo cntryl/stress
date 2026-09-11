@@ -2701,7 +2701,7 @@ mod tests {
         };
         StressRun {
             schema_version: SCHEMA_VERSION.to_string(),
-            tool_version: "0.3.0".to_string(),
+            tool_version: "0.4.0".to_string(),
             suite: suite.to_string(),
             run_profile: RunProfile::Release,
             environment: EnvironmentInfo::unknown(profile_config.clone()),

@@ -52,8 +52,8 @@ We keep dependencies minimal and up-to-date:
 
 | Version | Status | Security Updates |
 |---------|--------|------------------|
-| 0.3.x   | Current | Yes - all patches |
-| < 0.3.0 | Legacy | No |
+| 0.4.x   | Current | Yes - all patches |
+| < 0.4.0 | Legacy | No |
 
 ## Public Vulnerabilities
 

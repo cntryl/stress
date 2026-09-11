@@ -83,7 +83,7 @@ authoring and reporting experience.
 
 ```toml
 [dev-dependencies]
-cntryl-stress = "0.3"
+cntryl-stress = "0.4"
 
 [[bench]]
 name = "storage_stress"
