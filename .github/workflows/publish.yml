@@ -1,6 +1,9 @@
 name: Publish to crates.io
 
 on:
+  push:
+    tags:
+      - "v*.*.*"
   workflow_dispatch:
 
 permissions:
