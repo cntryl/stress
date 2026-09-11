@@ -48,7 +48,7 @@ jobs:
           if names != versions.keys() or len(set(versions.values())) != 1:
               raise SystemExit(f"published package versions are inconsistent: {versions}")
           print(next(iter(versions.values())))
-          ')
+          ')"
           test "$RELEASE_TAG" = "v$versions"
 
       - name: Verify package contents
