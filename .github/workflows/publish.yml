@@ -1,13 +1,10 @@
 name: Publish to crates.io
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: crates-io-publish
@@ -19,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: crates-io
     permissions:
-      contents: read
+      contents: write
       id-token: write
 
     steps:
@@ -29,27 +26,15 @@ jobs:
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Verify release tag matches published crates
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
+      - name: Read release versions from Cargo manifests
+        id: version
         run: |
-          test "${GITHUB_REF_TYPE}" = "tag"
-          versions="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c '
-          import json
-          import sys
-
-          metadata = json.load(sys.stdin)
-          names = {"cntryl-stress", "cntryl-stress-macros"}
-          versions = {
-              package["name"]: package["version"]
-              for package in metadata["packages"]
-              if package["name"] in names
-          }
-          if names != versions.keys() or len(set(versions.values())) != 1:
-              raise SystemExit(f"published package versions are inconsistent: {versions}")
-          print(next(iter(versions.values())))
-          ')"
-          test "$RELEASE_TAG" = "v$versions"
+          core_version="$(sed -n '/^\[package\]/,/^\[/ { s/^version = "\([^"]*\)"/\1/p; }' core/Cargo.toml | head -n 1)"
+          macros_version="$(sed -n '/^\[package\]/,/^\[/ { s/^version = "\([^"]*\)"/\1/p; }' macros/Cargo.toml | head -n 1)"
+          test -n "${core_version}"
+          test -n "${macros_version}"
+          test "${core_version}" = "${macros_version}"
+          echo "version=${core_version}" >> "${GITHUB_OUTPUT}"
 
       - name: Verify package contents
         run: |
@@ -90,3 +75,18 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish --locked -p cntryl-stress
+
+      - name: Create release tag when absent
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v${RELEASE_VERSION}"
+          if git ls-remote --exit-code --refs origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "${tag} already exists; leaving it unchanged."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${tag}" "${GITHUB_SHA}" -m "Release ${tag}"
+          git push origin "${tag}"
