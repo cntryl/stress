@@ -36,10 +36,8 @@ jobs:
           test "${core_version}" = "${macros_version}"
           echo "version=${core_version}" >> "${GITHUB_OUTPUT}"
 
-      - name: Verify package contents
-        run: |
-          cargo package --locked -p cntryl-stress-macros
-          cargo package --locked --no-verify -p cntryl-stress
+      - name: Verify macros package contents
+        run: cargo package --locked -p cntryl-stress-macros
 
       - name: Test workspace
         run: cargo test --locked --workspace --all-targets --all-features
@@ -70,6 +68,9 @@ jobs:
           done
           echo "cntryl-stress-macros $macros_version did not become visible on crates.io" >&2
           exit 1
+
+      - name: Verify core package contents
+        run: cargo package --locked -p cntryl-stress
 
       - name: Publish core crate
         env:
