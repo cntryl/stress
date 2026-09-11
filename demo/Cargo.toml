@@ -9,7 +9,7 @@ repository = "https://github.com/cntryl/stress"
 publish = false
 
 [dependencies]
-cntryl-stress = { version = "0.3", path = "../core" }
+cntryl-stress = { version = "0.4", path = "../core" }
 
 [[bench]]
 name = "stress-demo"

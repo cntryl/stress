@@ -3029,7 +3029,7 @@ mod tests {
                 .profile_config();
         StressRun {
             schema_version: SCHEMA_VERSION.to_string(),
-            tool_version: "0.3.0".to_string(),
+            tool_version: "0.4.0".to_string(),
             suite: "suite".to_string(),
             run_profile: profile_config.profile,
             environment: EnvironmentInfo::unknown(profile_config.clone()),
@@ -3589,7 +3589,7 @@ mod tests {
 
         let report = format_console_output(&run);
 
-        assert!(report.contains("@cntryl/stress v0.3.0"));
+        assert!(report.contains("@cntryl/stress v0.4.0"));
         assert!(report.contains("suite"));
         let header = report
             .lines()
