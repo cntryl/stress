@@ -3637,9 +3637,9 @@ mod tests {
         let tick = Duration::from_nanos(40);
         let quantized = MicroMeasurement {
             iterations: 1_000,
-            gross_elapsed: Duration::from_nanos(20_000),
+            gross_elapsed: Duration::from_micros(20),
             overhead: Duration::from_nanos(5_000),
-            net_elapsed: Duration::from_nanos(15_000),
+            net_elapsed: Duration::from_micros(15),
         };
         let guarded = guard_per_op_quantization(quantized, tick);
         assert_eq!(guarded.overhead, guarded.gross_elapsed);
@@ -3647,9 +3647,9 @@ mod tests {
 
         let resolvable = MicroMeasurement {
             iterations: 1_000,
-            gross_elapsed: Duration::from_nanos(400_000),
+            gross_elapsed: Duration::from_micros(400),
             overhead: Duration::from_nanos(5_000),
-            net_elapsed: Duration::from_nanos(395_000),
+            net_elapsed: Duration::from_micros(395),
         };
         let kept = guard_per_op_quantization(resolvable, tick);
         assert_eq!(kept.overhead, resolvable.overhead);
