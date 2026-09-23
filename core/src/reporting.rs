@@ -6,6 +6,7 @@ use crate::artifact::{
     StressRun, SummaryStats, TrustClass,
 };
 use crate::config::StressRunnerConfig;
+use crate::diagnostics::catalog_fix;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as FmtWrite;
 use std::io::Write;
@@ -1571,7 +1572,6 @@ fn push_shape_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSummar
         "Micro timing",
         summaries,
         "tiny_micro_timing",
-        "Batch more logical work per sample, or declare role = \"diagnostic\" after validating the microbenchmark shape.",
         |summary| {
             format!(
                 "{} is too small to trust as a gate-quality microbenchmark.",
@@ -1584,7 +1584,6 @@ fn push_shape_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSummar
         "Optimized away",
         summaries,
         "likely_optimized_away",
-        "Vary inputs, accumulate observable outputs, and use #[stress(metadata(validated_micro = \"true\"))] only after anti-DCE is explicit.",
         |summary| {
             format!(
                 "{} is likely optimized away or dominated by compiler artifacts.",
@@ -1592,20 +1591,14 @@ fn push_shape_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSummar
             )
         },
     );
-    push_diagnostic_group(
-        groups,
-        "Too fast",
-        summaries,
-        "too_fast",
-        "Batch more logical work per measurement or use Tier 1 for hot-path micro timing.",
-        |summary| format!("{} is too small for stable timing.", summary.name),
-    );
+    push_diagnostic_group(groups, "Too fast", summaries, "too_fast", |summary| {
+        format!("{} is too small for stable timing.", summary.name)
+    });
     push_diagnostic_group(
         groups,
         "Setup",
         summaries,
         "setup_dominates_measurement",
-        "Increase measured work per iteration and keep setup outside the measurement closure.",
         |summary| format!("{} is dominated by setup or timing overhead.", summary.name),
     );
     push_diagnostic_group(
@@ -1613,7 +1606,6 @@ fn push_shape_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSummar
         "Throughput shape",
         summaries,
         "single_op_throughput",
-        "Use measure_batch or record_external for throughput work, or move a single-operation row to Tier 2.",
         |summary| {
             format!(
                 "{} is a throughput-tier benchmark but records one operation per sample.",
@@ -1626,7 +1618,6 @@ fn push_shape_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSummar
         "Measurement semantics",
         summaries,
         "fixed_ops_throughput",
-        "Use duration-based throughput for main rows, or split the fixed-op probe into an explicit diagnostic row.",
         |summary| {
             format!(
                 "{} uses fixed-op timing for a throughput row.",
@@ -1639,15 +1630,18 @@ fn push_shape_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSummar
         "Batch unit",
         summaries,
         "batch_unit_ambiguous",
-        "Add logical_unit and any *_per_logical_operation parameter so the report can state the measured question directly.",
-        |summary| format!("{} does not declare an explicit batch normalization basis.", summary.name),
+        |summary| {
+            format!(
+                "{} does not declare an explicit batch normalization basis.",
+                summary.name
+            )
+        },
     );
     push_diagnostic_group(
         groups,
         "Measurement mode",
         summaries,
         "measurement_mode_mismatch",
-        "Use one measurement_mode per workload family, or split fixed-op probes into explicit diagnostic rows.",
         |summary| {
             format!(
                 "{} mixes throughput measurement modes with sibling rows in the same family.",
@@ -1660,8 +1654,12 @@ fn push_shape_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSummar
         "Capped throughput",
         summaries,
         "flat_or_capped_throughput",
-        "Confirm whether this row is an intentional capped-capacity probe; otherwise inspect local bottlenecks or move it out of the gate set.",
-        |summary| format!("{} is suspiciously flat for a duration-based throughput row.", summary.name),
+        |summary| {
+            format!(
+                "{} is suspiciously flat for a duration-based throughput row.",
+                summary.name
+            )
+        },
     );
 }
 
@@ -1676,7 +1674,6 @@ fn push_validity_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSum
         "Operations",
         &ordinary_summaries,
         "zero_completed_ops",
-        "Record completed logical work with measure_batch, operations, or record_external.",
         |summary| {
             format!(
                 "{} completed zero logical operations in at least one sample.",
@@ -1689,7 +1686,6 @@ fn push_validity_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSum
         "Timing",
         &ordinary_summaries,
         "invalid_timing",
-        "Measure exactly one non-empty workload for this row.",
         |summary| format!("{} recorded invalid timing.", summary.name),
     );
     let mut benchmark_errors = IssueGroup::with_fix(
@@ -1712,10 +1708,7 @@ fn push_validity_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSum
     }
     push_issue_group(groups, benchmark_errors);
 
-    let mut correctness = IssueGroup::with_fix(
-        "Correctness",
-        "Inspect correctness counters before using this performance number.",
-    );
+    let mut correctness = IssueGroup::with_fix("Correctness", catalog_fix("correctness_failure"));
     for summary in summaries.iter().copied().filter(|summary| {
         !summary.correctness.passed && !summary.metadata.contains_key("benchmark_error")
     }) {
@@ -1730,11 +1723,7 @@ fn push_validity_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSum
         .filter(|summary| summary.budget_results.iter().any(|result| !result.passed))
     {
         if budget.fix.is_none() {
-            budget.fix = Some(diagnostic_fix(
-                summary,
-                "budget_failure",
-                "Inspect the failing budget, then either reduce measured cost or intentionally update the budget.",
-            ));
+            budget.fix = Some(diagnostic_fix(summary, "budget_failure"));
         }
         budget.push(format!(
             "{} failed budget checks: {}.",
@@ -1750,17 +1739,14 @@ fn push_comparison_issues(
     summaries: &[&BenchmarkSummary],
     comparisons: &BTreeMap<&str, &ComparisonResult>,
 ) {
-    let mut regressions = IssueGroup::with_fix(
-        "Regression",
-        "Inspect the same benchmark row before updating the baseline.",
-    );
+    let mut regressions = IssueGroup::with_fix("Regression", catalog_fix("regression"));
     let mut improvements = IssueGroup::with_fix(
         "Improvement",
         "Update baselines only when the improvement is intentional.",
     );
     let mut semantic_changes = IssueGroup::with_fix(
         "Baseline semantics",
-        "Refresh the baseline after confirming the semantic change is intentional.",
+        catalog_fix("baseline_semantics_changed"),
     );
     for summary in summaries {
         if let Some(comparison) = comparisons.get(summary.benchmark_id.as_str()).copied() {
@@ -1804,11 +1790,7 @@ fn push_allocation_issue(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSu
         .collect::<Vec<_>>();
     let mut group = IssueGroup::with_fix(
         "Allocation",
-        first_diagnostic_fix(
-            summaries,
-            "high_allocations",
-            "Move reusable allocations into setup or make the allocation budget explicit.",
-        ),
+        first_diagnostic_fix(summaries, "high_allocations"),
     );
     match names.as_slice() {
         [] => {}
@@ -1822,20 +1804,13 @@ fn push_allocation_issue(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSu
 }
 
 fn push_variance_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSummary]) {
-    push_diagnostic_group(
-        groups,
-        "Variance",
-        summaries,
-        "high_variance",
-        "Use deterministic fixtures and move setup outside the measured work.",
-        |summary| {
-            let rsd = summary.stats.as_ref().map_or_else(
-                || "unknown".to_string(),
-                |stats| format_percent(stats.relative_std_dev),
-            );
-            format!("{} ({rsd})", summary.name)
-        },
-    );
+    push_diagnostic_group(groups, "Variance", summaries, "high_variance", |summary| {
+        let rsd = summary.stats.as_ref().map_or_else(
+            || "unknown".to_string(),
+            |stats| format_percent(stats.relative_std_dev),
+        );
+        format!("{} ({rsd})", summary.name)
+    });
 }
 
 fn push_sample_count_issue(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSummary]) {
@@ -1847,11 +1822,7 @@ fn push_sample_count_issue(groups: &mut Vec<IssueGroup>, summaries: &[&Benchmark
         .collect::<Vec<_>>();
     let mut group = IssueGroup::with_fix(
         "Samples",
-        first_diagnostic_fix(
-            summaries,
-            "too_few_samples",
-            "Collect at least five measured samples, or use the release profile for gate-quality rows.",
-        ),
+        first_diagnostic_fix(summaries, "too_few_samples"),
     );
     match names.as_slice() {
         [] => {}
@@ -1919,13 +1890,11 @@ fn push_diagnostic_group<F>(
     title: &'static str,
     summaries: &[&BenchmarkSummary],
     code: &str,
-    fallback_fix: &str,
     format_item: F,
 ) where
     F: Fn(&BenchmarkSummary) -> String,
 {
-    let mut group =
-        IssueGroup::with_fix(title, first_diagnostic_fix(summaries, code, fallback_fix));
+    let mut group = IssueGroup::with_fix(title, first_diagnostic_fix(summaries, code));
     for summary in summaries
         .iter()
         .copied()
@@ -1942,23 +1911,25 @@ fn push_issue_group(groups: &mut Vec<IssueGroup>, group: IssueGroup) {
     }
 }
 
-fn diagnostic_fix(summary: &BenchmarkSummary, code: &str, fallback: &str) -> String {
+/// Fix text for `code`: the row's own contextual suggestion when present,
+/// otherwise the catalog fix.
+fn diagnostic_fix(summary: &BenchmarkSummary, code: &str) -> String {
     summary
         .diagnostics
         .iter()
         .find(|diagnostic| diagnostic.code == code)
         .and_then(|diagnostic| diagnostic.suggestions.first())
-        .map_or_else(|| fallback.to_string(), Clone::clone)
+        .map_or_else(|| catalog_fix(code).to_string(), Clone::clone)
 }
 
-fn first_diagnostic_fix(summaries: &[&BenchmarkSummary], code: &str, fallback: &str) -> String {
+fn first_diagnostic_fix(summaries: &[&BenchmarkSummary], code: &str) -> String {
     summaries
         .iter()
         .copied()
         .find(|summary| has_diagnostic(summary, code))
         .map_or_else(
-            || fallback.to_string(),
-            |summary| diagnostic_fix(summary, code, fallback),
+            || catalog_fix(code).to_string(),
+            |summary| diagnostic_fix(summary, code),
         )
 }
 
@@ -4255,6 +4226,10 @@ mod tests {
         assert!(
             report.contains("Fix: Inspect the same benchmark row before updating the baseline.")
         );
+        assert!(report.contains(&format!(
+            "Fix: {}",
+            crate::diagnostics::catalog_fix("regression")
+        )));
         assert!(report.contains("Fix: Batch more logical work per sample."));
         assert!(report
             .trim_end()

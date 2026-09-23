@@ -12,6 +12,9 @@ pub const SCHEMA_VERSION: &str = "cntryl-stress.v2";
 /// Machine-readable JSON Schema for [`StressRun`] artifacts.
 pub const ARTIFACT_JSON_SCHEMA: &str = include_str!("../schema/cntryl-stress.v2.schema.json");
 
+/// Evidence key carrying the measured `Instant` granularity on `too_fast`.
+const TIMER_RESOLUTION_EVIDENCE_KEY: &str = "timer_resolution_ns";
+
 const LATENCY_ESTIMATOR_METADATA_KEY: &str = "cntryl_stress_latency_estimator";
 const PER_SAMPLE_P95_STUDENT_T_ESTIMATOR: &str = "per_sample_p95_mean_student_t_95";
 
@@ -2201,12 +2204,19 @@ fn normalized_summary_for_validation(
     summary: &BenchmarkSummary,
 ) -> Result<serde_json::Value, String> {
     let mut normalized = summary.clone();
+    // Comparison-time codes depend on the other artifact, and codes or
+    // evidence added after v0.4 are absent from older baselines. Suggestions
+    // are advisory text that may be reworded between releases.
     normalized.diagnostics.retain(|diagnostic| {
         !matches!(
             diagnostic.code.as_str(),
-            "regression" | "baseline_semantics_changed"
+            "regression" | "baseline_semantics_changed" | "non_finite_samples_dropped"
         )
     });
+    for diagnostic in &mut normalized.diagnostics {
+        diagnostic.suggestions.clear();
+        diagnostic.evidence.remove(TIMER_RESOLUTION_EVIDENCE_KEY);
+    }
     serde_json::to_value(normalized)
         .map_err(|error| format!("failed to normalize baseline summary: {error}"))
 }
@@ -2772,9 +2782,7 @@ pub(crate) fn attach_regression_diagnostics(
                 ),
                 ("threshold".to_string(), comparison.threshold.to_string()),
             ]),
-            suggestions: vec![
-                "Compare the same benchmark row before updating baselines.".to_string()
-            ],
+            suggestions: catalog_suggestions("regression"),
         });
     }
 
@@ -2798,10 +2806,7 @@ pub(crate) fn attach_regression_diagnostics(
                 .clone()
                 .unwrap_or_else(|| "The row semantics changed relative to baseline.".to_string()),
             evidence: BTreeMap::new(),
-            suggestions: vec![
-                "Refresh the baseline after confirming the semantic change is intentional."
-                    .to_string(),
-            ],
+            suggestions: catalog_suggestions("baseline_semantics_changed"),
         });
     }
 }
@@ -2849,10 +2854,7 @@ pub(crate) fn attach_measurement_mode_mismatch_diagnostics(summaries: &mut [Benc
                             mode_names.clone(),
                         ),
                     ]),
-                    suggestions: vec![
-                        "Use one measurement_mode per workload family, or split fixed-op probes into explicit diagnostic rows."
-                            .to_string(),
-                    ],
+            suggestions: catalog_suggestions("measurement_mode_mismatch"),
                 });
                 summary.trust_class = derive_trust_class_from_summary(summary);
             }
@@ -3306,7 +3308,6 @@ fn summary_diagnostics(input: DiagnosticInputs<'_>) -> Vec<BenchmarkDiagnostic> 
             DiagnosticSeverity::Error,
             "At least one measured sample recorded zero or invalid timing.",
             [("invalid_samples", invalid_timing_count(samples).to_string())],
-            ["Measure exactly one non-empty workload for this row."],
         ));
     }
     if samples
@@ -3321,7 +3322,6 @@ fn summary_diagnostics(input: DiagnosticInputs<'_>) -> Vec<BenchmarkDiagnostic> 
                 "zero_completed_samples",
                 zero_completed_count(samples).to_string(),
             )],
-            ["Record completed logical work with measure_batch, operations, or record_external."],
         ));
     }
     if !correctness_passed {
@@ -3330,7 +3330,6 @@ fn summary_diagnostics(input: DiagnosticInputs<'_>) -> Vec<BenchmarkDiagnostic> 
             DiagnosticSeverity::Error,
             "Correctness counters did not pass for this benchmark row.",
             [],
-            ["Inspect correctness counters before using this performance number."],
         ));
     }
     if samples.len() < 5 {
@@ -3343,7 +3342,6 @@ fn summary_diagnostics(input: DiagnosticInputs<'_>) -> Vec<BenchmarkDiagnostic> 
             },
             "The row has too few measured samples to make a stable decision.",
             [("measured_samples", samples.len().to_string())],
-            ["Collect at least five measured samples, or use the release profile for gate-quality rows."],
         ));
     }
     if stats.is_some_and(|stats| stats.relative_std_dev > 0.10) {
@@ -3369,7 +3367,6 @@ fn summary_diagnostics(input: DiagnosticInputs<'_>) -> Vec<BenchmarkDiagnostic> 
                     .unwrap_or_default()
                     .to_string(),
             )],
-            ["Batch more logical work per measurement or use Tier 1 for hot-path micro timing."],
         ));
     }
     if has_overhead_dominant_sample(samples, overhead_ns_per_op) {
@@ -3378,7 +3375,6 @@ fn summary_diagnostics(input: DiagnosticInputs<'_>) -> Vec<BenchmarkDiagnostic> 
             DiagnosticSeverity::Error,
             "Timing overhead or setup dominates the measured work.",
             overhead_evidence(overhead_ns_per_op),
-            ["Increase measured work per iteration and keep setup outside the measurement closure."],
         ));
     }
     if spec.budgets.requires_allocation_tracking()
@@ -3386,12 +3382,14 @@ fn summary_diagnostics(input: DiagnosticInputs<'_>) -> Vec<BenchmarkDiagnostic> 
             .iter()
             .any(|sample| sample.allocs_per_op.is_none() || sample.bytes_per_op.is_none())
     {
-        diagnostics.push(diagnostic(
+        // Contextual fix: the generic budget advice does not apply when the
+        // budget cannot be evaluated at all.
+        diagnostics.push(diagnostic_with_evidence(
             "budget_failure",
             DiagnosticSeverity::Error,
             "An allocation budget was configured but allocation tracking is unavailable.",
-            [("budget", "allocation".to_string())],
-            ["Install cntryl_stress::stress_allocator!() in the benchmark crate."],
+            BTreeMap::from([("budget".to_string(), "allocation".to_string())]),
+            vec!["Install cntryl_stress::stress_allocator!() in the benchmark crate.".to_string()],
         ));
     }
     if budget_results.iter().any(|result| !result.passed) {
@@ -3400,7 +3398,7 @@ fn summary_diagnostics(input: DiagnosticInputs<'_>) -> Vec<BenchmarkDiagnostic> 
             DiagnosticSeverity::Error,
             "One or more explicit benchmark budgets failed.",
             budget_failure_evidence(budget_results),
-            vec!["Inspect the failing budget, then either reduce measured cost or intentionally update the budget.".to_string()],
+            catalog_suggestions("budget_failure"),
         ));
     }
     if has_unbudgeted_high_allocations(spec, allocs_per_op, bytes_per_op) {
@@ -3423,7 +3421,6 @@ fn summary_diagnostics(input: DiagnosticInputs<'_>) -> Vec<BenchmarkDiagnostic> 
                     .map(|stats| stats.mean.to_string())
                     .unwrap_or_default(),
             )],
-            ["Vary inputs, accumulate observable outputs, and use #[stress(metadata(validated_micro = \"true\"))] only after anti-DCE is explicit."],
         ));
     } else if should_flag_tiny_micro_timing(spec, ns_per_op) {
         diagnostics.push(diagnostic(
@@ -3436,7 +3433,6 @@ fn summary_diagnostics(input: DiagnosticInputs<'_>) -> Vec<BenchmarkDiagnostic> 
                     .map(|stats| stats.mean.to_string())
                     .unwrap_or_default(),
             )],
-            ["Batch more logical work per sample, or declare role = \"diagnostic\" after validating the microbenchmark shape."],
         ));
     }
     if batch_unit_ambiguous(spec) {
@@ -3445,10 +3441,7 @@ fn summary_diagnostics(input: DiagnosticInputs<'_>) -> Vec<BenchmarkDiagnostic> 
             DiagnosticSeverity::Warning,
             "Batched work is missing explicit logical-unit normalization metadata.",
             batch_unit_ambiguity_evidence(spec),
-            vec![
-                "Add logical_unit and any *_per_logical_operation parameter so the report can state the measured question directly."
-                    .to_string(),
-            ],
+            catalog_suggestions("batch_unit_ambiguous"),
         ));
     }
     if fixed_ops_throughput(spec, samples) {
@@ -3463,10 +3456,7 @@ fn summary_diagnostics(input: DiagnosticInputs<'_>) -> Vec<BenchmarkDiagnostic> 
                 ),
                 ("tier".to_string(), spec.tier.to_string()),
             ]),
-            vec![
-                "Use duration-based throughput for main rows, or split the fixed-op probe into an explicit diagnostic row."
-                    .to_string(),
-            ],
+            catalog_suggestions("fixed_ops_throughput"),
         ));
     }
     if flat_or_capped_throughput(spec, stats, wall_clock, samples) {
@@ -3475,10 +3465,7 @@ fn summary_diagnostics(input: DiagnosticInputs<'_>) -> Vec<BenchmarkDiagnostic> 
             DiagnosticSeverity::Warning,
             "Throughput is near-perfectly flat while completed logical work is effectively fixed across samples.",
             flat_or_capped_throughput_evidence(stats, wall_clock, samples),
-            vec![
-                "Confirm whether this row is an intentional capped-capacity probe; otherwise inspect local bottlenecks or move it out of the gate set."
-                    .to_string(),
-            ],
+            catalog_suggestions("flat_or_capped_throughput"),
         ));
     }
     if (3..=MAX_TIER).contains(&spec.tier)
@@ -3492,7 +3479,6 @@ fn summary_diagnostics(input: DiagnosticInputs<'_>) -> Vec<BenchmarkDiagnostic> 
             DiagnosticSeverity::Warning,
             "A throughput-tier row completed only one operation per sample.",
             [("tier", spec.tier.to_string())],
-            ["Use measure_batch or record_external for throughput work, or move a single-operation row to Tier 2."],
         ));
     }
     if spec.intent == MeasurementIntent::Async
@@ -3505,18 +3491,17 @@ fn summary_diagnostics(input: DiagnosticInputs<'_>) -> Vec<BenchmarkDiagnostic> 
             DiagnosticSeverity::Info,
             "Async measurement did not show observable scheduling or await overhead.",
             [("intent", spec.intent.to_string())],
-            ["Make sure the measured future awaits the real async operation instead of spawning detached work."],
         ));
     }
     diagnostics
 }
 
-fn diagnostic<const E: usize, const S: usize>(
+/// Build a diagnostic whose suggestion is the catalog fix for `code`.
+fn diagnostic<const E: usize>(
     code: &'static str,
     severity: DiagnosticSeverity,
     reason: &'static str,
     evidence: [(&'static str, String); E],
-    suggestions: [&'static str; S],
 ) -> BenchmarkDiagnostic {
     BenchmarkDiagnostic {
         code: code.to_string(),
@@ -3526,7 +3511,7 @@ fn diagnostic<const E: usize, const S: usize>(
             .into_iter()
             .map(|(key, value)| (key.to_string(), value))
             .collect(),
-        suggestions: suggestions.into_iter().map(str::to_string).collect(),
+        suggestions: catalog_suggestions(code),
     }
 }
 
@@ -3543,6 +3528,15 @@ fn diagnostic_with_evidence(
         reason: reason.to_string(),
         evidence,
         suggestions,
+    }
+}
+
+fn catalog_suggestions(code: &str) -> Vec<String> {
+    let fix = crate::diagnostics::catalog_fix(code);
+    if fix.is_empty() {
+        Vec::new()
+    } else {
+        vec![fix.to_string()]
     }
 }
 
@@ -5417,6 +5411,48 @@ mod tests {
 
         assert_eq!(json["schema_version"], SCHEMA_VERSION);
         assert_eq!(json["samples"].as_array().expect("samples").len(), 0);
+    }
+
+    #[test]
+    fn baseline_validation_ignores_advisory_diagnostic_text_and_new_codes() {
+        let spec = spec("bench");
+        let samples = vec![
+            completed_sample("bench", 0, 100, 1),
+            completed_sample("bench", 1, 100, 1),
+        ];
+        let mut summary = summarize_benchmark(&spec, &samples);
+        assert!(summary
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "too_few_samples"));
+        for diagnostic in &mut summary.diagnostics {
+            diagnostic.suggestions = vec!["wording from an older release".to_string()];
+            diagnostic
+                .evidence
+                .insert("timer_resolution_ns".to_string(), "41".to_string());
+        }
+        summary.diagnostics.retain(|diagnostic| diagnostic.code != "non_finite_samples_dropped");
+        let run = StressRun {
+            schema_version: SCHEMA_VERSION.to_string(),
+            tool_version: "0.4.0".to_string(),
+            suite: "suite".to_string(),
+            run_profile: RunProfile::Default,
+            environment: test_env(),
+            benchmark_specs: vec![spec],
+            samples,
+            summaries: vec![summary],
+            comparisons: Vec::new(),
+            diagnostics_summary: Vec::new(),
+            started_at: "123".to_string(),
+            total_elapsed_ns: 0,
+            metadata: BTreeMap::from([(
+                SUMMARY_SEMANTICS_METADATA_KEY.to_string(),
+                SUMMARY_SEMANTICS_CURRENT.to_string(),
+            )]),
+        };
+
+        run.canonical_baseline_summaries()
+            .expect("advisory text and post-v0.4 additions must not invalidate baselines");
     }
 
     #[test]
