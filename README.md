@@ -447,10 +447,10 @@ Command-line arguments override `STRESS_*` environment variables, which override
 | Variable | Description |
 |----------|-------------|
 | `STRESS_PROFILE` | Optional profile override: `default`, `smoke`, `lab`, or `release` |
-| `STRESS_SAMPLES` | Measured samples per benchmark |
+| `STRESS_SAMPLES` | Measured samples per benchmark; must be greater than 0 |
 | `STRESS_WARMUP_SAMPLES` | Warmup samples |
 | `STRESS_COOLDOWN_SAMPLES` | Cooldown samples |
-| `STRESS_FILTER` | Benchmark name/module glob; an unmatched selection is fatal |
+| `STRESS_FILTER` | Benchmark name/module glob; must not be empty or whitespace; an unmatched selection is fatal |
 | `STRESS_TIER` | Exact tier filter, 1 through 6 |
 | `STRESS_TIMEOUT_SECS` | Positive per-benchmark deadline in seconds |
 | `STRESS_OUTPUT_DIR` | Artifact output directory |
@@ -460,14 +460,17 @@ Command-line arguments override `STRESS_*` environment variables, which override
 | `STRESS_BASELINE_DIR` | Baseline directory for `latest` and `--save-baseline` conventions |
 | `STRESS_SAVE_BASELINE` | Save a passed run under the baseline directory |
 | `STRESS_THRESHOLD` | Regression threshold as a fraction (`0.05` means 5%) |
-| `STRESS_GIT_SHA` | Git SHA override |
+| `STRESS_GIT_SHA` | Git SHA override; an empty value is treated as unset (with a warning) and the SHA is auto-detected |
 | `STRESS_SAMPLE_DURATION_MS` | Fixed-duration sample budget |
 | `STRESS_OPERATIONS_PER_SAMPLE` | Fixed-operations sample size |
 | `STRESS_MICRO_SAMPLE_DURATION_MS` | Micro sample target duration |
 | `STRESS_RUN_ID` | Run generation identity copied into artifact metadata |
 | `STRESS_BUILD_INPUT_IDENTITY` | Advanced direct-run identity for non-default feature/target builds; the wrapper sets this automatically |
 | `STRESS_FAIL_ON_ISSUES` | Fail on warning-or-error diagnostics |
-| `STRESS_DENY_DIAGNOSTICS` | Fail on diagnostics at `info`, `warning`, or `error` |
+| `STRESS_DENY_DIAGNOSTICS` | Fail on diagnostics at `info`, `warning`, or `error`; when set together with `STRESS_FAIL_ON_ISSUES`, the stricter of the two applies and a disagreement prints a warning |
+| `STRESS_FAIL_ON_REGRESSION` | `true`/`false`: whether meaningful regressions fail the run (overrides the profile) |
+| `STRESS_FAIL_ON_QUALITY` | `true`/`false`: whether quality below the minimum fails the run (overrides the profile) |
+| `STRESS_MIN_QUALITY` | Minimum quality: `authoritative`, `acceptable`, `noisy`, or `untrustworthy` |
 | `STRESS_CONSOLE_NAMES` | Human console name mode: `compact` or `full` |
 | `STRESS_PROGRESS` | Enable or disable stderr progress for human output |
 
@@ -644,6 +647,11 @@ under `cntryl_stress::reporting`, and run gate helpers are under
   regression baseline.
 
 ## Programmatic Runner
+
+`StressRunnerConfig::filter` selects programmatic benchmarks whose name (the
+string passed to `run`, or `BenchmarkSpec::name`) contains the pattern as a
+substring. The suite name is not matched, so a filter equal to the suite name
+does not select every benchmark.
 
 ```rust
 use cntryl_stress::{black_box, StressRunner, StressRunnerConfig};

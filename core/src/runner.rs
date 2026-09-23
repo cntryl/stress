@@ -151,14 +151,24 @@ impl StressRunner {
     }
 
     /// Replace reporters.
+    ///
+    /// Each new reporter receives `suite_start` immediately, so it observes
+    /// exactly one suite start before any benchmark events.
     pub fn reporters(&mut self, reporters: Vec<Box<dyn Reporter>>) -> &mut Self {
+        for reporter in &reporters {
+            reporter.suite_start(&self.suite, &self.config);
+        }
         self.reporters = reporters;
         self.deferred_reporters.clear();
         self
     }
 
     /// Add a reporter.
+    ///
+    /// The reporter receives `suite_start` immediately, so it observes exactly
+    /// one suite start before any benchmark events.
     pub fn add_reporter(&mut self, reporter: Box<dyn Reporter>) -> &mut Self {
+        reporter.suite_start(&self.suite, &self.config);
         self.reporters.push(reporter);
         self
     }
@@ -365,7 +375,9 @@ impl StressRunner {
             }
         }
         if let Some(filter) = &self.config.filter {
-            spec.name.contains(filter) || spec.id.contains(filter)
+            // Match the benchmark name only: the suite-qualified id would let a
+            // filter equal to the suite name select every benchmark.
+            spec.name.contains(filter.as_str())
         } else {
             true
         }
@@ -394,7 +406,9 @@ impl StressRunner {
             if failed {
                 self.samples.truncate(start_sample);
                 *topology = MeasurementTopology::default();
-                topology.validate_invocation(base_spec, SamplePhase::Measured, &records);
+                // The user's error is the result. Register rows leniently so a
+                // topology or override mismatch cannot panic and hide it.
+                topology.register_failed_invocation(base_spec, &records);
                 for record in records {
                     let benchmark_id = measurement_id(&base_spec.id, &record.name);
                     let progress_name = topology
@@ -645,12 +659,28 @@ where
         } else {
             let mut error_ctx = StressContext::new(spec.tier, spec.mode.clone());
             error_ctx.record_benchmark_error(error.message());
-            records.extend(error_ctx.take_measurements());
+            let mut error_records = error_ctx.take_measurements();
+            for error_record in &mut error_records {
+                error_record.name = unique_record_name(&records, &error_record.name);
+            }
+            records.extend(error_records);
         }
         (records, wall_clock, true)
     } else {
         (ctx.take_measurements(), wall_clock, false)
     }
+}
+
+fn unique_record_name(records: &[MeasurementRecord], base: &str) -> String {
+    let taken = |candidate: &str| records.iter().any(|record| record.name == candidate);
+    if !taken(base) {
+        return base.to_string();
+    }
+    // At most `records.len()` names are taken, so this range always has a free slot.
+    (2..=records.len() + 2)
+        .map(|suffix| format!("{base} ({suffix})"))
+        .find(|candidate| !taken(candidate))
+        .expect("an unused suffix exists")
 }
 
 fn measurement_id(base_id: &str, measurement_name: &str) -> String {
@@ -707,6 +737,29 @@ impl MeasurementTopology {
         for record in records {
             self.register_record(base_spec, phase, record);
         }
+    }
+
+    /// Register the rows of a failed invocation without enforcing the
+    /// cross-invocation contract, so the user's error is always reported.
+    fn register_failed_invocation(
+        &mut self,
+        base_spec: &BenchmarkSpec,
+        records: &[MeasurementRecord],
+    ) {
+        for record in records {
+            let benchmark_id = measurement_id(&base_spec.id, &record.name);
+            if self.specs.contains_key(&benchmark_id) {
+                continue;
+            }
+            let candidate = measurement_spec(base_spec, record, &benchmark_id);
+            self.spec_order.push(benchmark_id.clone());
+            self.specs.insert(benchmark_id.clone(), candidate);
+            self.overrides.insert(
+                benchmark_id,
+                MeasurementOverrideContract::from_record(record),
+            );
+        }
+        self.names = Some(records.iter().map(|record| record.name.clone()).collect());
     }
 
     fn register_record(
@@ -1033,7 +1086,27 @@ fn run_timestamp_stem() -> String {
 }
 
 /// Gate decision for a finished run.
+///
+/// New gate outcomes may be added in minor releases, so matches outside this
+/// crate need a wildcard arm:
+///
+/// ```compile_fail
+/// use cntryl_stress::runner::RunGate;
+///
+/// fn label(gate: RunGate) -> &'static str {
+///     match gate {
+///         RunGate::Passed => "passed",
+///         RunGate::CorrectnessFailed => "correctness",
+///         RunGate::QualityFailed => "quality",
+///         RunGate::RegressionFailed => "regression",
+///         RunGate::DiagnosticsFailed => "diagnostics",
+///         RunGate::BudgetFailed => "budget",
+///         RunGate::ArtifactFailed => "artifact",
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RunGate {
     /// The run satisfies correctness, quality, and regression policy.
     Passed,
@@ -2503,5 +2576,158 @@ mod tests {
                 ..CorrectnessCounters::default()
             }
         );
+    }
+
+    #[test]
+    fn failed_invocation_with_row_warmup_override_records_user_error() {
+        let config = StressRunnerConfig::new()
+            .samples(2)
+            .warmup_samples(1)
+            .cooldown_samples(0);
+        let mut runner = StressRunner::with_config("suite", config);
+        runner.reporters(Vec::new());
+
+        runner.run("fallible", |ctx| {
+            ctx.benchmark("work")
+                .warmup(1)
+                .measure_result(|| Err::<(), _>("warmup transport failed"))?;
+            Ok::<(), &str>(())
+        });
+        let run = runner.finish();
+
+        assert_eq!(run.summaries.len(), 1);
+        assert!(!run.summaries[0].correctness.passed);
+        assert_eq!(
+            run.summaries[0].metadata.get("benchmark_error"),
+            Some(&"warmup transport failed".to_string())
+        );
+        assert_eq!(evaluate_run_gate(&run), RunGate::CorrectnessFailed);
+    }
+
+    #[test]
+    fn failed_invocation_after_overridden_rows_records_synthetic_error_row() {
+        let config = StressRunnerConfig::new()
+            .samples(2)
+            .warmup_samples(0)
+            .cooldown_samples(0);
+        let mut runner = StressRunner::with_config("suite", config);
+        runner.reporters(Vec::new());
+
+        runner.run("fallible", |ctx| {
+            ctx.benchmark("work").samples(3).cooldown(1).measure(|| {});
+            Err::<(), _>("teardown failed")
+        });
+        let run = runner.finish();
+
+        let error_row = run
+            .summaries
+            .iter()
+            .find(|summary| summary.metadata.contains_key("benchmark_error"))
+            .expect("error row");
+        assert_eq!(
+            error_row.metadata.get("benchmark_error"),
+            Some(&"teardown failed".to_string())
+        );
+        assert!(!error_row.correctness.passed);
+        assert_eq!(evaluate_run_gate(&run), RunGate::CorrectnessFailed);
+    }
+
+    #[test]
+    fn failed_invocation_with_user_row_named_benchmark_error_does_not_collide() {
+        let config = StressRunnerConfig::new()
+            .samples(1)
+            .warmup_samples(0)
+            .cooldown_samples(0);
+        let mut runner = StressRunner::with_config("suite", config);
+        runner.reporters(Vec::new());
+
+        runner.run("fallible", |ctx| {
+            ctx.measure("benchmark error", || {});
+            Err::<(), _>("late failure")
+        });
+        let run = runner.finish();
+
+        assert_eq!(run.summaries.len(), 2);
+        let ids = run
+            .summaries
+            .iter()
+            .map(|summary| summary.benchmark_id.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), 2);
+        assert!(run.summaries.iter().any(|summary| summary
+            .metadata
+            .get("benchmark_error")
+            .is_some_and(|message| message == "late failure")));
+        assert_eq!(evaluate_run_gate(&run), RunGate::CorrectnessFailed);
+    }
+
+    #[test]
+    fn filter_matches_benchmark_name_not_suite_name() {
+        let config = StressRunnerConfig::new()
+            .samples(1)
+            .warmup_samples(0)
+            .filter("storage");
+        let mut runner = StressRunner::with_config("storage", config);
+        runner.reporters(Vec::new());
+
+        runner.run("parse", |ctx| {
+            ctx.measure("work", || {});
+        });
+        runner.run("storage_write", |ctx| {
+            ctx.measure("work", || {});
+        });
+        let run = runner.finish();
+
+        assert_eq!(run.summaries.len(), 1);
+        assert_eq!(run.summaries[0].benchmark_id, "storage/storage_write/work");
+    }
+
+    struct CountingSuiteStartReporter {
+        starts: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Reporter for CountingSuiteStartReporter {
+        fn suite_start(&self, suite: &str, _config: &StressRunnerConfig) {
+            self.starts
+                .lock()
+                .expect("capture start")
+                .push(format!("start:{suite}"));
+        }
+
+        fn bench_start(&self, spec: &BenchmarkSpec) {
+            self.starts
+                .lock()
+                .expect("capture bench")
+                .push(format!("bench:{}", spec.name));
+        }
+    }
+
+    #[test]
+    fn late_reporters_receive_suite_start_exactly_once_before_bench_events() {
+        let replaced = Arc::new(Mutex::new(Vec::new()));
+        let added = Arc::new(Mutex::new(Vec::new()));
+        let config = StressRunnerConfig::new().samples(1).warmup_samples(0);
+        let mut runner = StressRunner::with_config("suite", config);
+        runner.reporters(vec![Box::new(CountingSuiteStartReporter {
+            starts: Arc::clone(&replaced),
+        })]);
+        runner.add_reporter(Box::new(CountingSuiteStartReporter {
+            starts: Arc::clone(&added),
+        }));
+        runner.run("one", |ctx| {
+            ctx.measure("work", || {});
+        });
+        runner.run("two", |ctx| {
+            ctx.measure("work", || {});
+        });
+        let _ = runner.finish();
+
+        let expected = vec![
+            "start:suite".to_string(),
+            "bench:one".to_string(),
+            "bench:two".to_string(),
+        ];
+        assert_eq!(*replaced.lock().expect("replaced"), expected);
+        assert_eq!(*added.lock().expect("added"), expected);
     }
 }
