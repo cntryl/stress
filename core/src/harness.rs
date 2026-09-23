@@ -1997,7 +1997,7 @@ mod tests {
 
         assert_eq!(
             resolved.config.deny_diagnostics,
-            Some(DiagnosticSeverity::Error)
+            Some(DiagnosticSeverity::Warning)
         );
         assert_eq!(resolved.config.console_names, ConsoleNameMode::Full);
         assert!(!resolved.config.progress);
@@ -2010,7 +2010,7 @@ mod tests {
         );
         assert_eq!(
             resolved.metadata.get("deny_diagnostics_src"),
-            Some(&"env STRESS_DENY_DIAGNOSTICS".to_string())
+            Some(&"env STRESS_FAIL_ON_ISSUES".to_string())
         );
     }
 

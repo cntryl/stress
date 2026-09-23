@@ -13,6 +13,9 @@ pub(crate) struct EnvConfigResolution {
     pub config: StressRunnerConfig,
     pub metadata: HashMap<String, String>,
     pub warnings: Vec<String>,
+    /// Non-fatal notices (already printed to stderr) about how ambiguous
+    /// environment input was resolved.
+    pub notices: Vec<String>,
 }
 
 impl EnvConfigResolution {
@@ -21,6 +24,7 @@ impl EnvConfigResolution {
             config,
             metadata: HashMap::new(),
             warnings: Vec::new(),
+            notices: Vec::new(),
         }
     }
 }
@@ -545,6 +549,7 @@ where
     apply_selection_env_overrides(get_var, resolution);
     apply_execution_env_overrides(get_var, resolution);
     apply_diagnostic_env_overrides(get_var, resolution);
+    apply_policy_env_overrides(get_var, resolution);
 }
 
 fn apply_sample_env_overrides<F>(get_var: &F, resolution: &mut EnvConfigResolution)
@@ -556,7 +561,7 @@ where
         resolution,
         "STRESS_SAMPLES",
         "samples",
-        |value| value.parse::<usize>().ok(),
+        |value| value.parse::<usize>().ok().filter(|value| *value != 0),
         |config, value| config.samples = value,
     );
     parse_env(
@@ -602,23 +607,36 @@ where
         resolution,
         "STRESS_FILTER",
         "filter",
-        |value| Some(value.to_string()),
+        |value| (!value.trim().is_empty()).then(|| value.to_string()),
         |config, value| config.filter = Some(value),
     );
-    parse_env(
-        &get_var,
-        resolution,
-        "STRESS_GIT_SHA",
-        "git_sha",
-        |value| Some(value.to_string()),
-        |config, value| config.git_sha = Some(value),
-    );
+    if get_var("STRESS_GIT_SHA").is_some_and(|value| value.trim().is_empty()) {
+        push_notice(
+            resolution,
+            "STRESS_GIT_SHA is empty; treating it as unset and auto-detecting the git SHA"
+                .to_string(),
+        );
+    } else {
+        parse_env(
+            &get_var,
+            resolution,
+            "STRESS_GIT_SHA",
+            "git_sha",
+            |value| Some(value.to_string()),
+            |config, value| config.git_sha = Some(value),
+        );
+    }
     parse_env(
         &get_var,
         resolution,
         "STRESS_TIER",
         "tier",
-        |value| value.parse::<u32>().ok(),
+        |value| {
+            value
+                .parse::<u32>()
+                .ok()
+                .filter(|tier| (1..=MAX_TIER).contains(tier))
+        },
         |config, value| config.tier = Some(value),
     );
     parse_env(
@@ -694,42 +712,100 @@ fn apply_diagnostic_env_overrides<F>(get_var: &F, resolution: &mut EnvConfigReso
 where
     F: Fn(&str) -> Option<String>,
 {
-    if let Some(value) = get_var("STRESS_FAIL_ON_ISSUES") {
-        match parse_bool_env(&value) {
-            Some(true) => {
-                resolution.config.deny_diagnostics = Some(DiagnosticSeverity::Warning);
-                resolution.metadata.insert(
-                    "deny_diagnostics_src".to_string(),
-                    "env STRESS_FAIL_ON_ISSUES".to_string(),
-                );
-            }
-            Some(false) => {
-                resolution.config.deny_diagnostics = None;
-                resolution.metadata.insert(
-                    "deny_diagnostics_src".to_string(),
-                    "env STRESS_FAIL_ON_ISSUES".to_string(),
-                );
-            }
-            None => resolution
+    let fail_on_issues = get_var("STRESS_FAIL_ON_ISSUES").and_then(|value| {
+        let parsed =
+            parse_bool_env(&value).map(|enabled| enabled.then_some(DiagnosticSeverity::Warning));
+        if parsed.is_none() {
+            resolution
                 .warnings
-                .push("invalid STRESS_FAIL_ON_ISSUES; expected true or false".to_string()),
+                .push("invalid STRESS_FAIL_ON_ISSUES; expected true or false".to_string());
         }
-    }
+        parsed
+    });
+    let deny = get_var("STRESS_DENY_DIAGNOSTICS").and_then(|value| {
+        let parsed = value.parse::<DiagnosticSeverity>().ok();
+        if parsed.is_none() {
+            resolution.warnings.push(
+                "invalid STRESS_DENY_DIAGNOSTICS; expected info, warning, or error".to_string(),
+            );
+        }
+        parsed
+    });
 
-    if let Some(value) = get_var("STRESS_DENY_DIAGNOSTICS") {
-        match value.parse::<DiagnosticSeverity>() {
-            Ok(threshold) => {
-                resolution.config.deny_diagnostics = Some(threshold);
-                resolution.metadata.insert(
-                    "deny_diagnostics_src".to_string(),
-                    "env STRESS_DENY_DIAGNOSTICS".to_string(),
+    let (threshold, source) = match (fail_on_issues, deny) {
+        (None, None) => return,
+        (Some(threshold), None) => (threshold, "env STRESS_FAIL_ON_ISSUES"),
+        (None, Some(threshold)) => (Some(threshold), "env STRESS_DENY_DIAGNOSTICS"),
+        (Some(issues), Some(deny)) => {
+            // Never let one variable silently weaken the other: resolve to the
+            // stricter gate and say so when they disagree.
+            let issues_is_stricter = issues.is_some_and(|issues| issues.rank() < deny.rank());
+            let (threshold, source) = if issues_is_stricter {
+                (issues, "env STRESS_FAIL_ON_ISSUES")
+            } else {
+                (Some(deny), "env STRESS_DENY_DIAGNOSTICS")
+            };
+            if issues != Some(deny) {
+                let resolved = threshold.map_or_else(|| "off".to_string(), |t| t.to_string());
+                push_notice(
+                    resolution,
+                    format!(
+                        "STRESS_FAIL_ON_ISSUES and STRESS_DENY_DIAGNOSTICS disagree; using the stricter diagnostic gate ({resolved}) from {source}"
+                    ),
                 );
             }
-            Err(_) => resolution.warnings.push(
-                "invalid STRESS_DENY_DIAGNOSTICS; expected info, warning, or error".to_string(),
-            ),
+            (threshold, source)
         }
+    };
+    resolution.config.deny_diagnostics = threshold;
+    resolution
+        .metadata
+        .insert("deny_diagnostics_src".to_string(), source.to_string());
+}
+
+fn apply_policy_env_overrides<F>(get_var: &F, resolution: &mut EnvConfigResolution)
+where
+    F: Fn(&str) -> Option<String>,
+{
+    parse_env(
+        &get_var,
+        resolution,
+        "STRESS_FAIL_ON_REGRESSION",
+        "fail_on_regression",
+        parse_bool_env,
+        |config, value| config.fail_on_regression = value,
+    );
+    parse_env(
+        &get_var,
+        resolution,
+        "STRESS_FAIL_ON_QUALITY",
+        "fail_on_quality",
+        parse_bool_env,
+        |config, value| config.fail_on_quality = value,
+    );
+    parse_env(
+        &get_var,
+        resolution,
+        "STRESS_MIN_QUALITY",
+        "min_quality",
+        parse_quality_env,
+        |config, value| config.min_quality = value,
+    );
+}
+
+fn parse_quality_env(value: &str) -> Option<QualityClass> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "authoritative" => Some(QualityClass::Authoritative),
+        "acceptable" => Some(QualityClass::Acceptable),
+        "noisy" => Some(QualityClass::Noisy),
+        "untrustworthy" => Some(QualityClass::Untrustworthy),
+        _ => None,
     }
+}
+
+fn push_notice(resolution: &mut EnvConfigResolution, notice: String) {
+    eprintln!("stress: warning: {notice}");
+    resolution.notices.push(notice);
 }
 
 fn parse_env<F, T, P, A>(
@@ -777,6 +853,9 @@ fn apply_default_sources(metadata: &mut HashMap<String, String>) {
         "operations_per_sample_src",
         "micro_sample_duration_src",
         "threshold_src",
+        "fail_on_regression_src",
+        "fail_on_quality_src",
+        "min_quality_src",
     ] {
         metadata
             .entry(key.to_string())
@@ -1094,5 +1173,133 @@ mod tests {
         }
         assert_eq!(cfg.mode_for_tier(0), None);
         assert_eq!(cfg.mode_for_tier(MAX_TIER + 1), None);
+    }
+
+    fn resolve(pairs: &[(&'static str, &str)]) -> EnvConfigResolution {
+        let env = pairs
+            .iter()
+            .map(|(key, value)| (*key, (*value).to_string()))
+            .collect::<HashMap<_, _>>();
+        StressRunnerConfig::resolve_from_env_with(|key| env.get(key).cloned())
+    }
+
+    #[test]
+    fn conflicting_diagnostic_env_vars_resolve_to_the_stricter_gate_with_notice() {
+        let resolution = resolve(&[
+            ("STRESS_FAIL_ON_ISSUES", "true"),
+            ("STRESS_DENY_DIAGNOSTICS", "error"),
+        ]);
+        assert_eq!(
+            resolution.config.deny_diagnostics,
+            Some(DiagnosticSeverity::Warning)
+        );
+        assert!(resolution.warnings.is_empty());
+        assert_eq!(resolution.notices.len(), 1);
+
+        let resolution = resolve(&[
+            ("STRESS_FAIL_ON_ISSUES", "false"),
+            ("STRESS_DENY_DIAGNOSTICS", "info"),
+        ]);
+        assert_eq!(
+            resolution.config.deny_diagnostics,
+            Some(DiagnosticSeverity::Info)
+        );
+        assert_eq!(resolution.notices.len(), 1);
+
+        let resolution = resolve(&[
+            ("STRESS_FAIL_ON_ISSUES", "true"),
+            ("STRESS_DENY_DIAGNOSTICS", "info"),
+        ]);
+        assert_eq!(
+            resolution.config.deny_diagnostics,
+            Some(DiagnosticSeverity::Info)
+        );
+        assert_eq!(resolution.notices.len(), 1);
+
+        let resolution = resolve(&[
+            ("STRESS_FAIL_ON_ISSUES", "true"),
+            ("STRESS_DENY_DIAGNOSTICS", "warning"),
+        ]);
+        assert_eq!(
+            resolution.config.deny_diagnostics,
+            Some(DiagnosticSeverity::Warning)
+        );
+        assert!(resolution.notices.is_empty());
+    }
+
+    #[test]
+    fn empty_git_sha_env_is_treated_as_unset_with_notice() {
+        for value in ["", "   "] {
+            let resolution = resolve(&[("STRESS_GIT_SHA", value)]);
+            assert!(resolution.warnings.is_empty());
+            assert_eq!(resolution.notices.len(), 1);
+            assert_ne!(
+                resolution.metadata.get("git_sha_src"),
+                Some(&"env STRESS_GIT_SHA".to_string())
+            );
+            assert_ne!(resolution.config.git_sha.as_deref(), Some(value));
+        }
+    }
+
+    #[test]
+    fn no_work_and_out_of_range_selection_env_values_are_rejected_at_parse_time() {
+        let resolution = resolve(&[
+            ("STRESS_SAMPLES", "0"),
+            ("STRESS_TIER", "7"),
+            ("STRESS_FILTER", "   "),
+        ]);
+        assert_eq!(resolution.config.samples, 5);
+        assert_eq!(resolution.config.tier, None);
+        assert_eq!(resolution.config.filter, None);
+        assert_eq!(
+            resolution.warnings,
+            vec![
+                "invalid STRESS_SAMPLES".to_string(),
+                "invalid STRESS_FILTER".to_string(),
+                "invalid STRESS_TIER".to_string(),
+            ]
+        );
+        let resolution = resolve(&[("STRESS_TIER", "0")]);
+        assert_eq!(resolution.warnings, vec!["invalid STRESS_TIER".to_string()]);
+    }
+
+    #[test]
+    fn quality_and_regression_policy_env_values_override_the_profile() {
+        let resolution = resolve(&[
+            ("STRESS_FAIL_ON_REGRESSION", "true"),
+            ("STRESS_FAIL_ON_QUALITY", "1"),
+            ("STRESS_MIN_QUALITY", "authoritative"),
+        ]);
+        assert!(resolution.warnings.is_empty());
+        assert!(resolution.config.fail_on_regression);
+        assert!(resolution.config.fail_on_quality);
+        assert_eq!(resolution.config.min_quality, QualityClass::Authoritative);
+        assert_eq!(
+            resolution.metadata.get("min_quality_src"),
+            Some(&"env STRESS_MIN_QUALITY".to_string())
+        );
+
+        let resolution = resolve(&[
+            ("STRESS_PROFILE", "release"),
+            ("STRESS_FAIL_ON_REGRESSION", "false"),
+            ("STRESS_FAIL_ON_QUALITY", "0"),
+        ]);
+        assert!(!resolution.config.fail_on_regression);
+        assert!(!resolution.config.fail_on_quality);
+        assert_eq!(
+            resolution.metadata.get("fail_on_quality_src"),
+            Some(&"env STRESS_FAIL_ON_QUALITY".to_string())
+        );
+
+        let resolution = resolve(&[
+            ("STRESS_FAIL_ON_REGRESSION", "maybe"),
+            ("STRESS_FAIL_ON_QUALITY", "yes"),
+            ("STRESS_MIN_QUALITY", "great"),
+        ]);
+        assert_eq!(resolution.warnings.len(), 3);
+        assert_eq!(
+            resolution.metadata.get("min_quality_src"),
+            Some(&"default".to_string())
+        );
     }
 }
