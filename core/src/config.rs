@@ -1275,10 +1275,7 @@ mod tests {
 
     #[test]
     fn no_work_and_out_of_range_selection_env_values_are_rejected_at_parse_time() {
-        let resolution = resolve(&[
-            ("STRESS_SAMPLES", "0"),
-            ("STRESS_TIER", "7"),
-        ]);
+        let resolution = resolve(&[("STRESS_SAMPLES", "0"), ("STRESS_TIER", "7")]);
         assert_eq!(resolution.config.samples, 5);
         assert_eq!(resolution.config.tier, None);
         assert_eq!(resolution.config.filter, None);

@@ -2759,8 +2759,11 @@ fn time_empty_iterations(iterations: u64) -> Duration {
 /// `gross - overhead` is kept as-is even when the per-operation time is below
 /// one timer tick. The measurement is never altered to signal quantization.
 fn setup_micro_overhead(iterations: u64, gross_elapsed: Duration) -> (Duration, Duration) {
-    let micro =
-        micro_measurement_from_overhead(iterations, gross_elapsed, time_empty_iterations(iterations));
+    let micro = micro_measurement_from_overhead(
+        iterations,
+        gross_elapsed,
+        time_empty_iterations(iterations),
+    );
     (micro.overhead, micro.net_elapsed)
 }
 
@@ -3606,7 +3609,11 @@ mod tests {
         for record in records {
             assert!(record.counters.completed >= 1, "{}", record.name);
             let micro = record.micro.expect("micro block");
-            assert_eq!(micro.iterations, record.counters.attempted, "{}", record.name);
+            assert_eq!(
+                micro.iterations, record.counters.attempted,
+                "{}",
+                record.name
+            );
         }
     }
 
