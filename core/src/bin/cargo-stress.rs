@@ -43,6 +43,7 @@ use cntryl_stress::{
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
@@ -184,7 +185,7 @@ enum Commands {
     Stress(StressArgs),
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[allow(clippy::struct_excessive_bools)]
 struct StressArgs {
     // ========================================================================
@@ -518,6 +519,12 @@ fn main() -> Result<()> {
 
 fn run_stress(args: &StressArgs) -> Result<()> {
     validate_stress_args(args)?;
+    // Child harnesses run with the package root as their working directory,
+    // so user-supplied relative paths must be anchored to the invoking cwd.
+    let mut resolved_args = args.clone();
+    let invoking_dir = std::env::current_dir().context("Failed to get current directory")?;
+    resolve_invocation_paths(&mut resolved_args, &invoking_dir);
+    let args = &resolved_args;
     let verbosity = Verbosity::from_args(args);
     let passthrough_json = !args.list && !args.print_config;
 
@@ -580,6 +587,27 @@ fn run_stress(args: &StressArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Absolutize user-supplied relative paths against the directory cargo-stress
+/// was invoked from. The `latest` baseline selector is not a path.
+fn resolve_invocation_paths(args: &mut StressArgs, invoking_dir: &Path) {
+    let absolutize = |path: &mut PathBuf| {
+        if path.is_relative() {
+            *path = invoking_dir.join(&*path);
+        }
+    };
+    if let Some(dir) = args.output_dir.as_mut() {
+        absolutize(dir);
+    }
+    if let Some(baseline) = args.baseline.as_mut() {
+        if baseline.as_os_str() != "latest" {
+            absolutize(baseline);
+        }
+    }
+    if let Some(dir) = args.baseline_dir.as_mut() {
+        absolutize(dir);
+    }
 }
 
 fn validate_stress_args(args: &StressArgs) -> Result<()> {
@@ -746,6 +774,12 @@ impl Verbosity {
 /// Find the Cargo.toml, either from --manifest-path or by walking up from CWD.
 fn find_manifest(args: &StressArgs) -> Result<PathBuf> {
     if let Some(ref path) = args.manifest_path {
+        if path.is_dir() {
+            bail!(
+                "--manifest-path must be a path to a Cargo.toml file, not a directory: {}",
+                path.display()
+            );
+        }
         if path.exists() {
             return Ok(path.clone());
         }
@@ -2307,17 +2341,36 @@ fn consolidated_json_output(results: &[StressRunResult]) -> Result<String> {
 }
 
 fn report_passthrough_results(results: &[StressRunResult], verbosity: Verbosity) {
-    if verbosity.is_quiet() {
-        return;
-    }
+    let (stdout, stderr) = passthrough_output(results, verbosity);
+    print!("{stdout}");
+    eprint!("{stderr}");
+}
+
+/// Collect list/print-config child output. Quiet mode suppresses normal
+/// output but never hides the stderr of a child that failed.
+fn passthrough_output(results: &[StressRunResult], verbosity: Verbosity) -> (String, String) {
+    let mut stdout = String::new();
+    let mut stderr = String::new();
     for result in results {
-        if !result.stdout.is_empty() {
-            print!("{}", result.stdout);
+        if verbosity.is_quiet() {
+            if !result.status.success() {
+                let exit_info = result
+                    .status
+                    .code()
+                    .map_or_else(|| "signal".to_string(), |code| format!("exit {code}"));
+                let _ = writeln!(
+                    stderr,
+                    "Stress binary {} failed ({exit_info})",
+                    result.target.label()
+                );
+                stderr.push_str(&result.stderr);
+            }
+            continue;
         }
-        if !result.stderr.is_empty() {
-            eprint!("{}", result.stderr);
-        }
+        stdout.push_str(&result.stdout);
+        stderr.push_str(&result.stderr);
     }
+    (stdout, stderr)
 }
 
 fn report_result_errors(results: &[StressRunResult]) -> Result<()> {
@@ -4156,6 +4209,92 @@ mod tests {
         assert!(
             !output.status.success(),
             "Cargo must invoke the configured runner instead of executing the artifact directly"
+        );
+    }
+
+    #[cfg(unix)]
+    fn failure_status() -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(1 << 8)
+    }
+
+    #[cfg(windows)]
+    fn failure_status() -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(1)
+    }
+
+    #[test]
+    fn relative_path_args_resolve_against_the_invoking_directory() {
+        let invoking_dir = std::env::temp_dir().join("cargo-stress-invoking-dir");
+        let absolute_output = invoking_dir.join("absolute-output");
+        let mut args = StressArgs {
+            output_dir: Some(PathBuf::from("artifacts")),
+            baseline: Some(PathBuf::from("baselines/accepted.json")),
+            baseline_dir: Some(PathBuf::from("target/custom-baselines")),
+            ..stress_args()
+        };
+
+        resolve_invocation_paths(&mut args, &invoking_dir);
+
+        assert_eq!(args.output_dir, Some(invoking_dir.join("artifacts")));
+        assert_eq!(
+            args.baseline,
+            Some(invoking_dir.join("baselines/accepted.json"))
+        );
+        assert_eq!(
+            args.baseline_dir,
+            Some(invoking_dir.join("target/custom-baselines"))
+        );
+
+        let mut args = StressArgs {
+            output_dir: Some(absolute_output.clone()),
+            baseline: Some(PathBuf::from("latest")),
+            ..stress_args()
+        };
+        resolve_invocation_paths(&mut args, &invoking_dir);
+        assert_eq!(args.output_dir, Some(absolute_output));
+        assert_eq!(args.baseline, Some(PathBuf::from("latest")));
+        assert_eq!(args.baseline_dir, None);
+    }
+
+    #[test]
+    fn quiet_passthrough_mode_still_reports_failed_child_stderr() {
+        let mut failed = result_for(run("failed-suite", Vec::new()));
+        failed.status = failure_status();
+        failed.stdout = "listed output\n".to_string();
+        failed.stderr = "child exploded\n".to_string();
+        let mut passed = result_for(run("passed-suite", Vec::new()));
+        passed.stdout = "quiet listing\n".to_string();
+        passed.stderr = "benign noise\n".to_string();
+
+        let (stdout, stderr) = passthrough_output(&[failed, passed], Verbosity::Quiet);
+
+        assert!(
+            stdout.is_empty(),
+            "quiet mode suppresses stdout: {stdout:?}"
+        );
+        assert!(stderr.contains("child exploded"), "{stderr:?}");
+        assert!(stderr.contains("failed-suite"), "{stderr:?}");
+        assert!(!stderr.contains("benign noise"), "{stderr:?}");
+    }
+
+    #[test]
+    fn manifest_path_directory_is_rejected_with_a_clear_error() {
+        let fixture = TestDir::new("manifest-dir");
+        fixture.write("Cargo.toml", "[package]\nname = \"fixture\"\n");
+        let args = StressArgs {
+            manifest_path: Some(fixture.path().to_path_buf()),
+            ..stress_args()
+        };
+
+        let error = find_manifest(&args).expect_err("directories are not manifests");
+
+        assert!(
+            error
+                .to_string()
+                .contains("must be a path to a Cargo.toml file"),
+            "{error}"
         );
     }
 }
