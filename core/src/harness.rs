@@ -364,8 +364,12 @@ fn print_help() {
     eprintln!("    --threshold <FRACTION>         Regression fraction (0.05 means 5%)");
     eprintln!("    --fail-on-issues               Fail on warning-or-error diagnostics");
     eprintln!("    --deny-diagnostics <LEVEL>     Fail on diagnostics at info, warning, or error");
-    eprintln!("    --deny-code <CODE[,CODE]>      Fail when a diagnostic code is present; repeatable");
-    eprintln!("    --allow-code <CODE[,CODE]>     Exempt a code from --deny-diagnostics; repeatable");
+    eprintln!(
+        "    --deny-code <CODE[,CODE]>      Fail when a diagnostic code is present; repeatable"
+    );
+    eprintln!(
+        "    --allow-code <CODE[,CODE]>     Exempt a code from --deny-diagnostics; repeatable"
+    );
     eprintln!("    --names <compact|full>         Human console benchmark-name mode");
     eprintln!("    --no-progress                  Disable stderr progress for human output");
 }

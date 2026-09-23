@@ -301,6 +301,16 @@ struct StressArgs {
     #[arg(long)]
     deny_diagnostics: Option<DiagnosticSeverity>,
 
+    /// Fail when a diagnostic code is present; repeatable or comma-separated
+    /// (falls back to `STRESS_DENY_CODES`)
+    #[arg(long = "deny-code", value_name = "CODE", value_delimiter = ',', value_parser = parse_diagnostic_code)]
+    deny_codes: Vec<String>,
+
+    /// Exempt a diagnostic code from --deny-diagnostics; repeatable or
+    /// comma-separated (falls back to `STRESS_ALLOW_CODES`)
+    #[arg(long = "allow-code", value_name = "CODE", value_delimiter = ',', value_parser = parse_diagnostic_code)]
+    allow_codes: Vec<String>,
+
     // ========================================================================
     // Build Options
     // ========================================================================
@@ -355,6 +365,75 @@ struct StressArgs {
     /// Keep going even if a stress binary fails
     #[arg(long)]
     no_fail_fast: bool,
+
+    #[command(subcommand)]
+    command: Option<StressCommand>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum StressCommand {
+    /// Explain a diagnostic code, or list every code with --list
+    Explain(ExplainArgs),
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct ExplainArgs {
+    /// Diagnostic code to explain, e.g. `too_fast`
+    #[arg(required_unless_present = "list", conflicts_with = "list")]
+    code: Option<String>,
+
+    /// List every diagnostic code with its summary
+    #[arg(long)]
+    list: bool,
+}
+
+fn parse_diagnostic_code(value: &str) -> std::result::Result<String, String> {
+    let code = value.trim();
+    cntryl_stress::diagnostics::validate_diagnostic_code(code).map(|info| info.code.to_string())
+}
+
+/// Render `cargo stress explain` output, or an unknown-code error.
+fn explain_output(args: &ExplainArgs) -> std::result::Result<String, String> {
+    use cntryl_stress::diagnostics::{validate_diagnostic_code, DIAGNOSTIC_CATALOG};
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    if args.list {
+        let width = DIAGNOSTIC_CATALOG
+            .iter()
+            .map(|info| info.code.len())
+            .max()
+            .unwrap_or_default();
+        for info in DIAGNOSTIC_CATALOG {
+            let _ = writeln!(
+                output,
+                "{:<width$}  {:<7}  {}",
+                info.code,
+                info.default_severity.to_string(),
+                info.summary
+            );
+        }
+        return Ok(output);
+    }
+    let info = validate_diagnostic_code(args.code.as_deref().unwrap_or_default().trim())?;
+    let _ = writeln!(output, "{} ({})", info.code, info.default_severity);
+    let _ = writeln!(output);
+    let _ = writeln!(output, "{}", info.summary);
+    let _ = writeln!(output);
+    let _ = writeln!(output, "Causes: {}", info.causes);
+    let _ = writeln!(output, "Fix: {}", info.fix);
+    let _ = writeln!(output, "Docs: docs/{}", info.docs_anchor);
+    Ok(output)
+}
+
+fn run_explain(args: &ExplainArgs) {
+    match explain_output(args) {
+        Ok(output) => print!("{output}"),
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(2);
+        }
+    }
 }
 
 // ============================================================================
@@ -513,7 +592,13 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.cmd {
-        Commands::Stress(args) => run_stress(&args),
+        Commands::Stress(args) => match &args.command {
+            Some(StressCommand::Explain(explain)) => {
+                run_explain(explain);
+                Ok(())
+            }
+            None => run_stress(&args),
+        },
     }
 }
 
@@ -2282,6 +2367,13 @@ fn build_passthrough_args(cmd: &mut Command, args: &StressArgs, passthrough_json
         cmd.arg("--deny-diagnostics")
             .arg(deny_diagnostics.to_string());
     }
+
+    for code in &args.deny_codes {
+        cmd.arg("--deny-code").arg(code);
+    }
+    for code in &args.allow_codes {
+        cmd.arg("--allow-code").arg(code);
+    }
 }
 
 // ============================================================================
@@ -2633,6 +2725,9 @@ mod tests {
 
     fn stress_args() -> StressArgs {
         StressArgs {
+            deny_codes: Vec::new(),
+            allow_codes: Vec::new(),
+            command: None,
             workload: None,
             include_ignored: false,
             list: false,
@@ -3229,6 +3324,84 @@ mod tests {
             "[target.x86_64-unknown-linux-gnu]\nlinker = \"mold\"\n",
         );
         assert_ne!(identity(), first);
+    }
+
+    #[test]
+    fn code_policy_flags_parse_and_forward_to_child_binaries() {
+        let cli = Cli::try_parse_from([
+            "cargo",
+            "stress",
+            "--deny-code",
+            "too_fast,high_variance",
+            "--allow-code",
+            "too_few_samples",
+        ])
+        .expect("known codes parse");
+        let Commands::Stress(args) = cli.cmd;
+        assert_eq!(args.deny_codes, vec!["too_fast", "high_variance"]);
+        let mut cmd = Command::new("stress-child");
+
+        build_passthrough_args(&mut cmd, &args, true);
+
+        let child_args = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        for (flag, code) in [
+            ("--deny-code", "too_fast"),
+            ("--deny-code", "high_variance"),
+            ("--allow-code", "too_few_samples"),
+        ] {
+            assert!(
+                child_args
+                    .windows(2)
+                    .any(|window| window[0] == flag && window[1] == code),
+                "{child_args:?}"
+            );
+        }
+
+        let error = Cli::try_parse_from(["cargo", "stress", "--deny-code", "to_fast"])
+            .expect_err("unknown code");
+        assert!(
+            error.to_string().contains("did you mean 'too_fast'"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn explain_subcommand_prints_catalog_entries() {
+        let cli = Cli::try_parse_from(["cargo", "stress", "explain", "too_fast"])
+            .expect("explain parses");
+        let Commands::Stress(args) = cli.cmd;
+        let Some(StressCommand::Explain(explain)) = args.command else {
+            panic!("expected explain subcommand");
+        };
+        let output = explain_output(&explain).expect("known code");
+        assert!(output.contains("too_fast (warning)"), "{output}");
+        assert!(output.contains("Fix: Batch more logical work"), "{output}");
+        assert!(output.contains("diagnostics/too_fast.md"), "{output}");
+
+        let cli = Cli::try_parse_from(["cargo", "stress", "explain", "--list"])
+            .expect("explain --list parses");
+        let Commands::Stress(args) = cli.cmd;
+        let Some(StressCommand::Explain(explain)) = args.command else {
+            panic!("expected explain subcommand");
+        };
+        let output = explain_output(&explain).expect("list");
+        for info in cntryl_stress::diagnostics::DIAGNOSTIC_CATALOG {
+            assert!(output.contains(info.code), "{output}");
+        }
+
+        let cli = Cli::try_parse_from(["cargo", "stress", "explain", "to_fast"])
+            .expect("explain parses any code");
+        let Commands::Stress(args) = cli.cmd;
+        let Some(StressCommand::Explain(explain)) = args.command else {
+            panic!("expected explain subcommand");
+        };
+        let error = explain_output(&explain).expect_err("unknown code");
+        assert!(error.contains("did you mean 'too_fast'"), "{error}");
+
+        assert!(Cli::try_parse_from(["cargo", "stress", "explain"]).is_err());
     }
 
     #[test]
