@@ -450,7 +450,7 @@ Command-line arguments override `STRESS_*` environment variables, which override
 | `STRESS_SAMPLES` | Measured samples per benchmark; must be greater than 0 |
 | `STRESS_WARMUP_SAMPLES` | Warmup samples |
 | `STRESS_COOLDOWN_SAMPLES` | Cooldown samples |
-| `STRESS_FILTER` | Benchmark name/module glob; must not be empty or whitespace; an unmatched selection is fatal |
+| `STRESS_FILTER` | Benchmark name/module glob; an empty or whitespace value is treated as unset (with a notice); an unmatched selection is fatal |
 | `STRESS_TIER` | Exact tier filter, 1 through 6 |
 | `STRESS_TIMEOUT_SECS` | Positive per-benchmark deadline in seconds |
 | `STRESS_OUTPUT_DIR` | Artifact output directory |
@@ -650,8 +650,10 @@ under `cntryl_stress::reporting`, and run gate helpers are under
 
 `StressRunnerConfig::filter` selects programmatic benchmarks whose name (the
 string passed to `run`, or `BenchmarkSpec::name`) contains the pattern as a
-substring. The suite name is not matched, so a filter equal to the suite name
-does not select every benchmark.
+substring. A filter containing `/` also matches the suite-qualified id, so
+`"storage/parse"` selects `parse` in suite `storage`. The suite name alone is
+not matched, so a filter equal to the suite name does not select every
+benchmark.
 
 ```rust
 use cntryl_stress::{black_box, StressRunner, StressRunnerConfig};

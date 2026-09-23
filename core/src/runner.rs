@@ -375,9 +375,12 @@ impl StressRunner {
             }
         }
         if let Some(filter) = &self.config.filter {
-            // Match the benchmark name only: the suite-qualified id would let a
-            // filter equal to the suite name select every benchmark.
+            // Match the benchmark name; a filter containing '/' may also match
+            // the suite-qualified id ("suite/bench"). The id is never matched
+            // for a plain filter, so the suite name alone does not select
+            // every benchmark.
             spec.name.contains(filter.as_str())
+                || (filter.contains('/') && spec.id.contains(filter.as_str()))
         } else {
             true
         }
@@ -2680,6 +2683,27 @@ mod tests {
 
         assert_eq!(run.summaries.len(), 1);
         assert_eq!(run.summaries[0].benchmark_id, "storage/storage_write/work");
+    }
+
+    #[test]
+    fn filter_containing_slash_matches_the_suite_qualified_id() {
+        let config = StressRunnerConfig::new()
+            .samples(1)
+            .warmup_samples(0)
+            .filter("storage/parse");
+        let mut runner = StressRunner::with_config("storage", config);
+        runner.reporters(Vec::new());
+
+        runner.run("parse", |ctx| {
+            ctx.measure("work", || {});
+        });
+        runner.run("storage_write", |ctx| {
+            ctx.measure("work", || {});
+        });
+        let run = runner.finish();
+
+        assert_eq!(run.summaries.len(), 1);
+        assert_eq!(run.summaries[0].benchmark_id, "storage/parse/work");
     }
 
     struct CountingSuiteStartReporter {
