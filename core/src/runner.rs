@@ -2061,7 +2061,9 @@ mod tests {
 
         runner.run("bench", |ctx| {
             ctx.parameter("clients", 4);
-            ctx.measure("work", || std::hint::black_box(1_u64));
+            // Sleep so one operation always spans at least one timer tick; a
+            // zero reading is (correctly) invalid timing.
+            ctx.measure("work", || std::thread::sleep(Duration::from_micros(1)));
         });
         runner.finish()
     }
