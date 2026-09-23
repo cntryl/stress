@@ -25,7 +25,7 @@ anyhow = { version = "1", optional = true }
 syn = { version = "2", features = ["full"], optional = true }
 toml = { version = "1", optional = true }
 linkme = "0.3"
-cntryl-stress-macros = { version = "0.4", path = "../macros" }
+cntryl-stress-macros = { version = "=0.4.0", path = "../macros" }
 
 [[bin]]
 name = "cargo-stress"

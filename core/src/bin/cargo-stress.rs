@@ -2446,10 +2446,9 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
     use cntryl_stress::artifact::{
-        BenchmarkBudgets, BenchmarkMode, BenchmarkSpec, BenchmarkSummary, ComparisonClass,
-        ConsoleNameMode, CorrectnessCounters, CorrectnessSummary, EnvironmentInfo,
-        MeasurementIntent, PrimaryMetric, ProfileConfig, QualityClass, RunProfile, Sample,
-        SamplePhase, SummaryStats, TrustClass, SCHEMA_VERSION,
+        BenchmarkMode, BenchmarkSpec, BenchmarkSummary, ComparisonClass, ConsoleNameMode,
+        EnvironmentInfo, PrimaryMetric, ProfileConfig, QualityClass, RunProfile, Sample,
+        SamplePhase, SummaryStats, TrustClass,
     };
     use cntryl_stress::{runner::StressRunner, StressRunnerConfig};
     use std::collections::BTreeMap;
@@ -2697,117 +2696,61 @@ mod tests {
     }
 
     fn summary(name: &str, quality: QualityClass) -> BenchmarkSummary {
-        BenchmarkSummary {
-            benchmark_id: name.to_string(),
-            name: name.to_string(),
-            tier: 2,
-            intent: MeasurementIntent::General,
-            primary_metric: PrimaryMetric::Throughput,
-            measured_samples: 10,
-            warmup_samples: 1,
-            cooldown_samples: 0,
-            stats: SummaryStats::from_values(&[100.0, 101.0]),
-            wall_clock: SummaryStats::from_values(&[1_000_000.0]),
-            total_wall_clock_ns: 1_000_000,
-            ns_per_op: None,
-            gross_ns_per_op: None,
-            overhead_ns_per_op: None,
-            allocs_per_op: None,
-            bytes_per_op: None,
-            observations: Vec::new(),
-            quality,
-            trust_class: TrustClass::Gate,
-            budgets: BenchmarkBudgets::default(),
-            budget_results: Vec::new(),
-            diagnostics: Vec::new(),
-            correctness: CorrectnessSummary {
-                passed: true,
-                counters: CorrectnessCounters {
-                    attempted: 10,
-                    completed: 10,
-                    ..CorrectnessCounters::default()
-                },
-                errors: Vec::new(),
-            },
-            parameters: BTreeMap::new(),
-            metadata: BTreeMap::new(),
-        }
+        let mut summary = BenchmarkSummary::new(name, name, 2, PrimaryMetric::Throughput);
+        summary.measured_samples = 10;
+        summary.warmup_samples = 1;
+        summary.stats = SummaryStats::from_values(&[100.0, 101.0]);
+        summary.wall_clock = SummaryStats::from_values(&[1_000_000.0]);
+        summary.total_wall_clock_ns = 1_000_000;
+        summary.quality = quality;
+        summary.trust_class = TrustClass::Gate;
+        summary.correctness.counters.attempted = 10;
+        summary.correctness.counters.completed = 10;
+        summary
     }
 
     fn run(suite: &str, summaries: Vec<BenchmarkSummary>) -> StressRun {
-        let profile_config = ProfileConfig {
-            profile: RunProfile::Release,
-            measured_samples: 10,
-            warmup_samples: 1,
-            cooldown_samples: 0,
-            min_quality: QualityClass::Acceptable,
-            fail_on_quality: true,
-            fail_on_regression: true,
-            deny_diagnostics: None,
-            regression_threshold: 0.05,
-            sample_duration: Duration::from_secs(1),
-            operations_per_sample: 1,
-            micro_sample_duration: Duration::from_millis(100),
-            report_depth: "gated".to_string(),
-            console_names: ConsoleNameMode::Compact,
-            progress: true,
-        };
-        StressRun {
-            schema_version: SCHEMA_VERSION.to_string(),
-            tool_version: "0.4.0".to_string(),
-            suite: suite.to_string(),
-            run_profile: RunProfile::Release,
-            environment: EnvironmentInfo::unknown(profile_config.clone()),
-            benchmark_specs: vec![BenchmarkSpec {
-                id: format!("{suite}/bench"),
-                name: "bench".to_string(),
-                tier: 2,
-                mode: BenchmarkMode::FixedOperations {
-                    operations_per_sample: 1,
-                },
-                intent: MeasurementIntent::General,
-                budgets: BenchmarkBudgets::default(),
-                parameters: BTreeMap::new(),
-                metadata: BTreeMap::new(),
-            }],
-            samples: vec![Sample {
-                benchmark_id: format!("{suite}/bench"),
-                intent: MeasurementIntent::General,
-                sample_number: 0,
-                phase: SamplePhase::Measured,
-                elapsed_ns: 1,
-                wall_clock_ns: 1,
-                operations_attempted: 1,
-                operations_completed: 1,
-                throughput: 1.0,
-                calibrated_iterations: None,
-                gross_elapsed_ns: None,
-                overhead_ns: None,
-                net_elapsed_ns: None,
-                gross_ns_per_op: None,
-                overhead_ns_per_op: None,
-                net_ns_per_op: None,
-                allocs: None,
-                bytes: None,
-                allocs_per_op: None,
-                bytes_per_op: None,
-                latency_ns: Vec::new(),
-                observations: Vec::new(),
-                parameters: BTreeMap::new(),
-                counters: CorrectnessCounters {
-                    attempted: 1,
-                    completed: 1,
-                    ..CorrectnessCounters::default()
-                },
-                environment: EnvironmentInfo::unknown(profile_config),
-            }],
-            summaries,
-            comparisons: Vec::new(),
-            diagnostics_summary: Vec::new(),
-            started_at: "123".to_string(),
-            total_elapsed_ns: 1_000,
-            metadata: BTreeMap::new(),
-        }
+        let mut profile_config = ProfileConfig::new();
+        profile_config.profile = RunProfile::Release;
+        profile_config.measured_samples = 10;
+        profile_config.min_quality = QualityClass::Acceptable;
+        profile_config.fail_on_quality = true;
+        profile_config.fail_on_regression = true;
+        profile_config.sample_duration = Duration::from_secs(1);
+        profile_config.micro_sample_duration = Duration::from_millis(100);
+        profile_config.report_depth = "gated".to_string();
+
+        let mut run = StressRun::new(
+            suite,
+            RunProfile::Release,
+            EnvironmentInfo::unknown(profile_config.clone()),
+        );
+        run.tool_version = "0.4.0".to_string();
+        run.benchmark_specs.push(BenchmarkSpec::new(
+            format!("{suite}/bench"),
+            "bench",
+            2,
+            BenchmarkMode::FixedOperations {
+                operations_per_sample: 1,
+            },
+        ));
+        let mut sample = Sample::new(
+            format!("{suite}/bench"),
+            SamplePhase::Measured,
+            EnvironmentInfo::unknown(profile_config),
+        );
+        sample.elapsed_ns = 1;
+        sample.wall_clock_ns = 1;
+        sample.operations_attempted = 1;
+        sample.operations_completed = 1;
+        sample.throughput = 1.0;
+        sample.counters.attempted = 1;
+        sample.counters.completed = 1;
+        run.samples.push(sample);
+        run.summaries = summaries;
+        run.started_at = "123".to_string();
+        run.total_elapsed_ns = 1_000;
+        run
     }
 
     fn canonical_child_receipt(run_id: &str, fail_correctness: bool) -> StressRun {

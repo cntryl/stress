@@ -921,11 +921,14 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> 
     result
 }
 
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn sync_parent_directory(parent: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         std::fs::File::open(parent)?.sync_all()?;
     }
+    #[cfg(not(unix))]
+    let _ = parent;
     Ok(())
 }
 
