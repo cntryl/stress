@@ -418,3 +418,19 @@ fn public_enums_require_wildcard_arms() {
     assert_eq!(label(RunProfile::Smoke), "other");
     assert!(DiagnosticSeverity::Error.at_least(DiagnosticSeverity::Warning));
 }
+
+#[test]
+fn source_location_is_optional_and_additive_on_summaries() {
+    use cntryl_stress::artifact::SourceLocation;
+
+    let location = SourceLocation::new("benches/queue.rs", 42);
+    assert_eq!(location.file, "benches/queue.rs");
+    assert_eq!(location.line, 42);
+    assert_eq!(location.to_string(), "benches/queue.rs:42");
+
+    let value = serde_json::to_value(&location).expect("serialize location");
+    assert_eq!(
+        value,
+        serde_json::json!({ "file": "benches/queue.rs", "line": 42 })
+    );
+}

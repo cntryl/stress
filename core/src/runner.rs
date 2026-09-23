@@ -5,7 +5,7 @@ use crate::artifact::{
     attach_measurement_mode_mismatch_diagnostics, attach_regression_diagnostics,
     attach_timer_resolution_evidence, compare_summaries_with_specs, diagnostic_summary_for_run,
     summarize_benchmark, BenchmarkModeKind, BenchmarkSpec, EnvironmentInfo, MeasurementIntent,
-    RunProfile, Sample, SamplePhase, StressRun, MAX_TIER, SCHEMA_VERSION,
+    RunProfile, Sample, SamplePhase, SourceLocation, StressRun, MAX_TIER, SCHEMA_VERSION,
     SUMMARY_SEMANTICS_CURRENT, SUMMARY_SEMANTICS_METADATA_KEY,
 };
 use crate::config::StressRunnerConfig;
@@ -175,6 +175,9 @@ impl StressRunner {
     }
 
     /// Run a Tier 2 fixed-operations benchmark with low ceremony.
+    ///
+    /// The caller's location becomes the rows' fallback source location.
+    #[track_caller]
     pub fn run<F, O>(&mut self, name: &str, f: F)
     where
         F: Fn(&mut StressContext) -> O,
@@ -192,7 +195,8 @@ impl StressRunner {
             parameters: BTreeMap::new(),
             metadata: BTreeMap::new(),
         };
-        self.run_spec(&spec, f);
+        let source = SourceLocation::from_std(std::panic::Location::caller());
+        self.run_spec_at(&spec, Some(&source), f);
     }
 
     /// Run a benchmark using a complete spec.
@@ -202,6 +206,20 @@ impl StressRunner {
     /// Panics when the spec has an invalid id, name, tier, mode, role, or budget.
     pub fn run_spec<F, O>(&mut self, spec: &BenchmarkSpec, f: F)
     where
+        F: Fn(&mut StressContext) -> O,
+        O: IntoStressResult,
+    {
+        self.run_spec_at(spec, None, f);
+    }
+
+    /// Run a benchmark spec whose rows fall back to `source` when they did
+    /// not record their own location.
+    pub(crate) fn run_spec_at<F, O>(
+        &mut self,
+        spec: &BenchmarkSpec,
+        source: Option<&SourceLocation>,
+        f: F,
+    ) where
         F: Fn(&mut StressContext) -> O,
         O: IntoStressResult,
     {
@@ -276,13 +294,15 @@ impl StressRunner {
         let MeasurementTopology {
             mut specs,
             spec_order,
+            mut sources,
             ..
         } = topology;
         for spec_id in spec_order {
             let spec = specs
                 .remove(&spec_id)
                 .expect("spec order contains known ids");
-            let summary = summarize_benchmark(&spec, &self.samples[start_sample..]);
+            let mut summary = summarize_benchmark(&spec, &self.samples[start_sample..]);
+            summary.source = sources.remove(&spec_id).or_else(|| source.cloned());
             for reporter in &self.reporters {
                 reporter.bench_end(&summary);
             }
@@ -700,6 +720,7 @@ struct MeasurementTopology {
     specs: BTreeMap<String, BenchmarkSpec>,
     spec_order: Vec<String>,
     overrides: BTreeMap<String, MeasurementOverrideContract>,
+    sources: BTreeMap<String, SourceLocation>,
 }
 
 impl MeasurementTopology {
@@ -760,6 +781,7 @@ impl MeasurementTopology {
             }
             let candidate = measurement_spec(base_spec, record, &benchmark_id);
             self.spec_order.push(benchmark_id.clone());
+            self.record_source(&benchmark_id, record);
             self.specs.insert(benchmark_id.clone(), candidate);
             self.overrides.insert(
                 benchmark_id,
@@ -815,8 +837,16 @@ impl MeasurementTopology {
         }
 
         self.spec_order.push(benchmark_id.clone());
+        self.record_source(&benchmark_id, record);
         self.specs.insert(benchmark_id.clone(), candidate);
         self.overrides.insert(benchmark_id, overrides);
+    }
+
+    fn record_source(&mut self, benchmark_id: &str, record: &MeasurementRecord) {
+        if let Some(source) = &record.source {
+            self.sources
+                .insert(benchmark_id.to_string(), source.clone());
+        }
     }
 }
 
@@ -1240,7 +1270,7 @@ mod tests {
     use crate::artifact::{
         BenchmarkBudgets, BenchmarkMode, BenchmarkModeKind, ComparisonClass, ComparisonResult,
         CorrectnessCounters, DiagnosticSeverity, PrimaryMetric, QualityClass, RunProfile,
-        TrustClass,
+        SourceLocation, TrustClass,
     };
     use std::cell::Cell;
     use std::sync::{Arc, Mutex};
@@ -1399,6 +1429,121 @@ mod tests {
             run.summaries[0].parameters.get("client_count"),
             Some(&"1".to_string())
         );
+    }
+
+    #[test]
+    fn run_records_the_caller_location_as_the_function_level_source() {
+        let config = StressRunnerConfig::new()
+            .samples(1)
+            .warmup_samples(0)
+            .cooldown_samples(0);
+        let mut runner = StressRunner::with_config("suite", config);
+        runner.reporters(Vec::new());
+
+        let expected_line = line!() + 1;
+        runner.run("bench", |ctx| {
+            crate::__private::block_on(
+                ctx.measure_async("lookup", || async { std::hint::black_box(1_u64) }),
+            );
+        });
+        let run = runner.finish();
+
+        let source = run.summaries[0].source.as_ref().expect("source location");
+        assert_eq!(source.file, file!());
+        assert_eq!(source.line, expected_line);
+    }
+
+    #[test]
+    fn row_level_source_wins_over_function_level_source() {
+        let config = StressRunnerConfig::new()
+            .samples(2)
+            .warmup_samples(1)
+            .cooldown_samples(0);
+        let mut runner = StressRunner::with_config("suite", config);
+        runner.reporters(Vec::new());
+
+        let spec = BenchmarkSpec::new(
+            "suite/bench",
+            "bench",
+            2,
+            runner
+                .config
+                .mode_for_kind(BenchmarkModeKind::FixedOperations),
+        );
+        let fn_source = SourceLocation::new("benches/registered.rs", 7);
+        let row_line = std::cell::Cell::new(0);
+        let measure_line = std::cell::Cell::new(0);
+        runner.run_spec_at(&spec, Some(&fn_source), |ctx| {
+            row_line.set(line!() + 1);
+            ctx.benchmark("builder_row")
+                .measure(|| std::hint::black_box(1_u64));
+            measure_line.set(line!() + 1);
+            ctx.measure("plain_row", || std::hint::black_box(2_u64));
+        });
+        let run = runner.finish();
+
+        let by_name = |name: &str| {
+            run.summaries
+                .iter()
+                .find(|summary| summary.name.ends_with(name))
+                .and_then(|summary| summary.source.clone())
+                .expect("row source")
+        };
+        assert_eq!(
+            by_name("builder_row"),
+            SourceLocation::new(file!(), row_line.get())
+        );
+        assert_eq!(
+            by_name("plain_row"),
+            SourceLocation::new(file!(), measure_line.get())
+        );
+    }
+
+    #[test]
+    fn function_level_source_is_used_when_the_row_has_none() {
+        let config = StressRunnerConfig::new()
+            .samples(1)
+            .warmup_samples(0)
+            .cooldown_samples(0);
+        let mut runner = StressRunner::with_config("suite", config);
+        runner.reporters(Vec::new());
+        let spec = BenchmarkSpec::new(
+            "suite/bench",
+            "bench",
+            2,
+            runner
+                .config
+                .mode_for_kind(BenchmarkModeKind::FixedOperations),
+        );
+        let fn_source = SourceLocation::new("benches/registered.rs", 7);
+        runner.run_spec_at(&spec, Some(&fn_source), |ctx| {
+            crate::__private::block_on(
+                ctx.measure_async("async_row", || async { std::hint::black_box(1_u64) }),
+            );
+        });
+        let run = runner.finish();
+
+        assert_eq!(run.summaries[0].source, Some(fn_source));
+    }
+
+    #[test]
+    fn baseline_with_a_different_source_location_still_compares() {
+        let mut baseline = external_throughput_runner(1_000).finish();
+        baseline.summaries[0].source =
+            Some(SourceLocation::new("/some/other/checkout/benches/x.rs", 99));
+        let baseline_path = unique_temp_path("stress-baseline-source-location.json");
+        std::fs::write(
+            &baseline_path,
+            serde_json::to_string(&baseline).expect("serialize baseline"),
+        )
+        .expect("write baseline");
+
+        let run = external_throughput_runner(1_000)
+            .finish_with_baseline(&baseline_path)
+            .expect("source locations must not affect baseline validation");
+
+        assert_eq!(run.comparisons.len(), 1);
+        let _ = std::fs::remove_file(&baseline_path);
     }
 
     #[test]
@@ -2124,7 +2269,7 @@ mod tests {
         assert!(
             attention
                 .iter()
-                .any(|item| item.contains("=too_few_samples:")),
+                .any(|item| item.1.contains("=too_few_samples:")),
             "{attention:?}"
         );
         assert!(report.contains("denied codes: too_few_samples"), "{report}");
@@ -2140,7 +2285,7 @@ mod tests {
         let report = crate::reporting::format_console_run(&run);
         let attention = crate::reporting::attention_items(&run);
         assert!(
-            !attention.iter().any(|item| item.contains(" diagnostic ")),
+            !attention.iter().any(|item| item.1.contains(" diagnostic ")),
             "{attention:?}"
         );
         assert!(!report.contains("failed diagnostics"), "{report}");
@@ -2249,6 +2394,7 @@ mod tests {
             parameters: BTreeMap::new(),
             metadata: BTreeMap::new(),
             overrides: crate::context::MeasurementOverrides::default(),
+            source: None,
         };
 
         let sample = runner.sample_from_record(

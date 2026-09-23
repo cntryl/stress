@@ -35,6 +35,10 @@ pub struct BenchmarkEntry {
     pub budgets: BenchmarkBudgets,
     /// Static descriptive metadata.
     pub metadata: &'static [(&'static str, &'static str)],
+    /// Source file of the `#[stress]` attribute (`file!()`).
+    pub file: &'static str,
+    /// Source line of the `#[stress]` attribute (`line!()`).
+    pub line: u32,
 }
 
 #[doc(hidden)]
@@ -968,6 +972,7 @@ impl fmt::Display for SpecRunError {
 fn run_spec_with_timeout(
     runner: &mut StressRunner,
     spec: &BenchmarkSpec,
+    source: Option<&crate::artifact::SourceLocation>,
     func: fn(&mut StressContext) -> StressResult,
     timeout: Duration,
 ) -> Result<(), SpecRunError> {
@@ -995,7 +1000,7 @@ fn run_spec_with_timeout(
             }
         }
     };
-    runner.run_spec(spec, invoke);
+    runner.run_spec_at(spec, source, invoke);
     let failure = failure.into_inner();
     if let Some(worker) = worker.into_inner() {
         worker.finish(failure.is_none());
@@ -1176,8 +1181,11 @@ fn run_with_resolved_config(resolved: ResolvedStressConfig) {
             parameters: BTreeMap::new(),
             metadata,
         };
+        let source = Some(crate::artifact::SourceLocation::new(entry.file, entry.line));
         if let Some(timeout) = config_for_specs.timeout {
-            if let Err(error) = run_spec_with_timeout(&mut runner, &spec, entry.func, timeout) {
+            if let Err(error) =
+                run_spec_with_timeout(&mut runner, &spec, source.as_ref(), entry.func, timeout)
+            {
                 // Stop scheduling work (a timed-out thread may still be
                 // running), but publish what already completed plus the
                 // failing row before exiting non-zero.
@@ -1186,7 +1194,7 @@ fn run_with_resolved_config(resolved: ResolvedStressConfig) {
                 break;
             }
         } else {
-            runner.run_spec(&spec, entry.func);
+            runner.run_spec_at(&spec, source.as_ref(), entry.func);
         }
     }
 
@@ -1837,6 +1845,8 @@ mod tests {
             mode: BenchmarkModeKind::Micro,
             budgets: BenchmarkBudgets::default(),
             metadata: &[],
+            file: "benches/parser.rs",
+            line: 1,
         }
     }
 
@@ -2235,6 +2245,7 @@ mod tests {
         run_spec_with_timeout(
             &mut runner,
             &deadline_spec("threads"),
+            None,
             thread_recording_benchmark,
             Duration::from_secs(30),
         )
@@ -2253,6 +2264,7 @@ mod tests {
         let Err(error) = run_spec_with_timeout(
             &mut runner,
             &deadline_spec("slow"),
+            None,
             slow_benchmark,
             Duration::from_millis(1),
         ) else {
@@ -2269,6 +2281,7 @@ mod tests {
         run_spec_with_timeout(
             &mut runner,
             &deadline_spec("fast"),
+            None,
             fast_benchmark,
             Duration::from_secs(30),
         )
@@ -2276,6 +2289,7 @@ mod tests {
         let error = run_spec_with_timeout(
             &mut runner,
             &deadline_spec("slow"),
+            None,
             slow_benchmark,
             Duration::from_millis(1),
         )
@@ -2298,6 +2312,7 @@ mod tests {
         run_spec_with_timeout(
             &mut runner,
             &deadline_spec("fast"),
+            None,
             fast_benchmark,
             Duration::from_secs(30),
         )
@@ -2305,6 +2320,7 @@ mod tests {
         let error = run_spec_with_timeout(
             &mut runner,
             &deadline_spec("boom"),
+            None,
             panicking_benchmark,
             Duration::from_secs(30),
         )

@@ -1557,6 +1557,45 @@ pub struct BenchmarkSummary {
     pub parameters: BTreeMap<String, String>,
     /// Benchmark metadata.
     pub metadata: BTreeMap<String, String>,
+    /// Where the row was declared, when known. Informational only: it is
+    /// ignored by baseline validation because paths differ across checkouts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceLocation>,
+}
+
+/// Source location of a benchmark row or registered benchmark function.
+///
+/// Fields may be added in minor releases; construct with [`SourceLocation::new`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SourceLocation {
+    /// Source file path as reported by the compiler (`file!()`).
+    pub file: String,
+    /// One-based line number.
+    pub line: u32,
+}
+
+impl SourceLocation {
+    /// Create a source location.
+    #[must_use]
+    pub fn new(file: impl Into<String>, line: u32) -> Self {
+        Self {
+            file: file.into(),
+            line,
+        }
+    }
+
+    /// Location of a `#[track_caller]` caller.
+    #[must_use]
+    pub fn from_std(location: &std::panic::Location<'_>) -> Self {
+        Self::new(location.file(), location.line())
+    }
+}
+
+impl fmt::Display for SourceLocation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.file, self.line)
+    }
 }
 
 impl BenchmarkSummary {
@@ -1596,6 +1635,7 @@ impl BenchmarkSummary {
             correctness: CorrectnessSummary::new(true),
             parameters: BTreeMap::new(),
             metadata: BTreeMap::new(),
+            source: None,
         }
     }
 
@@ -2240,6 +2280,8 @@ fn normalized_summary_for_validation(
     summary: &BenchmarkSummary,
 ) -> Result<serde_json::Value, String> {
     let mut normalized = summary.clone();
+    // Source paths differ across machines and checkouts.
+    normalized.source = None;
     // Comparison-time codes depend on the other artifact, and codes or
     // evidence added after v0.4 are absent from older baselines. Suggestions
     // are advisory text that may be reworded between releases.
@@ -2521,6 +2563,7 @@ fn summarize_benchmark_with_latency_estimator(
         correctness,
         parameters: merged_parameters(spec, &measured),
         metadata,
+        source: None,
     }
 }
 
@@ -5638,6 +5681,30 @@ mod tests {
 
         run.canonical_baseline_summaries()
             .expect("advisory text and post-v0.4 additions must not invalidate baselines");
+    }
+
+    #[test]
+    fn summary_source_is_optional_in_json_and_schema() {
+        let mut summary = BenchmarkSummary::new("id", "name", 2, PrimaryMetric::Throughput);
+        let json = serde_json::to_value(&summary).expect("serialize");
+        assert!(json.get("source").is_none());
+
+        summary.source = Some(SourceLocation::new("benches/a.rs", 3));
+        let json = serde_json::to_value(&summary).expect("serialize");
+        assert_eq!(json["source"]["file"], "benches/a.rs");
+        assert_eq!(json["source"]["line"], 3);
+        let parsed: BenchmarkSummary = serde_json::from_value(json).expect("round trip");
+        assert_eq!(parsed.source, summary.source);
+
+        let schema =
+            serde_json::from_str::<serde_json::Value>(ARTIFACT_JSON_SCHEMA).expect("schema");
+        let summary_schema = &schema["$defs"]["benchmarkSummary"];
+        assert!(summary_schema["properties"]["source"].is_object());
+        assert!(!summary_schema["required"]
+            .as_array()
+            .expect("required")
+            .iter()
+            .any(|field| field == "source"));
     }
 
     #[test]

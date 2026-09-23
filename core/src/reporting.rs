@@ -1093,6 +1093,29 @@ pub(crate) fn format_report(run: &StressRun) -> String {
     output
 }
 
+fn write_markdown_attention(output: &mut String, run: &StressRun) {
+    let attention = attention_items(run);
+    if attention.is_empty() {
+        let _ = writeln!(output, "- none");
+        return;
+    }
+    for (benchmark_id, item) in attention {
+        let source = run
+            .summaries
+            .iter()
+            .find(|summary| summary.benchmark_id == benchmark_id)
+            .and_then(|summary| summary.source.as_ref());
+        match source {
+            Some(source) => {
+                let _ = writeln!(output, "- {item} (at `{source}`)");
+            }
+            None => {
+                let _ = writeln!(output, "- {item}");
+            }
+        }
+    }
+}
+
 pub(crate) fn format_markdown_report(run: &StressRun) -> String {
     let mut output = String::new();
     let _ = writeln!(output, "# {}", run.suite);
@@ -1114,14 +1137,7 @@ pub(crate) fn format_markdown_report(run: &StressRun) -> String {
     let _ = writeln!(output);
     let _ = writeln!(output, "## Needs attention");
     let _ = writeln!(output);
-    let attention = attention_items(run);
-    if attention.is_empty() {
-        let _ = writeln!(output, "- none");
-    } else {
-        for item in attention {
-            let _ = writeln!(output, "- {item}");
-        }
-    }
+    write_markdown_attention(&mut output, run);
     let _ = writeln!(output);
     let _ = writeln!(output, "## Benchmarks");
     let _ = writeln!(output);
@@ -1514,7 +1530,10 @@ fn write_issue_groups(output: &mut String, groups: &[IssueGroup]) {
         }
         let _ = writeln!(output, "  {}", group.title);
         for item in &group.items {
-            let _ = writeln!(output, "    • {item}");
+            let _ = writeln!(output, "    • {}", item.text);
+            if let Some(source) = &item.source {
+                let _ = writeln!(output, "      at {source}");
+            }
         }
         if let Some(fix) = &group.fix {
             let _ = writeln!(output, "    Fix: {fix}");
@@ -1525,7 +1544,7 @@ fn write_issue_groups(output: &mut String, groups: &[IssueGroup]) {
 #[derive(Debug)]
 struct IssueGroup {
     title: &'static str,
-    items: Vec<String>,
+    items: Vec<IssueItem>,
     fix: Option<String>,
 }
 
@@ -1547,8 +1566,24 @@ impl IssueGroup {
     }
 
     fn push(&mut self, item: impl Into<String>) {
-        self.items.push(item.into());
+        self.items.push(IssueItem {
+            text: item.into(),
+            source: None,
+        });
     }
+
+    fn push_at(&mut self, summary: &BenchmarkSummary, item: impl Into<String>) {
+        self.items.push(IssueItem {
+            text: item.into(),
+            source: summary.source.as_ref().map(ToString::to_string),
+        });
+    }
+}
+
+#[derive(Debug)]
+struct IssueItem {
+    text: String,
+    source: Option<String>,
 }
 
 fn suite_issue_groups(
@@ -1709,14 +1744,17 @@ fn push_validity_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSum
         .copied()
         .filter(|summary| summary.metadata.contains_key("benchmark_error"))
     {
-        benchmark_errors.push(format!(
-            "{}: {}",
-            summary.name,
-            summary
-                .metadata
-                .get("benchmark_error")
-                .map_or("unknown benchmark error", String::as_str)
-        ));
+        benchmark_errors.push_at(
+            summary,
+            format!(
+                "{}: {}",
+                summary.name,
+                summary
+                    .metadata
+                    .get("benchmark_error")
+                    .map_or("unknown benchmark error", String::as_str)
+            ),
+        );
     }
     push_issue_group(groups, benchmark_errors);
 
@@ -1724,7 +1762,10 @@ fn push_validity_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSum
     for summary in summaries.iter().copied().filter(|summary| {
         !summary.correctness.passed && !summary.metadata.contains_key("benchmark_error")
     }) {
-        correctness.push(format!("{} failed correctness checks.", summary.name));
+        correctness.push_at(
+            summary,
+            format!("{} failed correctness checks.", summary.name),
+        );
     }
     push_issue_group(groups, correctness);
 
@@ -1737,11 +1778,14 @@ fn push_validity_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSum
         if budget.fix.is_none() {
             budget.fix = Some(diagnostic_fix(summary, "budget_failure"));
         }
-        budget.push(format!(
-            "{} failed budget checks: {}.",
-            summary.name,
-            budget_note(summary)
-        ));
+        budget.push_at(
+            summary,
+            format!(
+                "{} failed budget checks: {}.",
+                summary.name,
+                budget_note(summary)
+            ),
+        );
     }
     push_issue_group(groups, budget);
 }
@@ -1763,24 +1807,33 @@ fn push_comparison_issues(
     for summary in summaries {
         if let Some(comparison) = comparisons.get(summary.benchmark_id.as_str()).copied() {
             match comparison.classification {
-                ComparisonClass::Regression => regressions.push(format!(
-                    "{} regressed against baseline ({}).",
-                    summary.name,
-                    format_delta_cell(comparison)
-                )),
-                ComparisonClass::Improvement if comparison_is_trustworthy(comparison) => {
-                    improvements.push(format!(
-                        "{} improved against baseline ({}).",
+                ComparisonClass::Regression => regressions.push_at(
+                    summary,
+                    format!(
+                        "{} regressed against baseline ({}).",
                         summary.name,
                         format_delta_cell(comparison)
-                    ));
+                    ),
+                ),
+                ComparisonClass::Improvement if comparison_is_trustworthy(comparison) => {
+                    improvements.push_at(
+                        summary,
+                        format!(
+                            "{} improved against baseline ({}).",
+                            summary.name,
+                            format_delta_cell(comparison)
+                        ),
+                    );
                 }
                 ComparisonClass::Inconclusive if comparison.reason.is_some() => {
-                    semantic_changes.push(format!(
-                        "{} changed comparison semantics: {}",
-                        summary.name,
-                        comparison.reason.as_deref().unwrap_or("unknown")
-                    ));
+                    semantic_changes.push_at(
+                        summary,
+                        format!(
+                            "{} changed comparison semantics: {}",
+                            summary.name,
+                            comparison.reason.as_deref().unwrap_or("unknown")
+                        ),
+                    );
                 }
                 ComparisonClass::Inconclusive
                 | ComparisonClass::Improvement
@@ -1798,7 +1851,6 @@ fn push_allocation_issue(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSu
         .iter()
         .copied()
         .filter(|summary| has_diagnostic(summary, "high_allocations"))
-        .map(|summary| summary.name.as_str())
         .collect::<Vec<_>>();
     let mut group = IssueGroup::with_fix(
         "Allocation",
@@ -1806,7 +1858,10 @@ fn push_allocation_issue(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSu
     );
     match names.as_slice() {
         [] => {}
-        [name] => group.push(format!("{name} allocates during measurement.")),
+        [summary] => group.push_at(
+            summary,
+            format!("{} allocates during measurement.", summary.name),
+        ),
         _ => group.push(format!(
             "{} benchmarks allocate during measurement.",
             names.len()
@@ -1830,7 +1885,6 @@ fn push_sample_count_issue(groups: &mut Vec<IssueGroup>, summaries: &[&Benchmark
         .iter()
         .copied()
         .filter(|summary| has_diagnostic(summary, "too_few_samples"))
-        .map(|summary| summary.name.as_str())
         .collect::<Vec<_>>();
     let mut group = IssueGroup::with_fix(
         "Samples",
@@ -1838,7 +1892,10 @@ fn push_sample_count_issue(groups: &mut Vec<IssueGroup>, summaries: &[&Benchmark
     );
     match names.as_slice() {
         [] => {}
-        [name] => group.push(format!("{name} has too few measured samples.")),
+        [summary] => group.push_at(
+            summary,
+            format!("{} has too few measured samples.", summary.name),
+        ),
         _ => group.push(format!(
             "{} benchmarks have too few measured samples.",
             names.len()
@@ -1912,7 +1969,7 @@ fn push_diagnostic_group<F>(
         .copied()
         .filter(|summary| has_diagnostic(summary, code))
     {
-        group.push(format_item(summary));
+        group.push_at(summary, format_item(summary));
     }
     push_issue_group(groups, group);
 }
@@ -2034,7 +2091,7 @@ fn format_summary_blocks(run: &StressRun) -> String {
     output
 }
 
-pub(crate) fn attention_items(run: &StressRun) -> Vec<String> {
+pub(crate) fn attention_items(run: &StressRun) -> Vec<(String, String)> {
     let comparisons = comparison_by_benchmark(run);
     let mut items = Vec::new();
     let mut seen = BTreeSet::new();
@@ -2076,7 +2133,7 @@ pub(crate) fn attention_items(run: &StressRun) -> Vec<String> {
 }
 
 fn push_budget_attention(
-    items: &mut Vec<String>,
+    items: &mut Vec<(String, String)>,
     seen: &mut BTreeSet<String>,
     summaries: &[BenchmarkSummary],
 ) {
@@ -2085,17 +2142,16 @@ fn push_budget_attention(
         .filter(|summary| summary.budget_results.iter().any(|result| !result.passed))
     {
         if seen.insert(summary.benchmark_id.clone()) {
-            items.push(format!(
-                "! {} budget failed: {}",
-                summary.name,
-                budget_note(summary)
+            items.push((
+                summary.benchmark_id.clone(),
+                format!("! {} budget failed: {}", summary.name, budget_note(summary)),
             ));
         }
     }
 }
 
 fn push_diagnostic_attention(
-    items: &mut Vec<String>,
+    items: &mut Vec<(String, String)>,
     seen: &mut BTreeSet<String>,
     summaries: &[BenchmarkSummary],
     code: &str,
@@ -2105,17 +2161,16 @@ fn push_diagnostic_attention(
         .filter(|summary| summary.diagnostics.iter().any(|item| item.code == code))
     {
         if seen.insert(summary.benchmark_id.clone()) {
-            items.push(format!(
-                "! {} {}",
-                summary.name,
-                diagnostic_note(summary, code)
+            items.push((
+                summary.benchmark_id.clone(),
+                format!("! {} {}", summary.name, diagnostic_note(summary, code)),
             ));
         }
     }
 }
 
 fn push_correctness_attention(
-    items: &mut Vec<String>,
+    items: &mut Vec<(String, String)>,
     seen: &mut BTreeSet<String>,
     summaries: &[BenchmarkSummary],
 ) {
@@ -2124,16 +2179,19 @@ fn push_correctness_attention(
         .filter(|summary| !summary.correctness.passed)
     {
         seen.insert(summary.benchmark_id.clone());
-        items.push(format!(
-            "✗ {} correctness failed: {}",
-            summary.name,
-            correctness_note(&summary.correctness)
+        items.push((
+            summary.benchmark_id.clone(),
+            format!(
+                "✗ {} correctness failed: {}",
+                summary.name,
+                correctness_note(&summary.correctness)
+            ),
         ));
     }
 }
 
 fn push_comparison_attention(
-    items: &mut Vec<String>,
+    items: &mut Vec<(String, String)>,
     seen: &mut BTreeSet<String>,
     summaries: &[BenchmarkSummary],
     comparisons: &BTreeMap<&str, &ComparisonResult>,
@@ -2161,50 +2219,59 @@ fn push_comparison_attention(
             } else {
                 "↑"
             };
-            items.push(format!(
-                "{icon} {} {}",
-                comparison.benchmark_id,
-                format_delta_cell(comparison)
+            items.push((
+                comparison.benchmark_id.clone(),
+                format!(
+                    "{icon} {} {}",
+                    comparison.benchmark_id,
+                    format_delta_cell(comparison)
+                ),
             ));
         }
     }
 }
 
 fn push_quality_gate_attention(
-    items: &mut Vec<String>,
+    items: &mut Vec<(String, String)>,
     seen: &mut BTreeSet<String>,
     run: &StressRun,
 ) {
     for summary in quality_gate_failures(run) {
         if seen.insert(summary.benchmark_id.clone()) {
-            items.push(format!(
-                "! {} quality gate failed: quality={} below min={} {}",
-                summary.name,
-                summary.quality,
-                run.environment.profile_config.min_quality,
-                row_notes(summary)
+            items.push((
+                summary.benchmark_id.clone(),
+                format!(
+                    "! {} quality gate failed: quality={} below min={} {}",
+                    summary.name,
+                    summary.quality,
+                    run.environment.profile_config.min_quality,
+                    row_notes(summary)
+                ),
             ));
         }
     }
 }
 
 fn push_diagnostic_gate_attention(
-    items: &mut Vec<String>,
+    items: &mut Vec<(String, String)>,
     seen: &mut BTreeSet<String>,
     run: &StressRun,
 ) {
     for diagnostic in run.diagnostic_gate_failures() {
         if seen.insert(diagnostic.benchmark_id.clone()) {
-            items.push(format!(
-                "! {} diagnostic {}={}: {}",
-                diagnostic.name, diagnostic.severity, diagnostic.code, diagnostic.reason
+            items.push((
+                diagnostic.benchmark_id.clone(),
+                format!(
+                    "! {} diagnostic {}={}: {}",
+                    diagnostic.name, diagnostic.severity, diagnostic.code, diagnostic.reason
+                ),
             ));
         }
     }
 }
 
 fn push_noisy_attention(
-    items: &mut Vec<String>,
+    items: &mut Vec<(String, String)>,
     seen: &mut BTreeSet<String>,
     summaries: &[BenchmarkSummary],
 ) {
@@ -2226,17 +2293,16 @@ fn push_noisy_attention(
     });
     for summary in rows {
         if seen.insert(summary.benchmark_id.clone()) {
-            items.push(format!(
-                "! {} {}",
-                summary.name,
-                quality_note("noisy", summary)
+            items.push((
+                summary.benchmark_id.clone(),
+                format!("! {} {}", summary.name, quality_note("noisy", summary)),
             ));
         }
     }
 }
 
 fn push_untrustworthy_attention(
-    items: &mut Vec<String>,
+    items: &mut Vec<(String, String)>,
     seen: &mut BTreeSet<String>,
     summaries: &[BenchmarkSummary],
 ) {
@@ -2258,13 +2324,16 @@ fn push_untrustworthy_attention(
     });
     for summary in rows {
         if seen.insert(summary.benchmark_id.clone()) {
-            items.push(format!("! {} {}", summary.name, row_notes(summary)));
+            items.push((
+                summary.benchmark_id.clone(),
+                format!("! {} {}", summary.name, row_notes(summary)),
+            ));
         }
     }
 }
 
 fn push_stable_change_attention(
-    items: &mut Vec<String>,
+    items: &mut Vec<(String, String)>,
     seen: &mut BTreeSet<String>,
     summaries: &[BenchmarkSummary],
     comparisons: &BTreeMap<&str, &ComparisonResult>,
@@ -2284,10 +2353,13 @@ fn push_stable_change_attention(
     });
     for comparison in rows.into_iter().take(3) {
         if seen.insert(comparison.benchmark_id.clone()) {
-            items.push(format!(
-                "~ {} {}",
-                comparison.benchmark_id,
-                format_delta_cell(comparison)
+            items.push((
+                comparison.benchmark_id.clone(),
+                format!(
+                    "~ {} {}",
+                    comparison.benchmark_id,
+                    format_delta_cell(comparison)
+                ),
             ));
         }
     }
@@ -3162,6 +3234,7 @@ mod tests {
             },
             parameters: BTreeMap::new(),
             metadata: BTreeMap::new(),
+            source: None,
         }
     }
 
@@ -3830,6 +3903,55 @@ mod tests {
         assert!(report.contains("fast"));
         assert!(report.contains("Noisy Or Untrustworthy"));
         assert!(report.contains("weak quality=noisy"));
+    }
+
+    fn located_micro_summary() -> BenchmarkSummary {
+        let mut located = summary("queue::tiny", 1_000_000.0, QualityClass::Acceptable);
+        located.source = Some(crate::artifact::SourceLocation::new("benches/queue.rs", 42));
+        located.diagnostics.push(BenchmarkDiagnostic::new(
+            "likely_optimized_away",
+            DiagnosticSeverity::Warning,
+            "too fast",
+        ));
+        located
+    }
+
+    #[test]
+    fn console_issue_groups_print_the_source_location() {
+        let run = run_with_summaries(vec![located_micro_summary()]);
+
+        let report = format_console_output(&run);
+
+        assert!(
+            report.contains("at benches/queue.rs:42"),
+            "missing location in:\n{report}"
+        );
+    }
+
+    #[test]
+    fn markdown_attention_items_print_the_source_location() {
+        let run = run_with_summaries(vec![located_micro_summary()]);
+
+        let markdown = format_markdown_report(&run);
+
+        assert!(
+            markdown.contains("at `benches/queue.rs:42`"),
+            "missing location in:\n{markdown}"
+        );
+    }
+
+    #[test]
+    fn console_issue_groups_omit_location_when_unknown() {
+        let mut unlocated = located_micro_summary();
+        unlocated.source = None;
+        let run = run_with_summaries(vec![unlocated]);
+
+        let report = format_console_output(&run);
+
+        assert!(
+            !report.contains(" at "),
+            "unexpected location in:\n{report}"
+        );
     }
 
     #[test]

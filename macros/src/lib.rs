@@ -138,6 +138,8 @@ pub fn stress(attr: TokenStream, item: TokenStream) -> TokenStream {
             mode: #mode,
             budgets: #stress_crate::artifact::BenchmarkBudgets::new()#(#budget_setters)*,
             metadata: &[#((#metadata_keys, #metadata_values)),*],
+            file: ::core::file!(),
+            line: ::core::line!(),
         };
     }
     .into()

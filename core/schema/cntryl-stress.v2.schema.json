@@ -366,7 +366,17 @@
         "diagnostics": { "type": "array", "items": { "$ref": "#/$defs/diagnostic" } },
         "correctness": { "$ref": "#/$defs/correctnessSummary" },
         "parameters": { "$ref": "#/$defs/stringMap" },
-        "metadata": { "$ref": "#/$defs/stringMap" }
+        "metadata": { "$ref": "#/$defs/stringMap" },
+        "source": { "$ref": "#/$defs/sourceLocation" }
+      }
+    },
+    "sourceLocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file", "line"],
+      "properties": {
+        "file": { "type": "string", "minLength": 1 },
+        "line": { "type": "integer", "minimum": 0 }
       }
     },
     "comparison": {
