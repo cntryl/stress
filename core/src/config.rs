@@ -615,14 +615,22 @@ where
         |value| Some(value.to_string()),
         |config, value| config.output_dir = PathBuf::from(value),
     );
-    parse_env(
-        &get_var,
-        resolution,
-        "STRESS_FILTER",
-        "filter",
-        |value| (!value.trim().is_empty()).then(|| value.to_string()),
-        |config, value| config.filter = Some(value),
-    );
+    if get_var("STRESS_FILTER").is_some_and(|value| value.trim().is_empty()) {
+        push_notice(
+            resolution,
+            "STRESS_FILTER is empty; treating it as unset and selecting every benchmark"
+                .to_string(),
+        );
+    } else {
+        parse_env(
+            &get_var,
+            resolution,
+            "STRESS_FILTER",
+            "filter",
+            |value| Some(value.to_string()),
+            |config, value| config.filter = Some(value),
+        );
+    }
     if get_var("STRESS_GIT_SHA").is_some_and(|value| value.trim().is_empty()) {
         push_notice(
             resolution,
@@ -1255,11 +1263,21 @@ mod tests {
     }
 
     #[test]
+    fn empty_filter_env_is_treated_as_unset_with_notice() {
+        for value in ["", "   "] {
+            let resolution = resolve(&[("STRESS_FILTER", value)]);
+            assert!(resolution.warnings.is_empty(), "{:?}", resolution.warnings);
+            assert_eq!(resolution.notices.len(), 1);
+            assert!(resolution.notices[0].contains("STRESS_FILTER"));
+            assert_eq!(resolution.config.filter, None);
+        }
+    }
+
+    #[test]
     fn no_work_and_out_of_range_selection_env_values_are_rejected_at_parse_time() {
         let resolution = resolve(&[
             ("STRESS_SAMPLES", "0"),
             ("STRESS_TIER", "7"),
-            ("STRESS_FILTER", "   "),
         ]);
         assert_eq!(resolution.config.samples, 5);
         assert_eq!(resolution.config.tier, None);
@@ -1268,7 +1286,6 @@ mod tests {
             resolution.warnings,
             vec![
                 "invalid STRESS_SAMPLES".to_string(),
-                "invalid STRESS_FILTER".to_string(),
                 "invalid STRESS_TIER".to_string(),
             ]
         );
