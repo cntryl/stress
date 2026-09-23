@@ -2726,69 +2726,29 @@ fn time_empty_iterations(iterations: u64) -> Duration {
 }
 
 /// Overhead and net time for Micro rows that time each operation separately
-/// (setup variants), including a timer-quantization guard.
+/// (setup variants).
+///
+/// Each individual reading may be quantized by a coarse clock (about 41ns on
+/// Apple Silicon), but the mean of many quantized readings is unbiased, so
+/// `gross - overhead` is kept as-is even when the per-operation time is below
+/// one timer tick. The measurement is never altered to signal quantization.
 fn setup_micro_overhead(iterations: u64, gross_elapsed: Duration) -> (Duration, Duration) {
-    let overhead = time_empty_iterations(iterations);
-    let micro = guard_per_op_quantization(
-        MicroMeasurement {
-            iterations,
-            gross_elapsed,
-            overhead,
-            net_elapsed: gross_elapsed.saturating_sub(overhead),
-        },
-        estimated_timer_tick(),
-    );
+    let micro =
+        micro_measurement_from_overhead(iterations, gross_elapsed, time_empty_iterations(iterations));
     (micro.overhead, micro.net_elapsed)
 }
 
-/// Mark per-operation Micro timing that sits below the clock's resolution.
-///
-/// Setup-excluding Micro rows start and stop the clock around every single
-/// operation. When the mean gross time per operation is below one observable
-/// timer tick, each individual reading is mostly quantization noise and the
-/// net figure is not trustworthy. Instead of silently reporting it, the whole
-/// gross time is attributed to overhead (net becomes zero), which trips the
-/// existing `setup_dominates_measurement` diagnostic for the row.
-fn guard_per_op_quantization(micro: MicroMeasurement, tick: Duration) -> MicroMeasurement {
-    let per_op_ns = micro
-        .gross_elapsed
-        .as_nanos()
-        .checked_div(u128::from(micro.iterations));
-    match per_op_ns {
-        Some(per_op_ns) if per_op_ns < tick.as_nanos() => MicroMeasurement {
-            overhead: micro.gross_elapsed,
-            net_elapsed: Duration::ZERO,
-            ..micro
-        },
-        _ => micro,
+fn micro_measurement_from_overhead(
+    iterations: u64,
+    gross_elapsed: Duration,
+    overhead: Duration,
+) -> MicroMeasurement {
+    MicroMeasurement {
+        iterations,
+        gross_elapsed,
+        overhead,
+        net_elapsed: gross_elapsed.saturating_sub(overhead),
     }
-}
-
-/// Smallest non-zero step observed between consecutive `Instant::now()` calls.
-fn estimated_timer_tick() -> Duration {
-    static TICK: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-    *TICK.get_or_init(|| {
-        let mut smallest = Duration::MAX;
-        for _ in 0..64 {
-            let start = Instant::now();
-            let mut spins = 0_u32;
-            let step = loop {
-                let step = start.elapsed();
-                spins += 1;
-                if !step.is_zero() || spins >= 1_000_000 {
-                    break step;
-                }
-            };
-            if !step.is_zero() {
-                smallest = smallest.min(step);
-            }
-        }
-        if smallest == Duration::MAX {
-            Duration::from_nanos(1)
-        } else {
-            smallest
-        }
-    })
 }
 
 /// Fluent recorder for correctness counters.
@@ -3633,29 +3593,17 @@ mod tests {
     }
 
     #[test]
-    fn micro_with_setup_flags_timer_quantized_per_op_timing() {
-        let tick = Duration::from_nanos(40);
-        let quantized = MicroMeasurement {
-            iterations: 1_000,
-            gross_elapsed: Duration::from_micros(20),
-            overhead: Duration::from_nanos(5_000),
-            net_elapsed: Duration::from_micros(15),
-        };
-        let guarded = guard_per_op_quantization(quantized, tick);
-        assert_eq!(guarded.overhead, guarded.gross_elapsed);
-        assert_eq!(guarded.net_elapsed, Duration::ZERO);
-
-        let resolvable = MicroMeasurement {
-            iterations: 1_000,
-            gross_elapsed: Duration::from_micros(400),
-            overhead: Duration::from_nanos(5_000),
-            net_elapsed: Duration::from_micros(395),
-        };
-        let kept = guard_per_op_quantization(resolvable, tick);
-        assert_eq!(kept.overhead, resolvable.overhead);
-        assert_eq!(kept.net_elapsed, resolvable.net_elapsed);
-
-        assert!(estimated_timer_tick() > Duration::ZERO);
+    fn micro_with_setup_keeps_net_time_below_the_timer_tick() {
+        // A real ~15ns operation on a ~41ns-tick clock: the mean of quantized
+        // readings is unbiased, so net = gross - overhead must be preserved.
+        let micro = micro_measurement_from_overhead(
+            1_000,
+            Duration::from_micros(20),
+            Duration::from_micros(5),
+        );
+        assert_eq!(micro.overhead, Duration::from_micros(5));
+        assert_eq!(micro.net_elapsed, Duration::from_micros(15));
+        assert_eq!(micro.gross_elapsed, Duration::from_micros(20));
     }
 
     #[test]

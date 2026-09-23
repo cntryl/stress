@@ -520,12 +520,10 @@ impl StressRunner {
         wall_clock: std::time::Duration,
         record: MeasurementRecord,
     ) -> Sample {
-        let duration = if record.duration.is_zero() && record.intent != MeasurementIntent::External
-        {
-            std::time::Duration::from_nanos(1)
-        } else {
-            record.duration
-        };
+        // A zero duration is recorded as-is: it marks the sample's timing as
+        // invalid (and its throughput as 0) instead of being floored to 1ns,
+        // which would report an absurd throughput for real work.
+        let duration = record.duration;
         let elapsed_secs = duration.as_secs_f64();
         let operations_attempted = record.counters.attempted;
         let operations_completed = record.counters.completed;
@@ -2127,6 +2125,44 @@ mod tests {
             ctx.record_external("work", Duration::from_millis(10), completed_operations);
         });
         runner
+    }
+
+    #[test]
+    fn zero_net_duration_produces_invalid_timing_not_absurd_throughput() {
+        let runner = StressRunner::with_config("suite", StressRunnerConfig::new());
+        let record = crate::context::MeasurementRecord {
+            name: "zero".to_string(),
+            intent: MeasurementIntent::General,
+            mode: BenchmarkMode::Micro {
+                target_sample_duration: Duration::from_millis(1),
+            },
+            duration: Duration::ZERO,
+            latency_ns: Vec::new(),
+            observations: Vec::new(),
+            counters: CorrectnessCounters {
+                attempted: 1_000_000,
+                completed: 1_000_000,
+                ..CorrectnessCounters::default()
+            },
+            operations_hint: None,
+            micro: None,
+            allocation: None,
+            parameters: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+            overrides: crate::context::MeasurementOverrides::default(),
+        };
+
+        let sample = runner.sample_from_record(
+            "suite/zero",
+            1,
+            SamplePhase::Measured,
+            Duration::from_millis(1),
+            record,
+        );
+
+        assert_eq!(sample.elapsed_ns, 0);
+        assert!(sample.throughput.abs() < f64::EPSILON, "{}", sample.throughput);
+        assert!(!sample.has_valid_timing());
     }
 
     #[test]
