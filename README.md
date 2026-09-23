@@ -25,7 +25,8 @@ high variance, setup-dominated measurements, and missing allocation tracking.
 - Deterministic fixtures with setup outside measured work.
 - Named measurements and stable row identifiers.
 - Logical operation counts for batch and throughput work.
-- Machine-readable JSON artifacts under `target/stress`.
+- Machine-readable JSON artifacts under the bench package's `target/stress`
+  directory (in a workspace, `<member>/target/stress` by default).
 - Human output that prioritizes value, variance, allocations, and fixes.
 - Release gates based on correctness, budgets, diagnostics, quality, and
   baseline comparisons.
@@ -567,9 +568,14 @@ cargo bench --bench storage_stress -- --json
 
 ## Artifacts
 
+Artifact paths are relative to the bench package root, because Cargo runs bench
+binaries from that directory. In a workspace, artifacts therefore land in
+`<member>/target/stress` by default, not in the workspace `target/` directory.
 Direct `cargo bench` runs write under `target/stress/{suite}/`. The Cargo
 wrapper keeps the same canonical suite and benchmark IDs, but avoids package
-collisions by writing under `target/stress/{package}/{suite}/`:
+collisions by writing under `target/stress/{package}/{suite}/`. Relative
+`--output-dir`, `--baseline`, and `--baseline-dir` values passed to
+`cargo stress` are resolved against the directory you run it from:
 
 - `{timestamp}.json` and `latest.json`
 - `{timestamp}.txt` and `latest.txt`
