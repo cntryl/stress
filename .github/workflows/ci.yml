@@ -82,10 +82,11 @@ jobs:
       - name: Check all targets at MSRV
         run: cargo check --locked --workspace --all-targets --all-features
 
-      # trybuild UI expectations (macros/tests/ui) match on 1.85 as well, so the
-      # full suite runs here without exclusions.
+      # trybuild UI stderr expectations (macros/tests/ui) are toolchain-specific
+      # and are pinned to stable diagnostics, so the UI test is skipped here and
+      # runs in the stable job instead.
       - name: Test at MSRV
-        run: cargo test --locked --workspace --all-targets --all-features
+        run: cargo test --locked --workspace --all-targets --all-features -- --skip stress_macro_ui
 
   test:
     name: test (${{ matrix.os }})
