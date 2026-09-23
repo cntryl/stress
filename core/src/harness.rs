@@ -7,7 +7,7 @@ use crate::artifact::{
 use crate::config::{parse_bool_env, StressRunnerConfig};
 use crate::reporting::{atomic_write, Reporter};
 use crate::runner::{evaluate_run_gate, RunGate, StressRunner};
-use crate::{StressContext, StressResult};
+use crate::{StressContext, StressError, StressResult};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::NonZeroU64;
@@ -838,6 +838,7 @@ enum SpecRunError {
     },
     Panicked {
         benchmark_id: String,
+        message: Option<String>,
     },
 }
 
@@ -869,48 +870,103 @@ impl fmt::Display for SpecRunError {
                 f,
                 "could not start isolated benchmark {benchmark_id:?}: {reason}"
             ),
-            Self::Panicked { benchmark_id } => {
-                write!(f, "benchmark {benchmark_id:?} panicked")
-            }
+            Self::Panicked {
+                benchmark_id,
+                message: Some(message),
+            } => write!(f, "benchmark {benchmark_id:?} panicked: {message}"),
+            Self::Panicked {
+                benchmark_id,
+                message: None,
+            } => write!(f, "benchmark {benchmark_id:?} panicked"),
         }
     }
 }
 
+/// Run one benchmark with a deadline covering all of its invocations.
+///
+/// The runner (and the results of already-completed benchmarks) stays on the
+/// calling thread; only each benchmark-function invocation runs on an isolated
+/// thread. If an invocation exceeds the remaining deadline or panics, the
+/// invocation is reported to the runner as a benchmark error, so the benchmark
+/// is recorded as a failing row, and the error is returned so the caller can
+/// stop scheduling further work. A timed-out invocation thread cannot be
+/// cancelled; it is abandoned and the caller is expected to exit after
+/// publishing results.
 fn run_spec_with_timeout(
-    mut runner: StressRunner,
-    spec: BenchmarkSpec,
+    runner: &mut StressRunner,
+    spec: &BenchmarkSpec,
     func: fn(&mut StressContext) -> StressResult,
     timeout: Duration,
-) -> Result<StressRunner, SpecRunError> {
+) -> Result<(), SpecRunError> {
+    let deadline = std::time::Instant::now() + timeout;
+    let failure: std::cell::RefCell<Option<SpecRunError>> = std::cell::RefCell::new(None);
+    let invoke = |ctx: &mut StressContext| -> StressResult {
+        if let Some(error) = failure.borrow().as_ref() {
+            return Err(StressError::new(error.to_string()));
+        }
+        match invoke_isolated(ctx, spec, func, deadline, timeout) {
+            Ok(result) => result,
+            Err(error) => {
+                let message = error.to_string();
+                *failure.borrow_mut() = Some(error);
+                Err(StressError::new(message))
+            }
+        }
+    };
+    runner.run_spec(spec, invoke);
+    failure.into_inner().map_or(Ok(()), Err)
+}
+
+fn invoke_isolated(
+    ctx: &mut StressContext,
+    spec: &BenchmarkSpec,
+    func: fn(&mut StressContext) -> StressResult,
+    deadline: std::time::Instant,
+    total_timeout: Duration,
+) -> Result<StressResult, SpecRunError> {
     let benchmark_id = spec.id.clone();
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let mut owned = std::mem::replace(ctx, StressContext::new(spec.tier, spec.mode.clone()));
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let handle = std::thread::Builder::new()
         .name(format!("stress-{}", sanitize_thread_name(&benchmark_id)))
         .spawn(move || {
-            runner.run_spec(&spec, func);
-            let _ = sender.send(runner);
+            let result = func(&mut owned);
+            let _ = sender.send((owned, result));
         })
         .map_err(|error| SpecRunError::Spawn {
             benchmark_id: benchmark_id.clone(),
             reason: error.to_string(),
         })?;
 
-    match receiver.recv_timeout(timeout) {
-        Ok(runner) => {
-            handle.join().map_err(|_| SpecRunError::Panicked {
-                benchmark_id: benchmark_id.clone(),
-            })?;
-            Ok(runner)
+    match receiver.recv_timeout(remaining) {
+        Ok((returned, result)) => {
+            let _ = handle.join();
+            *ctx = returned;
+            Ok(result)
         }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(SpecRunError::Timeout {
             benchmark_id,
-            timeout,
+            timeout: total_timeout,
         }),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            let _ = handle.join();
-            Err(SpecRunError::Panicked { benchmark_id })
+            let message = handle
+                .join()
+                .err()
+                .and_then(|payload| panic_message(payload.as_ref()));
+            Err(SpecRunError::Panicked {
+                benchmark_id,
+                message,
+            })
         }
     }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> Option<String> {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
 }
 
 fn sanitize_thread_name(benchmark_id: &str) -> String {
@@ -972,6 +1028,7 @@ fn run_with_resolved_config(resolved: ResolvedStressConfig) {
         )));
     }
 
+    let mut aborted: Option<SpecRunError> = None;
     for entry in benchmarks {
         let stable_name = format!("{}::{}", entry.module_path, entry.function_name);
         let display_name = format!("{}::{}", entry.module_path, entry.name);
@@ -992,11 +1049,14 @@ fn run_with_resolved_config(resolved: ResolvedStressConfig) {
             metadata,
         };
         if let Some(timeout) = config_for_specs.timeout {
-            runner =
-                run_spec_with_timeout(runner, spec, entry.func, timeout).unwrap_or_else(|error| {
-                    eprintln!("Stress run failed: {error}");
-                    std::process::exit(error.exit_code());
-                });
+            if let Err(error) = run_spec_with_timeout(&mut runner, &spec, entry.func, timeout) {
+                // Stop scheduling work (a timed-out thread may still be
+                // running), but publish what already completed plus the
+                // failing row before exiting non-zero.
+                eprintln!("Stress run failed: {error}");
+                aborted = Some(error);
+                break;
+            }
         } else {
             runner.run_spec(&spec, entry.func);
         }
@@ -1013,12 +1073,17 @@ fn run_with_resolved_config(resolved: ResolvedStressConfig) {
             let gate = evaluate_run_gate(&run);
             if gate != RunGate::Passed {
                 eprintln!("Stress run failed: {gate:?}");
+            }
+            if let Some(error) = aborted {
+                std::process::exit(error.exit_code());
+            }
+            if gate != RunGate::Passed {
                 std::process::exit(1);
             }
         }
         Err(error) => {
             eprintln!("Stress run failed to load baseline: {error}");
-            std::process::exit(1);
+            std::process::exit(aborted.map_or(1, |error| error.exit_code()));
         }
     }
 }
@@ -1926,24 +1991,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn benchmark_deadline_returns_a_typed_timeout() {
-        #[allow(clippy::unnecessary_wraps)]
-        fn slow(ctx: &mut StressContext) -> StressResult {
-            ctx.measure("slow", || std::thread::sleep(Duration::from_millis(20)));
-            Ok(())
-        }
-
-        let config = StressRunnerConfig::new()
+    fn deadline_config() -> StressRunnerConfig {
+        StressRunnerConfig::new()
             .samples(1)
             .warmup_samples(0)
             .cooldown_samples(0)
             .operations_per_sample(1)
-            .progress(false);
-        let runner = StressRunner::with_config("timeout-suite", config);
-        let spec = BenchmarkSpec {
-            id: "timeout-suite/slow".to_string(),
-            name: "slow".to_string(),
+            .progress(false)
+    }
+
+    fn deadline_spec(name: &str) -> BenchmarkSpec {
+        BenchmarkSpec {
+            id: format!("timeout-suite/{name}"),
+            name: name.to_string(),
             tier: 2,
             mode: crate::artifact::BenchmarkMode::FixedOperations {
                 operations_per_sample: 1,
@@ -1952,14 +2012,98 @@ mod tests {
             budgets: BenchmarkBudgets::default(),
             parameters: BTreeMap::new(),
             metadata: BTreeMap::new(),
-        };
+        }
+    }
 
-        let Err(error) = run_spec_with_timeout(runner, spec, slow, Duration::from_millis(1)) else {
+    #[allow(clippy::unnecessary_wraps)]
+    fn fast_benchmark(ctx: &mut StressContext) -> StressResult {
+        ctx.measure("fast", || std::hint::black_box(1_u64));
+        Ok(())
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    fn slow_benchmark(ctx: &mut StressContext) -> StressResult {
+        ctx.measure("slow", || std::thread::sleep(Duration::from_millis(200)));
+        Ok(())
+    }
+
+    fn panicking_benchmark(_ctx: &mut StressContext) -> StressResult {
+        panic!("benchmark exploded");
+    }
+
+    #[test]
+    fn benchmark_deadline_returns_a_typed_timeout() {
+        let mut runner = StressRunner::with_config("timeout-suite", deadline_config());
+
+        let Err(error) = run_spec_with_timeout(
+            &mut runner,
+            &deadline_spec("slow"),
+            slow_benchmark,
+            Duration::from_millis(1),
+        ) else {
             panic!("slow benchmark should time out");
         };
 
         assert!(matches!(error, SpecRunError::Timeout { .. }));
         assert_eq!(error.exit_code(), 124);
+    }
+
+    #[test]
+    fn timed_out_benchmark_keeps_completed_rows_and_fails_the_gate() {
+        let mut runner = StressRunner::with_config("timeout-suite", deadline_config());
+        run_spec_with_timeout(
+            &mut runner,
+            &deadline_spec("fast"),
+            fast_benchmark,
+            Duration::from_secs(30),
+        )
+        .expect("fast benchmark completes");
+        let error = run_spec_with_timeout(
+            &mut runner,
+            &deadline_spec("slow"),
+            slow_benchmark,
+            Duration::from_millis(1),
+        )
+        .expect_err("slow benchmark times out");
+        assert!(matches!(error, SpecRunError::Timeout { .. }));
+
+        let run = runner.finish();
+        assert_eq!(run.summaries.len(), 2, "{:?}", run.summaries);
+        assert!(run.summaries[0].name.contains("fast"));
+        assert!(run.summaries[1]
+            .metadata
+            .get("benchmark_error")
+            .is_some_and(|message| message.contains("deadline")));
+        assert_ne!(evaluate_run_gate(&run), RunGate::Passed);
+    }
+
+    #[test]
+    fn panicked_benchmark_keeps_completed_rows_and_fails_the_gate() {
+        let mut runner = StressRunner::with_config("timeout-suite", deadline_config());
+        run_spec_with_timeout(
+            &mut runner,
+            &deadline_spec("fast"),
+            fast_benchmark,
+            Duration::from_secs(30),
+        )
+        .expect("fast benchmark completes");
+        let error = run_spec_with_timeout(
+            &mut runner,
+            &deadline_spec("boom"),
+            panicking_benchmark,
+            Duration::from_secs(30),
+        )
+        .expect_err("panicking benchmark fails");
+        assert!(matches!(error, SpecRunError::Panicked { .. }));
+        assert_eq!(error.exit_code(), 1);
+
+        let run = runner.finish();
+        assert_eq!(run.summaries.len(), 2);
+        assert!(run.summaries[1]
+            .metadata
+            .get("benchmark_error")
+            .is_some_and(|message| message.contains("exploded")));
+        assert_ne!(evaluate_run_gate(&run), RunGate::Passed);
     }
 
     #[test]

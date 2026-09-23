@@ -1133,8 +1133,7 @@ impl StressContext {
                     accumulate_allocation(&mut allocation_total, allocation_delta);
                     outcome.accumulate(std::hint::black_box(invocation));
                 }
-                let overhead = time_empty_iterations(iterations);
-                let net_elapsed = gross_elapsed.saturating_sub(overhead);
+                let (overhead, net_elapsed) = setup_micro_overhead(iterations, gross_elapsed);
                 (
                     MeasurementState {
                         duration: net_elapsed,
@@ -1155,13 +1154,14 @@ impl StressContext {
                 let mut measured_elapsed = Duration::ZERO;
                 let mut allocation_total = None;
                 let mut outcome = OperationOutcome::default();
+                let wall_clock = SetupWallClockBound::start(*sample_duration);
                 loop {
                     let (elapsed, allocation_delta, invocation) =
                         time_operation_with_setup(setup, f);
                     measured_elapsed = measured_elapsed.saturating_add(elapsed);
                     accumulate_allocation(&mut allocation_total, allocation_delta);
                     outcome.accumulate(std::hint::black_box(invocation));
-                    if measured_elapsed >= *sample_duration {
+                    if measured_elapsed >= *sample_duration || wall_clock.exhausted() {
                         break;
                     }
                 }
@@ -1226,8 +1226,7 @@ impl StressContext {
                     accumulate_allocation(&mut allocation_total, allocation_delta);
                     result = Some(std::hint::black_box(output));
                 }
-                let overhead = time_empty_iterations(iterations);
-                let net_elapsed = gross_elapsed.saturating_sub(overhead);
+                let (overhead, net_elapsed) = setup_micro_overhead(iterations, gross_elapsed);
                 let mut counters = CorrectnessCounters::default();
                 set_successful_operations(&mut counters, iterations);
                 (
@@ -1254,7 +1253,8 @@ impl StressContext {
                 accumulate_allocation(&mut allocation_total, first_allocation);
                 let mut operations = 1_u64;
                 let mut result = std::hint::black_box(first_output);
-                while measured_elapsed < *sample_duration {
+                let wall_clock = SetupWallClockBound::start(*sample_duration);
+                while measured_elapsed < *sample_duration && !wall_clock.exhausted() {
                     let (elapsed, allocation_delta, output) = time_operation_with_setup(setup, f);
                     measured_elapsed = measured_elapsed.saturating_add(elapsed);
                     accumulate_allocation(&mut allocation_total, allocation_delta);
@@ -1537,8 +1537,7 @@ impl StressContext {
                 break;
             }
         }
-        let overhead = time_empty_iterations(progress.attempted);
-        let net_elapsed = gross_elapsed.saturating_sub(overhead);
+        let (overhead, net_elapsed) = setup_micro_overhead(progress.attempted, gross_elapsed);
         let attempted = progress.attempted;
         let (counters, result) = progress.finish();
         (
@@ -1570,12 +1569,14 @@ impl StressContext {
         let mut measured_elapsed = Duration::ZERO;
         let mut allocation_total = None;
         let mut progress = FallibleProgress::default();
+        let wall_clock = SetupWallClockBound::start(sample_duration);
         loop {
             let (elapsed, allocation_delta, output) = time_operation_with_setup(setup, f);
             measured_elapsed = measured_elapsed.saturating_add(elapsed);
             accumulate_allocation(&mut allocation_total, allocation_delta);
             if !progress.observe(std::hint::black_box(output))
                 || measured_elapsed >= sample_duration
+                || wall_clock.exhausted()
             {
                 break;
             }
@@ -1656,12 +1657,11 @@ impl StressContext {
             BenchmarkMode::Micro {
                 target_sample_duration,
             } => {
-                self.time_result_async_duration(*target_sample_duration, true, f)
+                self.time_result_async_duration(*target_sample_duration, f)
                     .await
             }
             BenchmarkMode::FixedDuration { sample_duration } => {
-                self.time_result_async_duration(*sample_duration, false, f)
-                    .await
+                self.time_result_async_duration(*sample_duration, f).await
             }
             BenchmarkMode::FixedOperations {
                 operations_per_sample,
@@ -1686,11 +1686,10 @@ impl StressContext {
             BenchmarkMode::Micro {
                 target_sample_duration,
             } => {
-                Self::time_result_async_duration_with_setup(*target_sample_duration, true, setup, f)
-                    .await
+                Self::time_result_async_duration_with_setup(*target_sample_duration, setup, f).await
             }
             BenchmarkMode::FixedDuration { sample_duration } => {
-                Self::time_result_async_duration_with_setup(*sample_duration, false, setup, f).await
+                Self::time_result_async_duration_with_setup(*sample_duration, setup, f).await
             }
             BenchmarkMode::FixedOperations {
                 operations_per_sample,
@@ -1704,7 +1703,6 @@ impl StressContext {
     async fn time_result_async_duration<F, Fut, R, E>(
         &self,
         sample_duration: Duration,
-        micro: bool,
         f: &mut F,
     ) -> (MeasurementState, Result<R, E>)
     where
@@ -1723,19 +1721,16 @@ impl StressContext {
         }
         let duration = start.elapsed();
         let allocation_delta = allocation_start.map(allocation::delta_since);
-        let iterations = progress.attempted;
         let (counters, result) = progress.finish();
         (
             MeasurementState {
                 duration,
                 counters,
                 operations_hint: Some(counters.completed),
-                micro: micro.then_some(MicroMeasurement {
-                    iterations,
-                    gross_elapsed: duration,
-                    overhead: Duration::ZERO,
-                    net_elapsed: duration,
-                }),
+                // Async rows have no Micro overhead calibration (the executor and
+                // await machinery cannot be baselined like a sync loop), so they
+                // never claim a calibrated micro block even in Micro mode.
+                micro: None,
                 allocation: allocation_delta.map(allocation_measurement),
             },
             result,
@@ -1776,7 +1771,6 @@ impl StressContext {
 
     async fn time_result_async_duration_with_setup<S, F, Fut, I, R, E>(
         sample_duration: Duration,
-        micro: bool,
         setup: &mut S,
         f: &mut F,
     ) -> (MeasurementState, Result<R, E>)
@@ -1788,6 +1782,7 @@ impl StressContext {
         let mut measured_elapsed = Duration::ZERO;
         let mut allocation_total = None;
         let mut progress = FallibleProgress::default();
+        let wall_clock = SetupWallClockBound::start(sample_duration);
         loop {
             let (elapsed, allocation_delta, output) =
                 time_async_operation_with_setup(setup, f).await;
@@ -1795,23 +1790,21 @@ impl StressContext {
             accumulate_allocation(&mut allocation_total, allocation_delta);
             if !progress.observe(std::hint::black_box(output))
                 || measured_elapsed >= sample_duration
+                || wall_clock.exhausted()
             {
                 break;
             }
         }
-        let iterations = progress.attempted;
         let (counters, result) = progress.finish();
         (
             MeasurementState {
                 duration: measured_elapsed,
                 counters,
                 operations_hint: Some(counters.completed),
-                micro: micro.then_some(MicroMeasurement {
-                    iterations,
-                    gross_elapsed: measured_elapsed,
-                    overhead: Duration::ZERO,
-                    net_elapsed: measured_elapsed,
-                }),
+                // Async rows have no Micro overhead calibration (the executor and
+                // await machinery cannot be baselined like a sync loop), so they
+                // never claim a calibrated micro block even in Micro mode.
+                micro: None,
                 allocation: allocation_total,
             },
             result,
@@ -1877,18 +1870,15 @@ impl StressContext {
         let allocation_delta = allocation_start.map(allocation::delta_since);
         let mut counters = CorrectnessCounters::default();
         set_successful_operations_if_unset(&mut counters, operations);
-        let micro = matches!(&self.mode, BenchmarkMode::Micro { .. }).then_some(MicroMeasurement {
-            iterations: operations,
-            gross_elapsed: duration,
-            overhead: Duration::ZERO,
-            net_elapsed: duration,
-        });
         (
             MeasurementState {
                 duration,
                 counters,
                 operations_hint: Some(operations),
-                micro,
+                // Async rows have no Micro overhead calibration (the executor and
+                // await machinery cannot be baselined like a sync loop), so they
+                // never claim a calibrated micro block even in Micro mode.
+                micro: None,
                 allocation: allocation_delta.map(allocation_measurement),
             },
             std::hint::black_box(result.expect("async duration measurement runs at least once")),
@@ -2435,6 +2425,37 @@ fn accumulate_allocation(
     total.bytes = total.bytes.saturating_add(delta.bytes);
 }
 
+/// Wall-clock multiple of the sample duration that a setup-excluding
+/// duration sample may consume.
+///
+/// Duration samples that exclude setup stop once the *measured* time reaches
+/// the sample duration. When setup is much slower than the measured operation
+/// that could take an unbounded amount of real time, so these loops also stop
+/// once total wall-clock time (setup + measured work + bookkeeping) reaches
+/// `SETUP_WALL_CLOCK_FACTOR * sample_duration`. At least one operation is
+/// always measured. Throughput and per-op figures remain correct because they
+/// are derived from the measured time and completed-operation count; the
+/// sample simply contains fewer operations.
+const SETUP_WALL_CLOCK_FACTOR: u32 = 10;
+
+struct SetupWallClockBound {
+    start: Instant,
+    budget: Duration,
+}
+
+impl SetupWallClockBound {
+    fn start(sample_duration: Duration) -> Self {
+        Self {
+            start: Instant::now(),
+            budget: sample_duration.saturating_mul(SETUP_WALL_CLOCK_FACTOR),
+        }
+    }
+
+    fn exhausted(&self) -> bool {
+        self.start.elapsed() >= self.budget
+    }
+}
+
 fn time_operation_with_setup<S, F, I, R>(
     setup: &mut S,
     f: &mut F,
@@ -2501,18 +2522,20 @@ fn calibrate_result_setup_iterations<S, F, I, R, E>(
     target: Duration,
     setup: &mut S,
     f: &mut F,
-) -> Result<u64, E>
+) -> Result<u64, CalibrationFailure<E>>
 where
     S: FnMut() -> I,
     F: FnMut(I) -> Result<R, E>,
 {
     let mut iterations = 1_u64;
+    let mut progress = CalibrationProgress::default();
     loop {
         let mut elapsed = Duration::ZERO;
         for _ in 0..iterations {
             let (iteration_elapsed, _, output) = time_operation_with_setup(setup, f);
             elapsed = elapsed.saturating_add(iteration_elapsed);
-            std::hint::black_box(output?);
+            progress.elapsed = progress.elapsed.saturating_add(iteration_elapsed);
+            progress.observe(std::hint::black_box(output))?;
         }
         if elapsed >= target || iterations >= 1 << 32 {
             return Ok(iterations);
@@ -2549,17 +2572,27 @@ where
     }
 }
 
-fn calibrate_result_iterations<F, R, E>(target: Duration, f: &mut F) -> Result<u64, E>
+fn calibrate_result_iterations<F, R, E>(
+    target: Duration,
+    f: &mut F,
+) -> Result<u64, CalibrationFailure<E>>
 where
     F: FnMut() -> Result<R, E>,
 {
     let mut iterations = 1_u64;
+    let mut progress = CalibrationProgress::default();
     loop {
         let start = Instant::now();
         for _ in 0..iterations {
-            std::hint::black_box(std::hint::black_box(f())?);
+            if let Err(failure) = progress.observe(std::hint::black_box(f())) {
+                return Err(CalibrationFailure {
+                    elapsed: failure.elapsed.saturating_add(start.elapsed()),
+                    ..failure
+                });
+            }
         }
         let elapsed = start.elapsed();
+        progress.elapsed = progress.elapsed.saturating_add(elapsed);
         if elapsed >= target || iterations >= 1 << 32 {
             return Ok(iterations);
         }
@@ -2577,21 +2610,68 @@ fn scaled_iterations(iterations: u64, elapsed: Duration, target: Duration) -> u6
         .max(1)
 }
 
-fn failed_micro_result<R, E>(error: E) -> (MeasurementState, Result<R, E>) {
+/// Running totals across all Micro calibration rounds.
+#[derive(Default)]
+struct CalibrationProgress {
+    attempted: u64,
+    completed: u64,
+    elapsed: Duration,
+}
+
+impl CalibrationProgress {
+    /// Record one calibration call. On error, returns the failure carrying the
+    /// totals observed so far (`elapsed` covers completed rounds only; callers
+    /// add the partial round they were timing).
+    fn observe<R, E>(&mut self, result: Result<R, E>) -> Result<(), CalibrationFailure<E>> {
+        self.attempted = self.attempted.saturating_add(1);
+        match result {
+            Ok(output) => {
+                std::hint::black_box(output);
+                self.completed = self.completed.saturating_add(1);
+                Ok(())
+            }
+            Err(error) => Err(CalibrationFailure {
+                error,
+                attempted: self.attempted,
+                completed: self.completed,
+                elapsed: self.elapsed,
+            }),
+        }
+    }
+}
+
+/// A fallible Micro workload that failed while its iteration count was being
+/// calibrated, with the work actually performed up to the failure.
+struct CalibrationFailure<E> {
+    error: E,
+    attempted: u64,
+    completed: u64,
+    elapsed: Duration,
+}
+
+fn failed_micro_result<R, E>(failure: CalibrationFailure<E>) -> (MeasurementState, Result<R, E>) {
+    let CalibrationFailure {
+        error,
+        attempted,
+        completed,
+        elapsed,
+    } = failure;
     (
         MeasurementState {
-            duration: Duration::ZERO,
+            duration: elapsed,
             counters: CorrectnessCounters {
-                attempted: 1,
+                attempted,
+                completed,
                 failures: 1,
                 ..CorrectnessCounters::default()
             },
-            operations_hint: Some(0),
+            operations_hint: Some(completed),
+            // Overhead is not calibrated when the workload fails mid-calibration.
             micro: Some(MicroMeasurement {
-                iterations: 1,
-                gross_elapsed: Duration::ZERO,
+                iterations: attempted,
+                gross_elapsed: elapsed,
                 overhead: Duration::ZERO,
-                net_elapsed: Duration::ZERO,
+                net_elapsed: elapsed,
             }),
             allocation: None,
         },
@@ -2599,6 +2679,14 @@ fn failed_micro_result<R, E>(error: E) -> (MeasurementState, Result<R, E>) {
     )
 }
 
+/// Time `iterations` back-to-back calls of `f`.
+///
+/// Each call's output replaces the previous one in a slot, so every output
+/// except the last is dropped inside the timed region: the destructor of the
+/// returned value is intentionally part of the per-operation cost (the same
+/// contract as a loop that discards results). The overhead baseline in
+/// [`time_empty_batch`] performs the same slot replacement with a trivially
+/// droppable value, so the only asymmetry left is the workload's own `Drop`.
 fn time_operation_batch<F, R>(iterations: u64, f: &mut F) -> (Duration, R)
 where
     F: FnMut() -> R,
@@ -2615,12 +2703,16 @@ where
     )
 }
 
+/// Loop-overhead baseline mirroring [`time_operation_batch`]'s slot handling.
 fn time_empty_batch(iterations: u64) -> Duration {
     let start = Instant::now();
+    let mut slot = None;
     for index in 0..iterations {
-        std::hint::black_box(index);
+        slot = Some(std::hint::black_box(index));
     }
-    start.elapsed()
+    let elapsed = start.elapsed();
+    std::hint::black_box(slot);
+    elapsed
 }
 
 fn time_empty_iterations(iterations: u64) -> Duration {
@@ -2631,6 +2723,72 @@ fn time_empty_iterations(iterations: u64) -> Duration {
         elapsed = elapsed.saturating_add(start.elapsed());
     }
     elapsed
+}
+
+/// Overhead and net time for Micro rows that time each operation separately
+/// (setup variants), including a timer-quantization guard.
+fn setup_micro_overhead(iterations: u64, gross_elapsed: Duration) -> (Duration, Duration) {
+    let overhead = time_empty_iterations(iterations);
+    let micro = guard_per_op_quantization(
+        MicroMeasurement {
+            iterations,
+            gross_elapsed,
+            overhead,
+            net_elapsed: gross_elapsed.saturating_sub(overhead),
+        },
+        estimated_timer_tick(),
+    );
+    (micro.overhead, micro.net_elapsed)
+}
+
+/// Mark per-operation Micro timing that sits below the clock's resolution.
+///
+/// Setup-excluding Micro rows start and stop the clock around every single
+/// operation. When the mean gross time per operation is below one observable
+/// timer tick, each individual reading is mostly quantization noise and the
+/// net figure is not trustworthy. Instead of silently reporting it, the whole
+/// gross time is attributed to overhead (net becomes zero), which trips the
+/// existing `setup_dominates_measurement` diagnostic for the row.
+fn guard_per_op_quantization(micro: MicroMeasurement, tick: Duration) -> MicroMeasurement {
+    let per_op_ns = micro
+        .gross_elapsed
+        .as_nanos()
+        .checked_div(u128::from(micro.iterations));
+    match per_op_ns {
+        Some(per_op_ns) if per_op_ns < tick.as_nanos() => MicroMeasurement {
+            overhead: micro.gross_elapsed,
+            net_elapsed: Duration::ZERO,
+            ..micro
+        },
+        _ => micro,
+    }
+}
+
+/// Smallest non-zero step observed between consecutive `Instant::now()` calls.
+fn estimated_timer_tick() -> Duration {
+    static TICK: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TICK.get_or_init(|| {
+        let mut smallest = Duration::MAX;
+        for _ in 0..64 {
+            let start = Instant::now();
+            let mut spins = 0_u32;
+            let step = loop {
+                let step = start.elapsed();
+                spins += 1;
+                if !step.is_zero() || spins >= 1_000_000 {
+                    break step;
+                }
+            };
+            if !step.is_zero() {
+                smallest = smallest.min(step);
+            }
+        }
+        if smallest == Duration::MAX {
+            Duration::from_nanos(1)
+        } else {
+            smallest
+        }
+    })
 }
 
 /// Fluent recorder for correctness counters.
@@ -3429,5 +3587,156 @@ mod tests {
     fn measure_rejects_empty_names() {
         let mut ctx = fixed_ops_ctx(1);
         ctx.measure("", || {});
+    }
+
+    fn micro_ctx(target: Duration) -> StressContext {
+        StressContext::new(
+            1,
+            BenchmarkMode::Micro {
+                target_sample_duration: target,
+            },
+        )
+    }
+
+    #[test]
+    fn fixed_duration_with_setup_bounds_wall_clock_when_setup_dominates() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut ctx = StressContext::new(
+                1,
+                BenchmarkMode::FixedDuration {
+                    sample_duration: Duration::from_millis(5),
+                },
+            );
+            let slow_setup = || std::thread::sleep(Duration::from_millis(1));
+            ctx.measure_with_setup("plain", slow_setup, |()| std::hint::black_box(1_u64));
+            let _ = ctx.measure_result_with_setup("result", slow_setup, |()| {
+                Ok::<_, ()>(std::hint::black_box(1_u64))
+            });
+            ctx.measure_outcome_with_setup("outcome", LogicalUnit::new("op"), slow_setup, |()| {
+                OperationOutcome::success(1)
+            });
+            let _ = crate::__private::block_on(ctx.measure_result_async_with_setup(
+                "async",
+                slow_setup,
+                |()| async { Ok::<_, ()>(1_u64) },
+            ));
+            let _ = sender.send(ctx.take_measurements());
+        });
+        let records = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("setup-dominated fixed-duration sampling must be wall-clock bounded");
+        assert_eq!(records.len(), 4);
+        for record in records {
+            assert!(record.counters.completed >= 1, "{}", record.name);
+        }
+    }
+
+    #[test]
+    fn micro_with_setup_flags_timer_quantized_per_op_timing() {
+        let tick = Duration::from_nanos(40);
+        let quantized = MicroMeasurement {
+            iterations: 1_000,
+            gross_elapsed: Duration::from_micros(20),
+            overhead: Duration::from_nanos(5_000),
+            net_elapsed: Duration::from_micros(15),
+        };
+        let guarded = guard_per_op_quantization(quantized, tick);
+        assert_eq!(guarded.overhead, guarded.gross_elapsed);
+        assert_eq!(guarded.net_elapsed, Duration::ZERO);
+
+        let resolvable = MicroMeasurement {
+            iterations: 1_000,
+            gross_elapsed: Duration::from_micros(400),
+            overhead: Duration::from_nanos(5_000),
+            net_elapsed: Duration::from_micros(395),
+        };
+        let kept = guard_per_op_quantization(resolvable, tick);
+        assert_eq!(kept.overhead, resolvable.overhead);
+        assert_eq!(kept.net_elapsed, resolvable.net_elapsed);
+
+        assert!(estimated_timer_tick() > Duration::ZERO);
+    }
+
+    #[test]
+    fn micro_calibration_failure_records_actual_progress() {
+        let mut ctx = micro_ctx(Duration::from_secs(1));
+        let calls = Cell::new(0_u64);
+        let result = ctx.measure_result("fails late", || {
+            calls.set(calls.get() + 1);
+            if calls.get() > 5 {
+                Err("boom")
+            } else {
+                std::thread::sleep(Duration::from_micros(50));
+                Ok(())
+            }
+        });
+        assert!(result.is_err());
+        let record = ctx.take_measurements().remove(0);
+        assert_eq!(record.counters.attempted, 6);
+        assert_eq!(record.counters.completed, 5);
+        assert_eq!(record.counters.failures, 1);
+        let micro = record.micro.expect("micro block");
+        assert_eq!(micro.iterations, 6);
+        assert!(micro.gross_elapsed >= Duration::from_micros(250));
+        assert!(record.duration >= Duration::from_micros(250));
+
+        let mut ctx = micro_ctx(Duration::from_secs(1));
+        let calls = Cell::new(0_u64);
+        let result = ctx.measure_result_with_setup(
+            "fails late with setup",
+            || (),
+            |()| {
+                calls.set(calls.get() + 1);
+                if calls.get() > 5 {
+                    Err("boom")
+                } else {
+                    std::thread::sleep(Duration::from_micros(50));
+                    Ok(())
+                }
+            },
+        );
+        assert!(result.is_err());
+        let record = ctx.take_measurements().remove(0);
+        assert_eq!(record.counters.attempted, 6);
+        assert_eq!(record.counters.completed, 5);
+        assert!(record.duration >= Duration::from_micros(250));
+    }
+
+    #[test]
+    fn async_micro_does_not_claim_overhead_calibration() {
+        let mut ctx = micro_ctx(Duration::from_millis(1));
+        crate::__private::block_on(ctx.measure_async("async", || async { 1_u64 }));
+        let _ = crate::__private::block_on(
+            ctx.measure_result_async("async result", || async { Ok::<_, ()>(1_u64) }),
+        );
+        let _ = crate::__private::block_on(ctx.measure_result_async_with_setup(
+            "async setup",
+            || (),
+            |()| async { Ok::<_, ()>(1_u64) },
+        ));
+        for record in ctx.take_measurements() {
+            assert!(record.micro.is_none(), "{}", record.name);
+            assert!(record.counters.completed >= 1);
+        }
+    }
+
+    #[test]
+    fn micro_batch_drops_previous_outputs_inside_the_timed_region() {
+        struct CountsDrops<'a>(&'a Cell<u64>);
+        impl Drop for CountsDrops<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let drops = Cell::new(0_u64);
+        let (_, last) = time_operation_batch(10, &mut || CountsDrops(&drops));
+        assert_eq!(
+            drops.get(),
+            9,
+            "all but the returned output drop while timed"
+        );
+        drop(last);
+        assert_eq!(drops.get(), 10);
     }
 }
