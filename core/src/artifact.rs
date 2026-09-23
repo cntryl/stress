@@ -3344,6 +3344,9 @@ fn summary_diagnostics(input: DiagnosticInputs<'_>) -> Vec<BenchmarkDiagnostic> 
             [("measured_samples", samples.len().to_string())],
         ));
     }
+    if let Some(diagnostic) = non_finite_samples_diagnostic(samples.len(), [stats, ns_per_op]) {
+        diagnostics.push(diagnostic);
+    }
     if stats.is_some_and(|stats| stats.relative_std_dev > 0.10) {
         diagnostics.push(diagnostic_with_evidence(
             "high_variance",
@@ -3529,6 +3532,33 @@ fn diagnostic_with_evidence(
         evidence,
         suggestions,
     }
+}
+
+fn non_finite_samples_diagnostic(
+    measured_samples: usize,
+    stats: [Option<&SummaryStats>; 2],
+) -> Option<BenchmarkDiagnostic> {
+    let dropped = stats
+        .into_iter()
+        .flatten()
+        .map(|stats| stats.non_finite_dropped)
+        .max()
+        .filter(|dropped| *dropped > 0)?;
+    // More than 10% of samples missing from the statistics is an error.
+    let severity = if u128::from(dropped) * 10 > measured_samples as u128 {
+        DiagnosticSeverity::Error
+    } else {
+        DiagnosticSeverity::Warning
+    };
+    Some(diagnostic(
+        "non_finite_samples_dropped",
+        severity,
+        "Non-finite metric values were dropped before computing statistics.",
+        [
+            ("non_finite_dropped", dropped.to_string()),
+            ("measured_samples", measured_samples.to_string()),
+        ],
+    ))
 }
 
 fn catalog_suggestions(code: &str) -> Vec<String> {
@@ -5411,6 +5441,38 @@ mod tests {
 
         assert_eq!(json["schema_version"], SCHEMA_VERSION);
         assert_eq!(json["samples"].as_array().expect("samples").len(), 0);
+    }
+
+    fn non_finite_diagnostic(total: usize, non_finite: usize) -> Option<BenchmarkDiagnostic> {
+        let spec = spec("bench");
+        let samples = (0..total)
+            .map(|index| {
+                let mut sample = completed_sample("bench", index, 1_000_000, 1_000);
+                if index < non_finite {
+                    sample.throughput = f64::NAN;
+                }
+                sample
+            })
+            .collect::<Vec<_>>();
+        summarize_benchmark(&spec, &samples)
+            .diagnostics
+            .into_iter()
+            .find(|diagnostic| diagnostic.code == "non_finite_samples_dropped")
+    }
+
+    #[test]
+    fn non_finite_samples_dropped_escalates_above_ten_percent() {
+        assert!(non_finite_diagnostic(10, 0).is_none());
+        let warning = non_finite_diagnostic(10, 1).expect("one dropped sample is reported");
+        assert_eq!(warning.severity, DiagnosticSeverity::Warning);
+        assert_eq!(warning.evidence.get("non_finite_dropped"), Some(&"1".to_string()));
+        assert_eq!(warning.evidence.get("measured_samples"), Some(&"10".to_string()));
+        assert_eq!(
+            warning.suggestions,
+            vec![crate::diagnostics::catalog_fix("non_finite_samples_dropped").to_string()]
+        );
+        let error = non_finite_diagnostic(10, 2).expect("two dropped samples are reported");
+        assert_eq!(error.severity, DiagnosticSeverity::Error);
     }
 
     #[test]
