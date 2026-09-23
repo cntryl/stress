@@ -187,6 +187,7 @@ enum Commands {
 
 #[derive(Debug, Clone, Parser)]
 #[allow(clippy::struct_excessive_bools)]
+#[command(args_conflicts_with_subcommands = true)]
 struct StressArgs {
     // ========================================================================
     // Test Selection
@@ -387,8 +388,14 @@ struct ExplainArgs {
     list: bool,
 }
 
+/// Validate one `--deny-code`/`--allow-code` list item. Empty items (from
+/// stray commas) parse to an empty string and are skipped when forwarding,
+/// matching the harness and `STRESS_*_CODES` parsing.
 fn parse_diagnostic_code(value: &str) -> std::result::Result<String, String> {
     let code = value.trim();
+    if code.is_empty() {
+        return Ok(String::new());
+    }
     cntryl_stress::diagnostics::validate_diagnostic_code(code).map(|info| info.code.to_string())
 }
 
@@ -422,7 +429,6 @@ fn explain_output(args: &ExplainArgs) -> std::result::Result<String, String> {
     let _ = writeln!(output);
     let _ = writeln!(output, "Causes: {}", info.causes);
     let _ = writeln!(output, "Fix: {}", info.fix);
-    let _ = writeln!(output, "Docs: docs/{}", info.docs_anchor);
     Ok(output)
 }
 
@@ -2368,10 +2374,10 @@ fn build_passthrough_args(cmd: &mut Command, args: &StressArgs, passthrough_json
             .arg(deny_diagnostics.to_string());
     }
 
-    for code in &args.deny_codes {
+    for code in args.deny_codes.iter().filter(|code| !code.is_empty()) {
         cmd.arg("--deny-code").arg(code);
     }
-    for code in &args.allow_codes {
+    for code in args.allow_codes.iter().filter(|code| !code.is_empty()) {
         cmd.arg("--allow-code").arg(code);
     }
 }
@@ -3369,6 +3375,38 @@ mod tests {
     }
 
     #[test]
+    fn code_flags_ignore_empty_list_items_like_the_harness() {
+        let cli = Cli::try_parse_from(["cargo", "stress", "--deny-code", "too_fast,"])
+            .expect("trailing comma is ignored");
+        let Commands::Stress(args) = cli.cmd;
+        let mut cmd = Command::new("stress-child");
+
+        build_passthrough_args(&mut cmd, &args, true);
+
+        let child_args = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            child_args
+                .iter()
+                .filter(|arg| arg.as_str() == "--deny-code")
+                .count(),
+            1,
+            "{child_args:?}"
+        );
+        assert!(!child_args.iter().any(String::is_empty), "{child_args:?}");
+    }
+
+    #[test]
+    fn explain_rejects_stress_flags_before_the_subcommand() {
+        assert!(
+            Cli::try_parse_from(["cargo", "stress", "--workload", "x", "explain", "too_fast"])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn explain_subcommand_prints_catalog_entries() {
         let cli = Cli::try_parse_from(["cargo", "stress", "explain", "too_fast"])
             .expect("explain parses");
@@ -3379,7 +3417,6 @@ mod tests {
         let output = explain_output(&explain).expect("known code");
         assert!(output.contains("too_fast (warning)"), "{output}");
         assert!(output.contains("Fix: Batch more logical work"), "{output}");
-        assert!(output.contains("diagnostics/too_fast.md"), "{output}");
 
         let cli = Cli::try_parse_from(["cargo", "stress", "explain", "--list"])
             .expect("explain --list parses");

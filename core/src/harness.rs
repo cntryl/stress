@@ -449,6 +449,10 @@ pub struct StressRunnerOptions {
     pub threshold_percent: Option<f64>,
     /// Strict diagnostic gate threshold.
     pub deny_diagnostics: Option<DiagnosticSeverity>,
+    /// Diagnostic codes that fail the run whenever present.
+    pub deny_codes: Vec<String>,
+    /// Diagnostic codes exempt from severity-based diagnostic gating.
+    pub allow_codes: Vec<String>,
     /// Human console benchmark-name mode.
     pub names: Option<ConsoleNameMode>,
     /// Whether human runs emit stderr progress.
@@ -575,6 +579,22 @@ impl StressRunnerOptions {
         self
     }
 
+    /// Fail the run whenever a diagnostic with `code` is present.
+    ///
+    /// Unknown codes are rejected when the run configuration is resolved.
+    #[must_use]
+    pub fn deny_code(mut self, code: impl Into<String>) -> Self {
+        self.deny_codes.push(code.into());
+        self
+    }
+
+    /// Exempt `code` from severity-based diagnostic gating.
+    #[must_use]
+    pub fn allow_code(mut self, code: impl Into<String>) -> Self {
+        self.allow_codes.push(code.into());
+        self
+    }
+
     /// Alias for warning-or-higher diagnostic gating.
     #[must_use]
     pub const fn fail_on_issues(mut self, value: bool) -> Self {
@@ -633,6 +653,8 @@ fn binary_args_from_options(options: StressRunnerOptions) -> StressBinaryArgs {
             .threshold_percent
             .map(|threshold_percent| threshold_percent / 100.0),
         deny_diagnostics: options.deny_diagnostics,
+        deny_codes: options.deny_codes,
+        allow_codes: options.allow_codes,
         names: options.names,
         no_progress: options.progress.map(|progress| !progress),
         ..StressBinaryArgs::default()
@@ -1934,6 +1956,16 @@ mod tests {
             resolved.metadata.get("deny_codes_src").map(String::as_str),
             Some("cli --deny-code")
         );
+    }
+
+    #[test]
+    fn runner_options_carry_code_policy() {
+        let options = StressRunnerOptions::new()
+            .deny_code("too_fast")
+            .allow_code("too_few_samples");
+        let args = binary_args_from_options(options);
+        assert_eq!(args.deny_codes, vec!["too_fast"]);
+        assert_eq!(args.allow_codes, vec!["too_few_samples"]);
     }
 
     #[test]

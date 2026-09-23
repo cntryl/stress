@@ -2116,6 +2116,37 @@ mod tests {
     }
 
     #[test]
+    fn console_attention_and_verdict_follow_the_code_policy() {
+        let mut run = warning_diagnostic_run(None);
+        run.environment.profile_config.deny_codes = vec!["too_few_samples".to_string()];
+        let report = crate::reporting::format_console_run(&run);
+        let attention = crate::reporting::attention_items(&run);
+        assert!(
+            attention
+                .iter()
+                .any(|item| item.contains("=too_few_samples:")),
+            "{attention:?}"
+        );
+        assert!(report.contains("denied codes: too_few_samples"), "{report}");
+        assert!(!report.contains(">= unknown"), "{report}");
+
+        let mut run = warning_diagnostic_run(Some(DiagnosticSeverity::Info));
+        let present = run
+            .diagnostics_summary
+            .iter()
+            .map(|diagnostic| diagnostic.code.clone())
+            .collect::<Vec<_>>();
+        run.environment.profile_config.allow_codes = present;
+        let report = crate::reporting::format_console_run(&run);
+        let attention = crate::reporting::attention_items(&run);
+        assert!(
+            !attention.iter().any(|item| item.contains(" diagnostic ")),
+            "{attention:?}"
+        );
+        assert!(!report.contains("failed diagnostics"), "{report}");
+    }
+
+    #[test]
     fn allowed_codes_are_exempt_from_severity_gating_but_deny_wins() {
         let mut run = warning_diagnostic_run(Some(DiagnosticSeverity::Info));
         assert_eq!(evaluate_run_gate(&run), RunGate::DiagnosticsFailed);

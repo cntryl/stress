@@ -1651,6 +1651,18 @@ fn push_shape_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSummar
     );
     push_diagnostic_group(
         groups,
+        "Non-finite samples",
+        summaries,
+        "non_finite_samples_dropped",
+        |summary| {
+            format!(
+                "{} dropped non-finite metric values from its statistics.",
+                summary.name
+            )
+        },
+    );
+    push_diagnostic_group(
+        groups,
         "Capped throughput",
         summaries,
         "flat_or_capped_throughput",
@@ -2022,7 +2034,7 @@ fn format_summary_blocks(run: &StressRun) -> String {
     output
 }
 
-fn attention_items(run: &StressRun) -> Vec<String> {
+pub(crate) fn attention_items(run: &StressRun) -> Vec<String> {
     let comparisons = comparison_by_benchmark(run);
     let mut items = Vec::new();
     let mut seen = BTreeSet::new();
@@ -2181,14 +2193,7 @@ fn push_diagnostic_gate_attention(
     seen: &mut BTreeSet<String>,
     run: &StressRun,
 ) {
-    let Some(threshold) = run.environment.profile_config.deny_diagnostics else {
-        return;
-    };
-    for diagnostic in run
-        .diagnostics_summary
-        .iter()
-        .filter(|diagnostic| diagnostic.severity.at_least(threshold))
-    {
+    for diagnostic in run.diagnostic_gate_failures() {
         if seen.insert(diagnostic.benchmark_id.clone()) {
             items.push(format!(
                 "! {} diagnostic {}={}: {}",
@@ -2635,12 +2640,21 @@ fn gate_status(run: &StressRun) -> String {
     }
     let diagnostic_failures = diagnostic_gate_count(run);
     if diagnostic_failures != 0 {
-        let threshold = run
-            .environment
-            .profile_config
-            .deny_diagnostics
-            .map_or("unknown".to_string(), |threshold| threshold.to_string());
-        return format!("failed diagnostics ({diagnostic_failures} >= {threshold})");
+        let policy = &run.environment.profile_config;
+        let denied = run
+            .diagnostic_gate_failures()
+            .into_iter()
+            .map(|diagnostic| diagnostic.code.as_str())
+            .filter(|code| policy.deny_codes.iter().any(|denied| denied == code))
+            .collect::<BTreeSet<_>>();
+        if denied.is_empty() {
+            let threshold = policy
+                .deny_diagnostics
+                .map_or("unknown".to_string(), |threshold| threshold.to_string());
+            return format!("failed diagnostics ({diagnostic_failures} >= {threshold})");
+        }
+        let denied = denied.into_iter().collect::<Vec<_>>().join(", ");
+        return format!("failed diagnostics ({diagnostic_failures}; denied codes: {denied})");
     }
     let quality_failures = quality_gate_failures(run).len();
     if quality_failures != 0 {
@@ -3229,6 +3243,27 @@ mod tests {
             "cntryl-stress-{label}-{}-{sequence}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn non_finite_samples_dropped_has_a_console_issue_group() {
+        let mut summary = summary("dropped", 1_000.0, QualityClass::Acceptable);
+        summary.diagnostics = vec![diagnostic(
+            "non_finite_samples_dropped",
+            "Non-finite metric values were dropped before computing statistics.",
+            crate::diagnostics::catalog_fix("non_finite_samples_dropped"),
+        )];
+        let groups = suite_issue_groups(&[&summary], &BTreeMap::new());
+        let group = groups
+            .iter()
+            .find(|group| group.title == "Non-finite samples")
+            .expect("non-finite issue group");
+        assert_eq!(
+            group.fix.as_deref(),
+            Some(crate::diagnostics::catalog_fix(
+                "non_finite_samples_dropped"
+            ))
+        );
     }
 
     #[test]
