@@ -3,7 +3,7 @@
 use crate::allocation;
 use crate::artifact::{
     BenchmarkMode, CorrectnessCounters, MeasurementIntent, ObservationDirection, ObservationUnit,
-    ScalarObservation, TrustClass,
+    ScalarObservation, SourceLocation, TrustClass,
 };
 use std::collections::BTreeMap;
 use std::fmt;
@@ -23,6 +23,7 @@ pub struct StressContext {
     pending_observations: Vec<ScalarObservation>,
     pending_counters: CorrectnessCounters,
     pending_has_counters: bool,
+    pending_source: Option<SourceLocation>,
 }
 
 /// Stable name for the logical operation represented by a measurement.
@@ -172,6 +173,7 @@ pub(crate) struct MeasurementRecord {
     pub parameters: BTreeMap<String, String>,
     pub metadata: BTreeMap<String, String>,
     pub overrides: MeasurementOverrides,
+    pub source: Option<SourceLocation>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -276,6 +278,7 @@ impl StressContext {
             pending_observations: Vec::new(),
             pending_counters: CorrectnessCounters::default(),
             pending_has_counters: false,
+            pending_source: None,
         }
     }
 
@@ -403,8 +406,14 @@ impl StressContext {
     }
 
     /// Start an advanced benchmark builder.
+    ///
+    /// The row records the caller's source location (`file:line`), so
+    /// diagnostics can point at the declaration. The location is captured
+    /// here, not when the builder's measure method is awaited.
+    #[track_caller]
     pub fn benchmark(&mut self, name: impl Into<String>) -> BenchmarkBuilder<'_> {
         BenchmarkBuilder {
+            source: SourceLocation::from_std(std::panic::Location::caller()),
             ctx: self,
             name: name.into(),
             overrides: MeasurementOverrides::default(),
@@ -420,10 +429,12 @@ impl StressContext {
     /// Repeated modes return only the final closure value. Use
     /// [`Self::measure_result`] when the operation can fail so an earlier error
     /// cannot be hidden by a later success.
+    #[track_caller]
     pub fn measure<F, R>(&mut self, name: impl Into<String>, f: F) -> R
     where
         F: FnMut() -> R,
     {
+        self.capture_caller_source();
         self.measure_with_intent(
             name,
             MeasurementIntent::General,
@@ -442,10 +453,12 @@ impl StressContext {
     ///
     /// Returns the first error produced by the measured operation. Tier 1
     /// calibration errors are also returned and recorded as failed evidence.
+    #[track_caller]
     pub fn measure_result<F, R, E>(&mut self, name: impl Into<String>, f: F) -> Result<R, E>
     where
         F: FnMut() -> Result<R, E>,
     {
+        self.capture_caller_source();
         self.measure_result_with_overrides(
             name.into(),
             MeasurementIntent::General,
@@ -464,6 +477,7 @@ impl StressContext {
     /// # Panics
     ///
     /// Panics when `logical_operations_per_iteration` is zero.
+    #[track_caller]
     pub fn measure_batch<F, R>(
         &mut self,
         name: impl Into<String>,
@@ -473,6 +487,7 @@ impl StressContext {
     where
         F: FnMut() -> R,
     {
+        self.capture_caller_source();
         self.measure_batch_with_overrides(
             name,
             logical_operations_per_iteration,
@@ -493,6 +508,7 @@ impl StressContext {
     /// Panics when the name or logical unit is empty, or when an invocation
     /// reports more completed operations than attempted operations.
     #[allow(clippy::needless_pass_by_value)]
+    #[track_caller]
     pub fn measure_outcome<F>(
         &mut self,
         name: impl Into<String>,
@@ -502,6 +518,7 @@ impl StressContext {
     where
         F: FnMut() -> OperationOutcome,
     {
+        self.capture_caller_source();
         self.measure_outcome_with_overrides(name, &logical_unit, MeasurementOverrides::default(), f)
     }
 
@@ -511,6 +528,7 @@ impl StressContext {
     /// [`Self::measure_with_setup`], correctness is supplied explicitly for
     /// every invocation and aggregated across the measured sample.
     #[allow(clippy::needless_pass_by_value)]
+    #[track_caller]
     pub fn measure_outcome_with_setup<S, F, I>(
         &mut self,
         name: impl Into<String>,
@@ -522,6 +540,7 @@ impl StressContext {
         S: FnMut() -> I,
         F: FnMut(I) -> OperationOutcome,
     {
+        self.capture_caller_source();
         self.measure_outcome_with_setup_and_overrides(
             name.into(),
             &logical_unit,
@@ -539,11 +558,13 @@ impl StressContext {
     /// only the final closure value. Use [`Self::measure_result_with_setup`] for
     /// fallible work, or [`Self::measure_outcome_with_setup`] when partial
     /// outcomes must be observed without stopping at the first error.
+    #[track_caller]
     pub fn measure_with_setup<S, F, I, R>(&mut self, name: impl Into<String>, setup: S, f: F) -> R
     where
         S: FnMut() -> I,
         F: FnMut(I) -> R,
     {
+        self.capture_caller_source();
         self.measure_with_setup_and_overrides(
             name.into(),
             MeasurementIntent::General,
@@ -563,6 +584,7 @@ impl StressContext {
     ///
     /// Returns the first error produced by the operation. Tier 1 calibration
     /// errors are also returned and recorded as failed evidence.
+    #[track_caller]
     pub fn measure_result_with_setup<S, F, I, R, E>(
         &mut self,
         name: impl Into<String>,
@@ -573,6 +595,7 @@ impl StressContext {
         S: FnMut() -> I,
         F: FnMut(I) -> Result<R, E>,
     {
+        self.capture_caller_source();
         self.measure_result_with_setup_and_overrides(
             name.into(),
             MeasurementIntent::General,
@@ -586,6 +609,12 @@ impl StressContext {
     ///
     /// Repeated modes return only the final future output. Use
     /// [`Self::measure_result_async`] for fallible async operations.
+    ///
+    /// Async helpers cannot record a row-level source location
+    /// (`#[track_caller]` does not reach through an `async fn`, and a location
+    /// captured inside the future would name the poll site). The row falls back
+    /// to the `#[stress]` function's location; use
+    /// `ctx.benchmark(name).measure_async(..)` for a row-level location.
     pub async fn measure_async<F, Fut, R>(&mut self, name: impl Into<String>, f: F) -> R
     where
         F: FnMut() -> Fut,
@@ -605,6 +634,12 @@ impl StressContext {
     /// # Errors
     ///
     /// Returns the first error produced by the measured future.
+    ///
+    /// Async helpers cannot record a row-level source location
+    /// (`#[track_caller]` does not reach through an `async fn`, and a location
+    /// captured inside the future would name the poll site). The row falls back
+    /// to the `#[stress]` function's location; use
+    /// `ctx.benchmark(name).measure_async(..)` for a row-level location.
     pub async fn measure_result_async<F, Fut, R, E>(
         &mut self,
         name: impl Into<String>,
@@ -631,6 +666,12 @@ impl StressContext {
     /// # Errors
     ///
     /// Returns the first error produced by the measured future.
+    ///
+    /// Async helpers cannot record a row-level source location
+    /// (`#[track_caller]` does not reach through an `async fn`, and a location
+    /// captured inside the future would name the poll site). The row falls back
+    /// to the `#[stress]` function's location; use
+    /// `ctx.benchmark(name).measure_async(..)` for a row-level location.
     pub async fn measure_result_async_with_setup<S, F, Fut, I, R, E>(
         &mut self,
         name: impl Into<String>,
@@ -656,10 +697,12 @@ impl StressContext {
     ///
     /// For fallible work, use [`Self::benchmark`], set threaded intent, and
     /// finish with [`BenchmarkBuilder::measure_result`].
+    #[track_caller]
     pub fn measure_threaded<F, R>(&mut self, name: impl Into<String>, f: F) -> R
     where
         F: FnMut() -> R,
     {
+        self.capture_caller_source();
         self.measure_with_intent(
             name,
             MeasurementIntent::Threaded,
@@ -672,10 +715,12 @@ impl StressContext {
     ///
     /// For fallible work, use [`Self::benchmark`], set pipeline intent, and
     /// finish with [`BenchmarkBuilder::measure_result`].
+    #[track_caller]
     pub fn measure_pipeline<F, R>(&mut self, name: impl Into<String>, f: F) -> R
     where
         F: FnMut() -> R,
     {
+        self.capture_caller_source();
         self.measure_with_intent(
             name,
             MeasurementIntent::Pipeline,
@@ -688,10 +733,12 @@ impl StressContext {
     ///
     /// For fallible work, use [`Self::benchmark`], set I/O intent, and finish
     /// with [`BenchmarkBuilder::measure_result`].
+    #[track_caller]
     pub fn measure_io<F, R>(&mut self, name: impl Into<String>, f: F) -> R
     where
         F: FnMut() -> R,
     {
+        self.capture_caller_source();
         self.measure_with_intent(
             name,
             MeasurementIntent::Io,
@@ -705,12 +752,14 @@ impl StressContext {
     /// # Panics
     ///
     /// Panics when `completed_operations` is zero.
+    #[track_caller]
     pub fn record_external(
         &mut self,
         name: impl Into<String>,
         duration: Duration,
         completed_operations: u64,
     ) -> &mut Self {
+        self.capture_caller_source();
         assert!(
             completed_operations != 0,
             "ctx.record_external() requires completed_operations > 0"
@@ -740,6 +789,7 @@ impl StressContext {
     /// Panics when the measurement name is empty or completed work exceeds
     /// attempted work.
     #[allow(clippy::needless_pass_by_value)]
+    #[track_caller]
     pub fn record_external_outcome(
         &mut self,
         name: impl Into<String>,
@@ -747,6 +797,7 @@ impl StressContext {
         logical_unit: LogicalUnit,
         outcome: OperationOutcome,
     ) -> &mut Self {
+        self.capture_caller_source();
         assert!(
             outcome.completed <= outcome.attempted,
             "completed operations cannot exceed attempted operations"
@@ -1929,6 +1980,11 @@ impl StressContext {
         )
     }
 
+    #[track_caller]
+    fn capture_caller_source(&mut self) {
+        self.pending_source = Some(SourceLocation::from_std(std::panic::Location::caller()));
+    }
+
     fn push_measurement(
         &mut self,
         name: String,
@@ -1965,6 +2021,7 @@ impl StressContext {
             parameters: self.parameters.clone(),
             metadata: self.metadata.clone(),
             overrides,
+            source: self.pending_source.take(),
         });
     }
 }
@@ -1978,6 +2035,7 @@ pub struct BenchmarkBuilder<'a> {
     intent: MeasurementIntent,
     parameters: BTreeMap<String, String>,
     metadata: BTreeMap<String, String>,
+    source: SourceLocation,
 }
 
 impl BenchmarkBuilder<'_> {
@@ -2101,11 +2159,12 @@ impl BenchmarkBuilder<'_> {
             intent,
             parameters,
             metadata,
+            source,
         } = self;
         let original_mode = apply_operations_override(ctx, operations_per_sample);
         let result = ctx.measure_with_intent(name, intent, overrides, f);
         restore_mode(ctx, original_mode);
-        attach_measurement_fields(ctx, parameters, metadata);
+        attach_measurement_fields(ctx, parameters, metadata, source);
         result
     }
 
@@ -2130,11 +2189,12 @@ impl BenchmarkBuilder<'_> {
             intent,
             parameters,
             metadata,
+            source,
         } = self;
         let original_mode = apply_operations_override(ctx, operations_per_sample);
         let result = ctx.measure_result_with_overrides(name, intent, overrides, f);
         restore_mode(ctx, original_mode);
-        attach_measurement_fields(ctx, parameters, metadata);
+        attach_measurement_fields(ctx, parameters, metadata, source);
         result
     }
 
@@ -2154,6 +2214,7 @@ impl BenchmarkBuilder<'_> {
             operations_per_sample,
             parameters,
             metadata,
+            source,
             ..
         } = self;
         let original_mode = apply_operations_override(ctx, operations_per_sample);
@@ -2165,7 +2226,7 @@ impl BenchmarkBuilder<'_> {
             f,
         );
         restore_mode(ctx, original_mode);
-        attach_measurement_fields(ctx, parameters, metadata);
+        attach_measurement_fields(ctx, parameters, metadata, source);
         completed
     }
 
@@ -2182,12 +2243,13 @@ impl BenchmarkBuilder<'_> {
             operations_per_sample,
             parameters,
             metadata,
+            source,
             ..
         } = self;
         let original_mode = apply_operations_override(ctx, operations_per_sample);
         let outcome = ctx.measure_outcome_with_overrides(name, &logical_unit, overrides, f);
         restore_mode(ctx, original_mode);
-        attach_measurement_fields(ctx, parameters, metadata);
+        attach_measurement_fields(ctx, parameters, metadata, source);
         outcome
     }
 
@@ -2210,13 +2272,14 @@ impl BenchmarkBuilder<'_> {
             operations_per_sample,
             parameters,
             metadata,
+            source,
             ..
         } = self;
         let original_mode = apply_operations_override(ctx, operations_per_sample);
         let outcome =
             ctx.measure_outcome_with_setup_and_overrides(name, &logical_unit, overrides, setup, f);
         restore_mode(ctx, original_mode);
-        attach_measurement_fields(ctx, parameters, metadata);
+        attach_measurement_fields(ctx, parameters, metadata, source);
         outcome
     }
 
@@ -2237,12 +2300,13 @@ impl BenchmarkBuilder<'_> {
             intent,
             parameters,
             metadata,
+            source,
             ..
         } = self;
         let original_mode = apply_operations_override(ctx, operations_per_sample);
         let result = ctx.measure_with_setup_and_overrides(name, intent, overrides, setup, f);
         restore_mode(ctx, original_mode);
-        attach_measurement_fields(ctx, parameters, metadata);
+        attach_measurement_fields(ctx, parameters, metadata, source);
         result
     }
 
@@ -2264,11 +2328,12 @@ impl BenchmarkBuilder<'_> {
             intent,
             parameters,
             metadata,
+            source,
         } = self;
         let original_mode = apply_operations_override(ctx, operations_per_sample);
         let result = ctx.measure_result_with_setup_and_overrides(name, intent, overrides, setup, f);
         restore_mode(ctx, original_mode);
-        attach_measurement_fields(ctx, parameters, metadata);
+        attach_measurement_fields(ctx, parameters, metadata, source);
         result
     }
 
@@ -2288,6 +2353,7 @@ impl BenchmarkBuilder<'_> {
             operations_per_sample,
             parameters,
             metadata,
+            source,
             ..
         } = self;
         let original_mode = apply_operations_override(ctx, operations_per_sample);
@@ -2295,7 +2361,7 @@ impl BenchmarkBuilder<'_> {
             .measure_async_with_overrides(name, MeasurementIntent::Async, overrides, f)
             .await;
         restore_mode(ctx, original_mode);
-        attach_measurement_fields(ctx, parameters, metadata);
+        attach_measurement_fields(ctx, parameters, metadata, source);
         result
     }
 
@@ -2316,6 +2382,7 @@ impl BenchmarkBuilder<'_> {
             operations_per_sample,
             parameters,
             metadata,
+            source,
             ..
         } = self;
         let original_mode = apply_operations_override(ctx, operations_per_sample);
@@ -2323,7 +2390,7 @@ impl BenchmarkBuilder<'_> {
             .measure_result_async_with_overrides(name, MeasurementIntent::Async, overrides, f)
             .await;
         restore_mode(ctx, original_mode);
-        attach_measurement_fields(ctx, parameters, metadata);
+        attach_measurement_fields(ctx, parameters, metadata, source);
         result
     }
 
@@ -2349,6 +2416,7 @@ impl BenchmarkBuilder<'_> {
             operations_per_sample,
             parameters,
             metadata,
+            source,
             ..
         } = self;
         let original_mode = apply_operations_override(ctx, operations_per_sample);
@@ -2362,7 +2430,7 @@ impl BenchmarkBuilder<'_> {
             )
             .await;
         restore_mode(ctx, original_mode);
-        attach_measurement_fields(ctx, parameters, metadata);
+        attach_measurement_fields(ctx, parameters, metadata, source);
         result
     }
 }
@@ -2398,6 +2466,7 @@ fn attach_measurement_fields(
     ctx: &mut StressContext,
     parameters: BTreeMap<String, String>,
     metadata: BTreeMap<String, String>,
+    source: SourceLocation,
 ) {
     let record = ctx
         .measurements
@@ -2405,6 +2474,7 @@ fn attach_measurement_fields(
         .expect("benchmark builder records one measurement");
     record.parameters.extend(parameters);
     record.metadata.extend(metadata);
+    record.source = Some(source);
 }
 
 fn allocation_measurement(delta: allocation::AllocationDelta) -> AllocationMeasurement {
