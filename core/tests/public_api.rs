@@ -368,3 +368,53 @@ fn non_exhaustive_public_types_remain_usable_downstream() {
     };
     assert_eq!(label, "passed");
 }
+
+#[test]
+fn budgets_and_counters_build_via_constructors() {
+    use cntryl_stress::artifact::{BenchmarkBudgets, CorrectnessCounters};
+
+    const BUDGETS: BenchmarkBudgets = BenchmarkBudgets::new()
+        .with_max_ns_per_op(10.0)
+        .with_max_allocs_per_op(1.0)
+        .with_max_bytes_per_op(64.0)
+        .with_max_regression_pct(5.0)
+        .with_max_rsd_pct(3.0);
+    assert_eq!(BUDGETS.max_ns_per_op, Some(10.0));
+    assert_eq!(BUDGETS.max_allocs_per_op, Some(1.0));
+    assert_eq!(BUDGETS.max_bytes_per_op, Some(64.0));
+    assert_eq!(BUDGETS.max_regression_pct, Some(5.0));
+    assert_eq!(BUDGETS.max_rsd_pct, Some(3.0));
+    assert_eq!(BenchmarkBudgets::new(), BenchmarkBudgets::default());
+
+    let counters = CorrectnessCounters::new()
+        .with_attempted(4)
+        .with_completed(3)
+        .with_failures(1)
+        .with_timeouts(2)
+        .with_duplicates(3)
+        .with_dropped(4)
+        .with_validation_errors(5);
+    assert_eq!(counters.attempted, 4);
+    assert_eq!(counters.completed, 3);
+    assert_eq!(counters.failures, 1);
+    assert_eq!(counters.timeouts, 2);
+    assert_eq!(counters.duplicates, 3);
+    assert_eq!(counters.dropped, 4);
+    assert_eq!(counters.validation_errors, 5);
+    assert_eq!(CorrectnessCounters::new(), CorrectnessCounters::default());
+}
+
+#[test]
+fn public_enums_require_wildcard_arms() {
+    use cntryl_stress::artifact::{DiagnosticSeverity, RunProfile};
+
+    #[allow(unreachable_patterns)]
+    const fn label(profile: RunProfile) -> &'static str {
+        match profile {
+            RunProfile::Default => "default",
+            _ => "other",
+        }
+    }
+    assert_eq!(label(RunProfile::Smoke), "other");
+    assert!(DiagnosticSeverity::Error.at_least(DiagnosticSeverity::Warning));
+}

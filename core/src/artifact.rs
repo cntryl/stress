@@ -50,8 +50,24 @@ fn legacy_summary_semantics() -> bool {
 pub const MAX_TIER: u32 = 6;
 
 /// Benchmark run profile. The default profile is a moderate day-to-day run.
+///
+/// Variants may be added in minor releases, so matches outside this crate
+/// need a wildcard arm:
+///
+/// ```compile_fail
+/// use cntryl_stress::artifact::RunProfile;
+/// fn label(profile: RunProfile) -> &'static str {
+///     match profile {
+///         RunProfile::Default => "default",
+///         RunProfile::Smoke => "smoke",
+///         RunProfile::Lab => "lab",
+///         RunProfile::Release => "release",
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum RunProfile {
     /// Moderate day-to-day run with useful per-tier signal.
     #[default]
@@ -92,6 +108,7 @@ impl std::str::FromStr for RunProfile {
 /// Static mode family derived from `#[stress(tier = N)]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum BenchmarkModeKind {
     /// Calibrated batched microbenchmark samples.
     Micro,
@@ -177,6 +194,7 @@ const fn tier_hint_for_mode(mode: BenchmarkModeKind) -> &'static str {
 /// Concrete mode used for a benchmark run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum BenchmarkMode {
     /// Calibrate a batched sample to a target wall-clock duration.
     Micro {
@@ -220,6 +238,7 @@ impl Default for BenchmarkMode {
 /// Phase for a raw sample row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SamplePhase {
     /// Warmup sample retained for reproducibility but excluded from statistics.
     Warmup,
@@ -232,6 +251,7 @@ pub enum SamplePhase {
 /// Summary quality classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum QualityClass {
     /// At least 10 measured samples and relative standard deviation <= 5%.
     Authoritative,
@@ -257,6 +277,7 @@ impl fmt::Display for QualityClass {
 /// Primary metric used for quality and baseline comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum PrimaryMetric {
     /// Operations per second. Higher is better.
     Throughput,
@@ -269,6 +290,7 @@ pub enum PrimaryMetric {
 /// Unit carried by a scalar benchmark observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ObservationUnit {
     /// Dimensionless count.
     Count,
@@ -283,6 +305,9 @@ pub enum ObservationUnit {
 }
 
 /// Interpretation of movement in a scalar observation.
+///
+/// Intentionally exhaustive: higher-is-better, lower-is-better, and
+/// informational form a closed set, so callers may match without a wildcard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservationDirection {
@@ -367,6 +392,7 @@ impl ObservationSummary {
 /// Benchmark authoring intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MeasurementIntent {
     /// General measured work.
     #[default]
@@ -402,6 +428,7 @@ impl fmt::Display for MeasurementIntent {
 /// Diagnostic severity for benchmark summaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum DiagnosticSeverity {
     /// Informational guidance.
     Info,
@@ -455,6 +482,7 @@ impl std::str::FromStr for DiagnosticSeverity {
 /// Whether a benchmark row should participate in performance gates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum TrustClass {
     /// The row is semantically valid and can drive quality/regression gates.
     #[default]
@@ -518,6 +546,7 @@ impl std::str::FromStr for TrustClass {
 /// Console benchmark-name presentation mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ConsoleNameMode {
     /// Compact table names with suffix preservation and parameter hints.
     #[default]
@@ -668,7 +697,22 @@ impl PrimaryMetric {
 }
 
 /// Per-benchmark budget gates.
+///
+/// Fields may be added in minor releases, so struct-literal construction is
+/// not supported outside this crate; use [`BenchmarkBudgets::new`] and the
+/// `with_*` builders.
+///
+/// ```compile_fail
+/// let _ = cntryl_stress::artifact::BenchmarkBudgets {
+///     max_ns_per_op: None,
+///     max_allocs_per_op: None,
+///     max_bytes_per_op: None,
+///     max_regression_pct: None,
+///     max_rsd_pct: None,
+/// };
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[non_exhaustive]
 pub struct BenchmarkBudgets {
     /// Maximum net nanoseconds per operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -688,6 +732,53 @@ pub struct BenchmarkBudgets {
 }
 
 impl BenchmarkBudgets {
+    /// Create an empty budget set with no limits.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            max_ns_per_op: None,
+            max_allocs_per_op: None,
+            max_bytes_per_op: None,
+            max_regression_pct: None,
+            max_rsd_pct: None,
+        }
+    }
+
+    /// Set the maximum net nanoseconds per operation.
+    #[must_use]
+    pub const fn with_max_ns_per_op(mut self, value: f64) -> Self {
+        self.max_ns_per_op = Some(value);
+        self
+    }
+
+    /// Set the maximum allocations per operation.
+    #[must_use]
+    pub const fn with_max_allocs_per_op(mut self, value: f64) -> Self {
+        self.max_allocs_per_op = Some(value);
+        self
+    }
+
+    /// Set the maximum allocated bytes per operation.
+    #[must_use]
+    pub const fn with_max_bytes_per_op(mut self, value: f64) -> Self {
+        self.max_bytes_per_op = Some(value);
+        self
+    }
+
+    /// Set the maximum lower-is-better regression percentage.
+    #[must_use]
+    pub const fn with_max_regression_pct(mut self, value: f64) -> Self {
+        self.max_regression_pct = Some(value);
+        self
+    }
+
+    /// Set the maximum relative standard deviation percentage.
+    #[must_use]
+    pub const fn with_max_rsd_pct(mut self, value: f64) -> Self {
+        self.max_rsd_pct = Some(value);
+        self
+    }
+
     /// Whether allocation counters are required by this budget.
     #[must_use]
     pub const fn requires_allocation_tracking(self) -> bool {
@@ -921,7 +1012,12 @@ fn student_t_critical_value_95(degrees_of_freedom: usize) -> f64 {
 }
 
 /// Canonical correctness counters. Non-zero error counters fail correctness.
+///
+/// Fields may be added in minor releases, so struct-literal construction is
+/// not supported outside this crate; use [`CorrectnessCounters::new`] and the
+/// `with_*` builders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[non_exhaustive]
 pub struct CorrectnessCounters {
     /// Operations attempted.
     pub attempted: u64,
@@ -940,6 +1036,69 @@ pub struct CorrectnessCounters {
 }
 
 impl CorrectnessCounters {
+    /// Create zeroed counters.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            attempted: 0,
+            completed: 0,
+            failures: 0,
+            timeouts: 0,
+            duplicates: 0,
+            dropped: 0,
+            validation_errors: 0,
+        }
+    }
+
+    /// Set the attempted counter.
+    #[must_use]
+    pub const fn with_attempted(mut self, value: u64) -> Self {
+        self.attempted = value;
+        self
+    }
+
+    /// Set the completed counter.
+    #[must_use]
+    pub const fn with_completed(mut self, value: u64) -> Self {
+        self.completed = value;
+        self
+    }
+
+    /// Set the failures counter.
+    #[must_use]
+    pub const fn with_failures(mut self, value: u64) -> Self {
+        self.failures = value;
+        self
+    }
+
+    /// Set the timeouts counter.
+    #[must_use]
+    pub const fn with_timeouts(mut self, value: u64) -> Self {
+        self.timeouts = value;
+        self
+    }
+
+    /// Set the duplicates counter.
+    #[must_use]
+    pub const fn with_duplicates(mut self, value: u64) -> Self {
+        self.duplicates = value;
+        self
+    }
+
+    /// Set the dropped counter.
+    #[must_use]
+    pub const fn with_dropped(mut self, value: u64) -> Self {
+        self.dropped = value;
+        self
+    }
+
+    /// Set the validation errors counter.
+    #[must_use]
+    pub const fn with_validation_errors(mut self, value: u64) -> Self {
+        self.validation_errors = value;
+        self
+    }
+
     /// True when no canonical correctness errors were observed.
     #[must_use]
     pub const fn passed(self) -> bool {
@@ -1469,6 +1628,7 @@ impl BenchmarkSummary {
 /// Baseline comparison classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ComparisonClass {
     /// Metric moved past threshold and confidence intervals do not overlap.
     Regression,
