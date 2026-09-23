@@ -637,6 +637,11 @@ under `cntryl_stress::reporting`, and run gate helpers are under
 
 ## Programmatic Runner
 
+`StressRunnerConfig::filter` selects programmatic benchmarks whose name (the
+string passed to `run`, or `BenchmarkSpec::name`) contains the pattern as a
+substring. The suite name is not matched, so a filter equal to the suite name
+does not select every benchmark.
+
 ```rust
 use cntryl_stress::{black_box, StressRunner, StressRunnerConfig};
 
