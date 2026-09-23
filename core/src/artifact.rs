@@ -305,6 +305,9 @@ pub enum ObservationUnit {
 }
 
 /// Interpretation of movement in a scalar observation.
+///
+/// Intentionally exhaustive: higher-is-better, lower-is-better, and
+/// informational form a closed set, so callers may match without a wildcard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservationDirection {
