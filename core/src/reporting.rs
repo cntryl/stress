@@ -1651,18 +1651,6 @@ fn push_shape_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSummar
     );
     push_diagnostic_group(
         groups,
-        "Non-finite samples",
-        summaries,
-        "non_finite_samples_dropped",
-        |summary| {
-            format!(
-                "{} dropped non-finite metric values from its statistics.",
-                summary.name
-            )
-        },
-    );
-    push_diagnostic_group(
-        groups,
         "Capped throughput",
         summaries,
         "flat_or_capped_throughput",
@@ -1699,6 +1687,18 @@ fn push_validity_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSum
         &ordinary_summaries,
         "invalid_timing",
         |summary| format!("{} recorded invalid timing.", summary.name),
+    );
+    push_diagnostic_group(
+        groups,
+        "Non-finite samples",
+        summaries,
+        "non_finite_samples_dropped",
+        |summary| {
+            format!(
+                "{} dropped non-finite metric values from its statistics.",
+                summary.name
+            )
+        },
     );
     let mut benchmark_errors = IssueGroup::with_fix(
         "Benchmark error",
