@@ -1,0 +1,1115 @@
+{
+  "schema_version": "cntryl-stress.v2",
+  "tool_version": "0.4.0",
+  "suite": "fixture",
+  "run_profile": "default",
+  "environment": {
+    "cpu_model": "Apple M5",
+    "core_count": 10,
+    "os": "macos aarch64",
+    "rustc_version": "rustc 1.98.1 (48a229cea 2026-09-01)",
+    "allocator": "cntryl-stress allocator not installed",
+    "build_profile": "debug",
+    "git_commit": "0000000000000000000000000000000000000000",
+    "tool_version": "0.4.0",
+    "command_line": [
+      "target/debug/examples/write_baseline"
+    ],
+    "profile_config": {
+      "profile": "default",
+      "measured_samples": 7,
+      "warmup_samples": 0,
+      "cooldown_samples": 0,
+      "min_quality": "noisy",
+      "fail_on_quality": false,
+      "fail_on_regression": false,
+      "regression_threshold": 0.05,
+      "sample_duration": 500000000,
+      "operations_per_sample": 1,
+      "micro_sample_duration": 25000000,
+      "report_depth": "default",
+      "console_names": "compact",
+      "progress": true
+    }
+  },
+  "benchmark_specs": [
+    {
+      "id": "fixture/throughput/work",
+      "name": "work",
+      "tier": 2,
+      "mode": {
+        "type": "fixed_operations",
+        "operations_per_sample": 1
+      },
+      "intent": "external",
+      "budgets": {},
+      "parameters": {
+        "measurement_mode": "fixed_ops"
+      },
+      "metadata": {}
+    },
+    {
+      "id": "fixture/latency/requests",
+      "name": "requests",
+      "tier": 2,
+      "mode": {
+        "type": "fixed_operations",
+        "operations_per_sample": 1
+      },
+      "intent": "external",
+      "budgets": {},
+      "parameters": {
+        "measurement_mode": "fixed_ops"
+      },
+      "metadata": {
+        "primary_metric": "latency"
+      }
+    }
+  ],
+  "samples": [
+    {
+      "benchmark_id": "fixture/throughput/work",
+      "intent": "external",
+      "sample_number": 0,
+      "phase": "measured",
+      "elapsed_ns": 1000000,
+      "wall_clock_ns": 8541,
+      "operations_attempted": 1000,
+      "operations_completed": 1000,
+      "throughput": 1000000.0,
+      "latency_ns": [],
+      "parameters": {},
+      "counters": {
+        "attempted": 1000,
+        "completed": 1000,
+        "failures": 0,
+        "timeouts": 0,
+        "duplicates": 0,
+        "dropped": 0,
+        "validation_errors": 0
+      },
+      "environment": {
+        "cpu_model": "Apple M5",
+        "core_count": 10,
+        "os": "macos aarch64",
+        "rustc_version": "rustc 1.98.1 (48a229cea 2026-09-01)",
+        "allocator": "cntryl-stress allocator not installed",
+        "build_profile": "debug",
+        "git_commit": "0000000000000000000000000000000000000000",
+        "tool_version": "0.4.0",
+        "command_line": [
+          "target/debug/examples/write_baseline"
+        ],
+        "profile_config": {
+          "profile": "default",
+          "measured_samples": 7,
+          "warmup_samples": 0,
+          "cooldown_samples": 0,
+          "min_quality": "noisy",
+          "fail_on_quality": false,
+          "fail_on_regression": false,
+          "regression_threshold": 0.05,
+          "sample_duration": 500000000,
+          "operations_per_sample": 1,
+          "micro_sample_duration": 25000000,
+          "report_depth": "default",
+          "console_names": "compact",
+          "progress": true
+        }
+      }
+    },
+    {
+      "benchmark_id": "fixture/throughput/work",
+      "intent": "external",
+      "sample_number": 1,
+      "phase": "measured",
+      "elapsed_ns": 1037000,
+      "wall_clock_ns": 250,
+      "operations_attempted": 1000,
+      "operations_completed": 1000,
+      "throughput": 964320.1542912248,
+      "latency_ns": [],
+      "parameters": {},
+      "counters": {
+        "attempted": 1000,
+        "completed": 1000,
+        "failures": 0,
+        "timeouts": 0,
+        "duplicates": 0,
+        "dropped": 0,
+        "validation_errors": 0
+      },
+      "environment": {
+        "cpu_model": "Apple M5",
+        "core_count": 10,
+        "os": "macos aarch64",
+        "rustc_version": "rustc 1.98.1 (48a229cea 2026-09-01)",
+        "allocator": "cntryl-stress allocator not installed",
+        "build_profile": "debug",
+        "git_commit": "0000000000000000000000000000000000000000",
+        "tool_version": "0.4.0",
+        "command_line": [
+          "target/debug/examples/write_baseline"
+        ],
+        "profile_config": {
+          "profile": "default",
+          "measured_samples": 7,
+          "warmup_samples": 0,
+          "cooldown_samples": 0,
+          "min_quality": "noisy",
+          "fail_on_quality": false,
+          "fail_on_regression": false,
+          "regression_threshold": 0.05,
+          "sample_duration": 500000000,
+          "operations_per_sample": 1,
+          "micro_sample_duration": 25000000,
+          "report_depth": "default",
+          "console_names": "compact",
+          "progress": true
+        }
+      }
+    },
+    {
+      "benchmark_id": "fixture/throughput/work",
+      "intent": "external",
+      "sample_number": 2,
+      "phase": "measured",
+      "elapsed_ns": 1074000,
+      "wall_clock_ns": 167,
+      "operations_attempted": 1000,
+      "operations_completed": 1000,
+      "throughput": 931098.6964618249,
+      "latency_ns": [],
+      "parameters": {},
+      "counters": {
+        "attempted": 1000,
+        "completed": 1000,
+        "failures": 0,
+        "timeouts": 0,
+        "duplicates": 0,
+        "dropped": 0,
+        "validation_errors": 0
+      },
+      "environment": {
+        "cpu_model": "Apple M5",
+        "core_count": 10,
+        "os": "macos aarch64",
+        "rustc_version": "rustc 1.98.1 (48a229cea 2026-09-01)",
+        "allocator": "cntryl-stress allocator not installed",
+        "build_profile": "debug",
+        "git_commit": "0000000000000000000000000000000000000000",
+        "tool_version": "0.4.0",
+        "command_line": [
+          "target/debug/examples/write_baseline"
+        ],
+        "profile_config": {
+          "profile": "default",
+          "measured_samples": 7,
+          "warmup_samples": 0,
+          "cooldown_samples": 0,
+          "min_quality": "noisy",
+          "fail_on_quality": false,
+          "fail_on_regression": false,
+          "regression_threshold": 0.05,
+          "sample_duration": 500000000,
+          "operations_per_sample": 1,
+          "micro_sample_duration": 25000000,
+          "report_depth": "default",
+          "console_names": "compact",
+          "progress": true
+        }
+      }
+    },
+    {
+      "benchmark_id": "fixture/throughput/work",
+      "intent": "external",
+      "sample_number": 3,
+      "phase": "measured",
+      "elapsed_ns": 1010000,
+      "wall_clock_ns": 166,
+      "operations_attempted": 1000,
+      "operations_completed": 1000,
+      "throughput": 990099.0099009901,
+      "latency_ns": [],
+      "parameters": {},
+      "counters": {
+        "attempted": 1000,
+        "completed": 1000,
+        "failures": 0,
+        "timeouts": 0,
+        "duplicates": 0,
+        "dropped": 0,
+        "validation_errors": 0
+      },
+      "environment": {
+        "cpu_model": "Apple M5",
+        "core_count": 10,
+        "os": "macos aarch64",
+        "rustc_version": "rustc 1.98.1 (48a229cea 2026-09-01)",
+        "allocator": "cntryl-stress allocator not installed",
+        "build_profile": "debug",
+        "git_commit": "0000000000000000000000000000000000000000",
+        "tool_version": "0.4.0",
+        "command_line": [
+          "target/debug/examples/write_baseline"
+        ],
+        "profile_config": {
+          "profile": "default",
+          "measured_samples": 7,
+          "warmup_samples": 0,
+          "cooldown_samples": 0,
+          "min_quality": "noisy",
+          "fail_on_quality": false,
+          "fail_on_regression": false,
+          "regression_threshold": 0.05,
+          "sample_duration": 500000000,
+          "operations_per_sample": 1,
+          "micro_sample_duration": 25000000,
+          "report_depth": "default",
+          "console_names": "compact",
+          "progress": true
+        }
+      }
+    },
+    {
+      "benchmark_id": "fixture/throughput/work",
+      "intent": "external",
+      "sample_number": 4,
+      "phase": "measured",
+      "elapsed_ns": 1047000,
+      "wall_clock_ns": 125,
+      "operations_attempted": 1000,
+      "operations_completed": 1000,
+      "throughput": 955109.8376313277,
+      "latency_ns": [],
+      "parameters": {},
+      "counters": {
+        "attempted": 1000,
+        "completed": 1000,
+        "failures": 0,
+        "timeouts": 0,
+        "duplicates": 0,
+        "dropped": 0,
+        "validation_errors": 0
+      },
+      "environment": {
+        "cpu_model": "Apple M5",
+        "core_count": 10,
+        "os": "macos aarch64",
+        "rustc_version": "rustc 1.98.1 (48a229cea 2026-09-01)",
+        "allocator": "cntryl-stress allocator not installed",
+        "build_profile": "debug",
+        "git_commit": "0000000000000000000000000000000000000000",
+        "tool_version": "0.4.0",
+        "command_line": [
+          "target/debug/examples/write_baseline"
+        ],
+        "profile_config": {
+          "profile": "default",
+          "measured_samples": 7,
+          "warmup_samples": 0,
+          "cooldown_samples": 0,
+          "min_quality": "noisy",
+          "fail_on_quality": false,
+          "fail_on_regression": false,
+          "regression_threshold": 0.05,
+          "sample_duration": 500000000,
+          "operations_per_sample": 1,
+          "micro_sample_duration": 25000000,
+          "report_depth": "default",
+          "console_names": "compact",
+          "progress": true
+        }
+      }
+    },
+    {
+      "benchmark_id": "fixture/throughput/work",
+      "intent": "external",
+      "sample_number": 5,
+      "phase": "measured",
+      "elapsed_ns": 1084000,
+      "wall_clock_ns": 2000,
+      "operations_attempted": 1000,
+      "operations_completed": 1000,
+      "throughput": 922509.225092251,
+      "latency_ns": [],
+      "parameters": {},
+      "counters": {
+        "attempted": 1000,
+        "completed": 1000,
+        "failures": 0,
+        "timeouts": 0,
+        "duplicates": 0,
+        "dropped": 0,
+        "validation_errors": 0
+      },
+      "environment": {
+        "cpu_model": "Apple M5",
+        "core_count": 10,
+        "os": "macos aarch64",
+        "rustc_version": "rustc 1.98.1 (48a229cea 2026-09-01)",
+        "allocator": "cntryl-stress allocator not installed",
+        "build_profile": "debug",
+        "git_commit": "0000000000000000000000000000000000000000",
+        "tool_version": "0.4.0",
+        "command_line": [
+          "target/debug/examples/write_baseline"
+        ],
+        "profile_config": {
+          "profile": "default",
+          "measured_samples": 7,
+          "warmup_samples": 0,
+          "cooldown_samples": 0,
+          "min_quality": "noisy",
+          "fail_on_quality": false,
+          "fail_on_regression": false,
+          "regression_threshold": 0.05,
+          "sample_duration": 500000000,
+          "operations_per_sample": 1,
+          "micro_sample_duration": 25000000,
+          "report_depth": "default",
+          "console_names": "compact",
+          "progress": true
+        }
+      }
+    },
+    {
+      "benchmark_id": "fixture/throughput/work",
+      "intent": "external",
+      "sample_number": 6,
+      "phase": "measured",
+      "elapsed_ns": 1020000,
+      "wall_clock_ns": 209,
+      "operations_attempted": 1000,
+      "operations_completed": 1000,
+      "throughput": 980392.1568627451,
+      "latency_ns": [],
+      "parameters": {},
+      "counters": {
+        "attempted": 1000,
+        "completed": 1000,
+        "failures": 0,
+        "timeouts": 0,
+        "duplicates": 0,
+        "dropped": 0,
+        "validation_errors": 0
+      },
+      "environment": {
+        "cpu_model": "Apple M5",
+        "core_count": 10,
+        "os": "macos aarch64",
+        "rustc_version": "rustc 1.98.1 (48a229cea 2026-09-01)",
+        "allocator": "cntryl-stress allocator not installed",
+        "build_profile": "debug",
+        "git_commit": "0000000000000000000000000000000000000000",
+        "tool_version": "0.4.0",
+        "command_line": [
+          "target/debug/examples/write_baseline"
+        ],
+        "profile_config": {
+          "profile": "default",
+          "measured_samples": 7,
+          "warmup_samples": 0,
+          "cooldown_samples": 0,
+          "min_quality": "noisy",
+          "fail_on_quality": false,
+          "fail_on_regression": false,
+          "regression_threshold": 0.05,
+          "sample_duration": 500000000,
+          "operations_per_sample": 1,
+          "micro_sample_duration": 25000000,
+          "report_depth": "default",
+          "console_names": "compact",
+          "progress": true
+        }
+      }
+    },
+    {
+      "benchmark_id": "fixture/latency/requests",
+      "intent": "external",
+      "sample_number": 0,
+      "phase": "measured",
+      "elapsed_ns": 500000,
+      "wall_clock_ns": 2375,
+      "operations_attempted": 23,
+      "operations_completed": 23,
+      "throughput": 46000.0,
+      "latency_ns": [
+        1000,
+        1097,
+        1194,
+        1291,
+        1388,
+        1485,
+        1073,
+        1170,
+        1267,
+        1364,
+        1461,
+        1049,
+        1146,
+        1243,
+        1340,
+        1437,
+        1025,
+        1122,
+        1219,
+        1316,
+        1413,
+        1001,
+        1098
+      ],
+      "parameters": {},
+      "counters": {
+        "attempted": 23,
+        "completed": 23,
+        "failures": 0,
+        "timeouts": 0,
+        "duplicates": 0,
+        "dropped": 0,
+        "validation_errors": 0
+      },
+      "environment": {
+        "cpu_model": "Apple M5",
+        "core_count": 10,
+        "os": "macos aarch64",
+        "rustc_version": "rustc 1.98.1 (48a229cea 2026-09-01)",
+        "allocator": "cntryl-stress allocator not installed",
+        "build_profile": "debug",
+        "git_commit": "0000000000000000000000000000000000000000",
+        "tool_version": "0.4.0",
+        "command_line": [
+          "target/debug/examples/write_baseline"
+        ],
+        "profile_config": {
+          "profile": "default",
+          "measured_samples": 7,
+          "warmup_samples": 0,
+          "cooldown_samples": 0,
+          "min_quality": "noisy",
+          "fail_on_quality": false,
+          "fail_on_regression": false,
+          "regression_threshold": 0.05,
+          "sample_duration": 500000000,
+          "operations_per_sample": 1,
+          "micro_sample_duration": 25000000,
+          "report_depth": "default",
+          "console_names": "compact",
+          "progress": true
+        }
+      }
+    },
+    {
+      "benchmark_id": "fixture/latency/requests",
+      "intent": "external",
+      "sample_number": 1,
+      "phase": "measured",
+      "elapsed_ns": 503000,
+      "wall_clock_ns": 1291,
+      "operations_attempted": 23,
+      "operations_completed": 23,
+      "throughput": 45725.64612326044,
+      "latency_ns": [
+        1131,
+        1228,
+        1325,
+        1422,
+        1010,
+        1107,
+        1204,
+        1301,
+        1398,
+        1495,
+        1083,
+        1180,
+        1277,
+        1374,
+        1471,
+        1059,
+        1156,
+        1253,
+        1350,
+        1447,
+        1035,
+        1132,
+        1229
+      ],
+      "parameters": {},
+      "counters": {
+        "attempted": 23,
+        "completed": 23,
+        "failures": 0,
+        "timeouts": 0,
+        "duplicates": 0,
+        "dropped": 0,
+        "validation_errors": 0
+      },
+      "environment": {
+        "cpu_model": "Apple M5",
+        "core_count": 10,
+        "os": "macos aarch64",
+        "rustc_version": "rustc 1.98.1 (48a229cea 2026-09-01)",
+        "allocator": "cntryl-stress allocator not installed",
+        "build_profile": "debug",
+        "git_commit": "0000000000000000000000000000000000000000",
+        "tool_version": "0.4.0",
+        "command_line": [
+          "target/debug/examples/write_baseline"
+        ],
+        "profile_config": {
+          "profile": "default",
+          "measured_samples": 7,
+          "warmup_samples": 0,
+          "cooldown_samples": 0,
+          "min_quality": "noisy",
+          "fail_on_quality": false,
+          "fail_on_regression": false,
+          "regression_threshold": 0.05,
+          "sample_duration": 500000000,
+          "operations_per_sample": 1,
+          "micro_sample_duration": 25000000,
+          "report_depth": "default",
+          "console_names": "compact",
+          "progress": true
+        }
+      }
+    },
+    {
+      "benchmark_id": "fixture/latency/requests",
+      "intent": "external",
+      "sample_number": 2,
+      "phase": "measured",
+      "elapsed_ns": 506000,
+      "wall_clock_ns": 1208,
+      "operations_attempted": 23,
+      "operations_completed": 23,
+      "throughput": 45454.54545454545,
+      "latency_ns": [
+        1262,
+        1359,
+        1456,
+        1044,
+        1141,
+        1238,
+        1335,
+        1432,
+        1020,
+        1117,
+        1214,
+        1311,
+        1408,
+        1505,
+        1093,
+        1190,
+        1287,
+        1384,
+        1481,
+        1069,
+        1166,
+        1263,
+        1360
+      ],
+      "parameters": {},
+      "counters": {
+        "attempted": 23,
+        "completed": 23,
+        "failures": 0,
+        "timeouts": 0,
+        "duplicates": 0,
+        "dropped": 0,
+        "validation_errors": 0
+      },
+      "environment": {
+        "cpu_model": "Apple M5",
+        "core_count": 10,
+        "os": "macos aarch64",
+        "rustc_version": "rustc 1.98.1 (48a229cea 2026-09-01)",
+        "allocator": "cntryl-stress allocator not installed",
+        "build_profile": "debug",
+        "git_commit": "0000000000000000000000000000000000000000",
+        "tool_version": "0.4.0",
+        "command_line": [
+          "target/debug/examples/write_baseline"
+        ],
+        "profile_config": {
+          "profile": "default",
+          "measured_samples": 7,
+          "warmup_samples": 0,
+          "cooldown_samples": 0,
+          "min_quality": "noisy",
+          "fail_on_quality": false,
+          "fail_on_regression": false,
+          "regression_threshold": 0.05,
+          "sample_duration": 500000000,
+          "operations_per_sample": 1,
+          "micro_sample_duration": 25000000,
+          "report_depth": "default",
+          "console_names": "compact",
+          "progress": true
+        }
+      }
+    },
+    {
+      "benchmark_id": "fixture/latency/requests",
+      "intent": "external",
+      "sample_number": 3,
+      "phase": "measured",
+      "elapsed_ns": 509000,
+      "wall_clock_ns": 1042,
+      "operations_attempted": 23,
+      "operations_completed": 23,
+      "throughput": 45186.64047151277,
+      "latency_ns": [
+        1393,
+        1490,
+        1078,
+        1175,
+        1272,
+        1369,
+        1466,
+        1054,
+        1151,
+        1248,
+        1345,
+        1442,
+        1030,
+        1127,
+        1224,
+        1321,
+        1418,
+        1006,
+        1103,
+        1200,
+        1297,
+        1394,
+        1491
+      ],
+      "parameters": {},
+      "counters": {
+        "attempted": 23,
+        "completed": 23,
+        "failures": 0,
+        "timeouts": 0,
+        "duplicates": 0,
+        "dropped": 0,
+        "validation_errors": 0
+      },
+      "environment": {
+        "cpu_model": "Apple M5",
+        "core_count": 10,
+        "os": "macos aarch64",
+        "rustc_version": "rustc 1.98.1 (48a229cea 2026-09-01)",
+        "allocator": "cntryl-stress allocator not installed",
+        "build_profile": "debug",
+        "git_commit": "0000000000000000000000000000000000000000",
+        "tool_version": "0.4.0",
+        "command_line": [
+          "target/debug/examples/write_baseline"
+        ],
+        "profile_config": {
+          "profile": "default",
+          "measured_samples": 7,
+          "warmup_samples": 0,
+          "cooldown_samples": 0,
+          "min_quality": "noisy",
+          "fail_on_quality": false,
+          "fail_on_regression": false,
+          "regression_threshold": 0.05,
+          "sample_duration": 500000000,
+          "operations_per_sample": 1,
+          "micro_sample_duration": 25000000,
+          "report_depth": "default",
+          "console_names": "compact",
+          "progress": true
+        }
+      }
+    },
+    {
+      "benchmark_id": "fixture/latency/requests",
+      "intent": "external",
+      "sample_number": 4,
+      "phase": "measured",
+      "elapsed_ns": 512000,
+      "wall_clock_ns": 1084,
+      "operations_attempted": 23,
+      "operations_completed": 23,
+      "throughput": 44921.875,
+      "latency_ns": [
+        1015,
+        1112,
+        1209,
+        1306,
+        1403,
+        1500,
+        1088,
+        1185,
+        1282,
+        1379,
+        1476,
+        1064,
+        1161,
+        1258,
+        1355,
+        1452,
+        1040,
+        1137,
+        1234,
+        1331,
+        1428,
+        1016,
+        1113
+      ],
+      "parameters": {},
+      "counters": {
+        "attempted": 23,
+        "completed": 23,
+        "failures": 0,
+        "timeouts": 0,
+        "duplicates": 0,
+        "dropped": 0,
+        "validation_errors": 0
+      },
+      "environment": {
+        "cpu_model": "Apple M5",
+        "core_count": 10,
+        "os": "macos aarch64",
+        "rustc_version": "rustc 1.98.1 (48a229cea 2026-09-01)",
+        "allocator": "cntryl-stress allocator not installed",
+        "build_profile": "debug",
+        "git_commit": "0000000000000000000000000000000000000000",
+        "tool_version": "0.4.0",
+        "command_line": [
+          "target/debug/examples/write_baseline"
+        ],
+        "profile_config": {
+          "profile": "default",
+          "measured_samples": 7,
+          "warmup_samples": 0,
+          "cooldown_samples": 0,
+          "min_quality": "noisy",
+          "fail_on_quality": false,
+          "fail_on_regression": false,
+          "regression_threshold": 0.05,
+          "sample_duration": 500000000,
+          "operations_per_sample": 1,
+          "micro_sample_duration": 25000000,
+          "report_depth": "default",
+          "console_names": "compact",
+          "progress": true
+        }
+      }
+    },
+    {
+      "benchmark_id": "fixture/latency/requests",
+      "intent": "external",
+      "sample_number": 5,
+      "phase": "measured",
+      "elapsed_ns": 515000,
+      "wall_clock_ns": 1000,
+      "operations_attempted": 23,
+      "operations_completed": 23,
+      "throughput": 44660.19417475728,
+      "latency_ns": [
+        1146,
+        1243,
+        1340,
+        1437,
+        1025,
+        1122,
+        1219,
+        1316,
+        1413,
+        1001,
+        1098,
+        1195,
+        1292,
+        1389,
+        1486,
+        1074,
+        1171,
+        1268,
+        1365,
+        1462,
+        1050,
+        1147,
+        1244
+      ],
+      "parameters": {},
+      "counters": {
+        "attempted": 23,
+        "completed": 23,
+        "failures": 0,
+        "timeouts": 0,
+        "duplicates": 0,
+        "dropped": 0,
+        "validation_errors": 0
+      },
+      "environment": {
+        "cpu_model": "Apple M5",
+        "core_count": 10,
+        "os": "macos aarch64",
+        "rustc_version": "rustc 1.98.1 (48a229cea 2026-09-01)",
+        "allocator": "cntryl-stress allocator not installed",
+        "build_profile": "debug",
+        "git_commit": "0000000000000000000000000000000000000000",
+        "tool_version": "0.4.0",
+        "command_line": [
+          "target/debug/examples/write_baseline"
+        ],
+        "profile_config": {
+          "profile": "default",
+          "measured_samples": 7,
+          "warmup_samples": 0,
+          "cooldown_samples": 0,
+          "min_quality": "noisy",
+          "fail_on_quality": false,
+          "fail_on_regression": false,
+          "regression_threshold": 0.05,
+          "sample_duration": 500000000,
+          "operations_per_sample": 1,
+          "micro_sample_duration": 25000000,
+          "report_depth": "default",
+          "console_names": "compact",
+          "progress": true
+        }
+      }
+    },
+    {
+      "benchmark_id": "fixture/latency/requests",
+      "intent": "external",
+      "sample_number": 6,
+      "phase": "measured",
+      "elapsed_ns": 518000,
+      "wall_clock_ns": 916,
+      "operations_attempted": 23,
+      "operations_completed": 23,
+      "throughput": 44401.5444015444,
+      "latency_ns": [
+        1277,
+        1374,
+        1471,
+        1059,
+        1156,
+        1253,
+        1350,
+        1447,
+        1035,
+        1132,
+        1229,
+        1326,
+        1423,
+        1011,
+        1108,
+        1205,
+        1302,
+        1399,
+        1496,
+        1084,
+        1181,
+        1278,
+        1375
+      ],
+      "parameters": {},
+      "counters": {
+        "attempted": 23,
+        "completed": 23,
+        "failures": 0,
+        "timeouts": 0,
+        "duplicates": 0,
+        "dropped": 0,
+        "validation_errors": 0
+      },
+      "environment": {
+        "cpu_model": "Apple M5",
+        "core_count": 10,
+        "os": "macos aarch64",
+        "rustc_version": "rustc 1.98.1 (48a229cea 2026-09-01)",
+        "allocator": "cntryl-stress allocator not installed",
+        "build_profile": "debug",
+        "git_commit": "0000000000000000000000000000000000000000",
+        "tool_version": "0.4.0",
+        "command_line": [
+          "target/debug/examples/write_baseline"
+        ],
+        "profile_config": {
+          "profile": "default",
+          "measured_samples": 7,
+          "warmup_samples": 0,
+          "cooldown_samples": 0,
+          "min_quality": "noisy",
+          "fail_on_quality": false,
+          "fail_on_regression": false,
+          "regression_threshold": 0.05,
+          "sample_duration": 500000000,
+          "operations_per_sample": 1,
+          "micro_sample_duration": 25000000,
+          "report_depth": "default",
+          "console_names": "compact",
+          "progress": true
+        }
+      }
+    }
+  ],
+  "summaries": [
+    {
+      "benchmark_id": "fixture/throughput/work",
+      "name": "work",
+      "tier": 2,
+      "intent": "external",
+      "primary_metric": "throughput",
+      "measured_samples": 7,
+      "warmup_samples": 0,
+      "cooldown_samples": 0,
+      "stats": {
+        "mean": 963361.2971771947,
+        "median": 964320.1542912248,
+        "min": 922509.225092251,
+        "max": 1000000.0,
+        "std_dev": 29229.332293725016,
+        "relative_std_dev": 0.03034098668835017,
+        "confidence_interval_95": {
+          "lower": 941707.9047906484,
+          "upper": 985014.6895637411
+        },
+        "p50": 964320.1542912248,
+        "p95": 1000000.0,
+        "p99": 1000000.0
+      },
+      "wall_clock": {
+        "mean": 1636.857142857143,
+        "median": 209.0,
+        "min": 125.0,
+        "max": 8541.0,
+        "std_dev": 3119.0496110498907,
+        "relative_std_dev": 1.9055111954398005,
+        "confidence_interval_95": {
+          "lower": -673.7671445018666,
+          "upper": 3947.481430216152
+        },
+        "p50": 209.0,
+        "p95": 8541.0,
+        "p99": 8541.0
+      },
+      "total_wall_clock_ns": 11458,
+      "ns_per_op": {
+        "mean": 1038.857142857143,
+        "median": 1037.0,
+        "min": 1000.0,
+        "max": 1084.0,
+        "std_dev": 31.7302619562071,
+        "relative_std_dev": 0.030543431475996936,
+        "confidence_interval_95": {
+          "lower": 1015.3510358492467,
+          "upper": 1062.363249865039
+        },
+        "p50": 1037.0,
+        "p95": 1084.0,
+        "p99": 1084.0
+      },
+      "quality": "acceptable",
+      "trust_class": "gate",
+      "budgets": {},
+      "correctness": {
+        "passed": true,
+        "counters": {
+          "attempted": 7000,
+          "completed": 7000,
+          "failures": 0,
+          "timeouts": 0,
+          "duplicates": 0,
+          "dropped": 0,
+          "validation_errors": 0
+        },
+        "errors": []
+      },
+      "parameters": {
+        "measurement_mode": "fixed_ops"
+      },
+      "metadata": {}
+    },
+    {
+      "benchmark_id": "fixture/latency/requests",
+      "name": "requests",
+      "tier": 2,
+      "intent": "external",
+      "primary_metric": "latency_p95",
+      "measured_samples": 7,
+      "warmup_samples": 0,
+      "cooldown_samples": 0,
+      "stats": {
+        "mean": 1473.142857142857,
+        "median": 1471.0,
+        "min": 1461.0,
+        "max": 1490.0,
+        "std_dev": 10.286375640113665,
+        "relative_std_dev": 0.006982605651745118,
+        "confidence_interval_95": {
+          "lower": 1463.6292036539244,
+          "upper": 1482.6565106317898
+        },
+        "p50": 1471.0,
+        "p95": 1490.0,
+        "p99": 1490.0
+      },
+      "wall_clock": {
+        "mean": 1273.7142857142858,
+        "median": 1084.0,
+        "min": 916.0,
+        "max": 2375.0,
+        "std_dev": 501.66546432382415,
+        "relative_std_dev": 0.39386027930313694,
+        "confidence_interval_95": {
+          "lower": 902.0753089281222,
+          "upper": 1645.3532625004493
+        },
+        "p50": 1084.0,
+        "p95": 2375.0,
+        "p99": 2375.0
+      },
+      "total_wall_clock_ns": 8916,
+      "ns_per_op": {
+        "mean": 22130.4347826087,
+        "median": 22130.434782608696,
+        "min": 21739.130434782608,
+        "max": 22521.739130434784,
+        "std_dev": 281.77133471338595,
+        "relative_std_dev": 0.012732299996872054,
+        "confidence_interval_95": {
+          "lower": 21921.69565670196,
+          "upper": 22339.17390851544
+        },
+        "p50": 22130.434782608696,
+        "p95": 22521.739130434784,
+        "p99": 22521.739130434784
+      },
+      "quality": "acceptable",
+      "trust_class": "gate",
+      "budgets": {},
+      "correctness": {
+        "passed": true,
+        "counters": {
+          "attempted": 161,
+          "completed": 161,
+          "failures": 0,
+          "timeouts": 0,
+          "duplicates": 0,
+          "dropped": 0,
+          "validation_errors": 0
+        },
+        "errors": []
+      },
+      "parameters": {
+        "measurement_mode": "fixed_ops"
+      },
+      "metadata": {
+        "cntryl_stress_latency_estimator": "per_sample_p95_mean_student_t_95",
+        "primary_metric": "latency"
+      }
+    }
+  ],
+  "comparisons": [],
+  "diagnostics_summary": [],
+  "started_at": "01790196904441015000-0000009295-00000000000000000000",
+  "total_elapsed_ns": 433833,
+  "metadata": {}
+}

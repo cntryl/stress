@@ -4,27 +4,29 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: crates-io-publish
   cancel-in-progress: false
 
 jobs:
-  publish:
-    name: Publish crates to crates.io
+  test:
+    name: Verify release candidate
     runs-on: ubuntu-latest
-    environment: crates-io
     permissions:
-      contents: write
-      id-token: write
+      contents: read
 
     steps:
-      - name: Check out release tag
-        uses: actions/checkout@v6
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
       - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
 
       - name: Read release versions from Cargo manifests
         id: version
@@ -36,11 +38,83 @@ jobs:
           test "${core_version}" = "${macros_version}"
           echo "version=${core_version}" >> "${GITHUB_OUTPUT}"
 
-      - name: Verify macros package contents
-        run: cargo package --locked -p cntryl-stress-macros
+      - name: Restrict release source ref
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          case "${GITHUB_REF}" in
+            refs/heads/main) ;;
+            "refs/tags/v${RELEASE_VERSION}") ;;
+            *)
+              echo "::error::Releases must be dispatched from refs/heads/main or refs/tags/v${RELEASE_VERSION}, not ${GITHUB_REF}."
+              exit 1
+              ;;
+          esac
 
       - name: Test workspace
         run: cargo test --locked --workspace --all-targets --all-features
+
+  publish:
+    name: Publish crates to crates.io
+    needs: test
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+
+      - name: Read release versions from Cargo manifests
+        id: version
+        run: |
+          core_version="$(sed -n '/^\[package\]/,/^\[/ { s/^version = "\([^"]*\)"/\1/p; }' core/Cargo.toml | head -n 1)"
+          macros_version="$(sed -n '/^\[package\]/,/^\[/ { s/^version = "\([^"]*\)"/\1/p; }' macros/Cargo.toml | head -n 1)"
+          test -n "${core_version}"
+          test -n "${macros_version}"
+          test "${core_version}" = "${macros_version}"
+          echo "version=${core_version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restrict release source ref
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          case "${GITHUB_REF}" in
+            refs/heads/main) ;;
+            "refs/tags/v${RELEASE_VERSION}") ;;
+            *)
+              echo "::error::Releases must be dispatched from refs/heads/main or refs/tags/v${RELEASE_VERSION}, not ${GITHUB_REF}."
+              exit 1
+              ;;
+          esac
+
+      - name: Refuse a conflicting release tag
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          tag="v${RELEASE_VERSION}"
+          remote="https://github.com/${GITHUB_REPOSITORY}.git"
+          existing="$(git ls-remote --refs "${remote}" "refs/tags/${tag}" | cut -f1)"
+          if [ -n "${existing}" ]; then
+            peeled="$(git ls-remote "${remote}" "refs/tags/${tag}^{}" | cut -f1)"
+            tagged_sha="${peeled:-${existing}}"
+            if [ "${tagged_sha}" != "${GITHUB_SHA}" ]; then
+              echo "::error::${tag} already exists at ${tagged_sha}, but this release was built from ${GITHUB_SHA}."
+              exit 1
+            fi
+          fi
+
+      - name: Verify macros package contents
+        run: cargo package --locked -p cntryl-stress-macros
 
       - name: Check whether macros version is already published
         id: macros_registry
@@ -55,7 +129,7 @@ jobs:
 
       - name: Authenticate with crates.io
         id: auth
-        uses: rust-lang/crates-io-auth-action@v1
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
 
       - name: Publish macros crate
         if: steps.macros_registry.outputs.published != 'true'
@@ -89,11 +163,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="v${RELEASE_VERSION}"
-          if git ls-remote --exit-code --refs origin "refs/tags/${tag}" >/dev/null 2>&1; then
-            echo "${tag} already exists; leaving it unchanged."
-            exit 0
+          remote="https://github.com/${GITHUB_REPOSITORY}.git"
+          existing="$(git ls-remote --refs "${remote}" "refs/tags/${tag}" | cut -f1)"
+          if [ -n "${existing}" ]; then
+            peeled="$(git ls-remote "${remote}" "refs/tags/${tag}^{}" | cut -f1)"
+            tagged_sha="${peeled:-${existing}}"
+            if [ "${tagged_sha}" = "${GITHUB_SHA}" ]; then
+              echo "${tag} already points at ${GITHUB_SHA}; leaving it unchanged."
+              exit 0
+            fi
+            echo "::error::${tag} already exists at ${tagged_sha}, but this release was built from ${GITHUB_SHA}."
+            exit 1
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "${tag}" "${GITHUB_SHA}" -m "Release ${tag}"
-          git push origin "${tag}"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${tag}"

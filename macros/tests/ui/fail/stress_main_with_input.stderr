@@ -1,0 +1,5 @@
+error: stress_main! takes no arguments
+ --> tests/ui/fail/stress_main_with_input.rs:2:32
+  |
+2 |     stress_alias::stress_main!(unexpected);
+  |                                ^^^^^^^^^^

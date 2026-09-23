@@ -52,7 +52,8 @@ const MAX_TIER: u32 = 6;
 pub fn stress(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
     let fn_name = &input.sig.ident;
-    let fn_name_str = fn_name.to_string();
+    let fn_name_str = syn::ext::IdentExt::unraw(fn_name).to_string();
+    let cfg_attrs = propagated_cfg_attrs(&input.attrs);
     let is_async = input.sig.asyncness.is_some();
 
     let attrs = match StressAttrs::parse(attr.into()) {
@@ -93,10 +94,7 @@ pub fn stress(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
     let metadata_keys = metadata.iter().map(|(key, _)| key);
     let metadata_values = metadata.iter().map(|(_, value)| value);
-    let submit_ident = syn::Ident::new(
-        &format!("__STRESS_BENCH_{}", fn_name_str.to_uppercase()),
-        fn_name.span(),
-    );
+    let submit_ident = syn::Ident::new(&format!("__stress_bench_{fn_name_str}"), fn_name.span());
     let wrapper_ident = syn::Ident::new(&format!("__stress_wrapper_{fn_name_str}"), fn_name.span());
     let invocation = if is_async {
         quote! {
@@ -106,6 +104,8 @@ pub fn stress(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { #fn_name(ctx) }
     };
     let wrapper = quote! {
+        #(#cfg_attrs)*
+        #[allow(non_snake_case)]
         fn #wrapper_ident(ctx: &mut #stress_crate::StressContext) -> #stress_crate::StressResult {
             #stress_crate::__private::IntoStressResult::into_stress_result(#invocation)
         }
@@ -115,6 +115,7 @@ pub fn stress(attr: TokenStream, item: TokenStream) -> TokenStream {
         #input
         #wrapper
 
+        #(#cfg_attrs)*
         #[allow(non_upper_case_globals)]
         #[#stress_crate::__private::linkme::distributed_slice(#stress_crate::__private::STRESS_BENCHMARKS)]
         #[linkme(crate = #stress_crate::__private::linkme)]
@@ -123,7 +124,7 @@ pub fn stress(attr: TokenStream, item: TokenStream) -> TokenStream {
             function_name: #fn_name_str,
             func: #wrapper_ident,
             ignored: #is_ignored,
-            module_path: module_path!(),
+            module_path: ::core::module_path!(),
             tier: #tier,
             mode: #mode,
             budgets: #stress_crate::artifact::BenchmarkBudgets {
@@ -373,9 +374,9 @@ fn percentage_budget_value(name_value: &MetaNameValue) -> syn::Result<f64> {
 
 fn option_f64_tokens(value: Option<f64>) -> TokenStream2 {
     if let Some(value) = value {
-        quote! { Some(#value) }
+        quote! { ::core::option::Option::Some(#value) }
     } else {
-        quote! { None }
+        quote! { ::core::option::Option::None }
     }
 }
 
@@ -513,7 +514,13 @@ fn tier_error(tier: u32) -> Option<String> {
 
 /// Generate a `main` function for stress benchmark binaries.
 #[proc_macro]
-pub fn stress_main(_input: TokenStream) -> TokenStream {
+pub fn stress_main(input: TokenStream) -> TokenStream {
+    let input = TokenStream2::from(input);
+    if !input.is_empty() {
+        return syn::Error::new_spanned(input, "stress_main! takes no arguments")
+            .to_compile_error()
+            .into();
+    }
     let stress_crate = match stress_crate_path() {
         Ok(path) => path,
         Err(error) => return error.to_compile_error().into(),
@@ -524,6 +531,16 @@ pub fn stress_main(_input: TokenStream) -> TokenStream {
         }
     }
     .into()
+}
+
+/// Returns the `#[cfg(...)]` attributes that must also gate the generated
+/// wrapper and registration items. `#[cfg_attr(...)]` is deliberately not
+/// copied: its payload (for example `inline`) may be invalid on a `static`.
+fn propagated_cfg_attrs(attrs: &[syn::Attribute]) -> Vec<&syn::Attribute> {
+    attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("cfg"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -561,5 +578,18 @@ mod tests {
         assert!(error
             .to_string()
             .contains("mode is not a public stress attribute"));
+    }
+
+    #[test]
+    fn only_cfg_attributes_are_propagated_to_generated_items() {
+        let item: ItemFn = syn::parse_quote! {
+            #[cfg(all())]
+            #[cfg_attr(all(), inline)]
+            #[doc = "x"]
+            fn bench(ctx: &mut StressContext) {}
+        };
+        let propagated = propagated_cfg_attrs(&item.attrs);
+        assert_eq!(propagated.len(), 1);
+        assert!(propagated[0].path().is_ident("cfg"));
     }
 }

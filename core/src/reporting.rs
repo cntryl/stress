@@ -206,6 +206,7 @@ enum ArtifactPublicationPoint {
     BeforeFinalize,
 }
 
+#[derive(Clone)]
 struct PendingArtifact<'a> {
     path: PathBuf,
     contents: &'a [u8],
@@ -243,7 +244,7 @@ impl JsonReporter {
         run: &StressRun,
         mut before_publication_point: impl FnMut(ArtifactPublicationPoint) -> std::io::Result<()>,
     ) -> std::io::Result<()> {
-        let sanitized_name = artifact_suite_directory_name(&run.suite);
+        let sanitized_name = artifact_suite_directory_name(&run.suite)?;
         let suite_dir = self.output_dir.join(sanitized_name);
         std::fs::create_dir_all(&suite_dir)?;
 
@@ -295,7 +296,12 @@ impl JsonReporter {
                 replace_existing: true,
             },
         ];
-        publish_artifact_set(&suite_dir, &artifacts, &mut before_publication_point)?;
+        publish_artifact_set(
+            &suite_dir,
+            &run.started_at,
+            &artifacts,
+            &mut before_publication_point,
+        )?;
 
         if self.announce {
             eprintln!("  Results written to: {}", json_path.display());
@@ -307,12 +313,26 @@ impl JsonReporter {
 
 fn publish_artifact_set(
     suite_dir: &Path,
+    started_at: &str,
     artifacts: &[PendingArtifact<'_>],
     before_publication_point: &mut impl FnMut(ArtifactPublicationPoint) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     validate_artifact_targets(suite_dir, artifacts)?;
     let _publication_lock = acquire_artifact_publication_lock(suite_dir)?;
     recover_interrupted_artifact_transactions(suite_dir)?;
+    // A slower concurrent run may finish after a newer one; keep its
+    // timestamped artifacts but never move latest.* backwards.
+    let filtered;
+    let artifacts = if latest_is_newer_than(suite_dir, started_at) {
+        filtered = artifacts
+            .iter()
+            .filter(|artifact| !artifact.replace_existing)
+            .cloned()
+            .collect::<Vec<_>>();
+        filtered.as_slice()
+    } else {
+        artifacts
+    };
     reject_timestamp_artifact_collisions(artifacts)?;
     let transaction_dir = create_artifact_transaction_directory(suite_dir)?;
     if let Err(error) = stage_artifacts(&transaction_dir, artifacts)
@@ -800,6 +820,21 @@ fn remove_published_artifact(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Whether `latest.json` in `suite_dir` records a run that started after
+/// `started_at`. Run stems are fixed-width, so shorter stems order first.
+fn latest_is_newer_than(suite_dir: &Path, started_at: &str) -> bool {
+    let Ok(bytes) = std::fs::read(suite_dir.join("latest.json")) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    value
+        .get("started_at")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|existing| (existing.len(), existing) > (started_at.len(), started_at))
+}
+
 fn staged_artifact_path(transaction_dir: &Path, index: usize) -> PathBuf {
     transaction_dir.join(format!("staged-{index}"))
 }
@@ -812,13 +847,47 @@ fn absent_artifact_path(transaction_dir: &Path, index: usize) -> PathBuf {
     transaction_dir.join(format!("absent-{index}"))
 }
 
-fn artifact_suite_directory_name(suite: &str) -> String {
-    let sanitized = suite.replace(['/', '\\'], "_");
-    if matches!(sanitized.as_str(), "" | "." | "..") {
-        "_invalid-suite".to_string()
+/// Validate a suite name for use as an artifact directory.
+///
+/// Applies the same rule as `StressRunner`: non-empty, not a dot segment, and
+/// only ASCII letters, digits, `.`, `-`, or `_`.
+fn artifact_suite_directory_name(suite: &str) -> std::io::Result<String> {
+    let valid = !suite.trim().is_empty()
+        && !matches!(suite, "." | "..")
+        && suite.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        });
+    if valid {
+        Ok(suite.to_string())
     } else {
-        sanitized
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "invalid stress suite name {suite:?}: must be non-empty, not '.' or '..', and contain only ASCII letters, digits, '.', '-', or '_'"
+            ),
+        ))
     }
+}
+
+/// Escape text for a single Markdown table cell.
+fn escape_markdown_cell(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '|' => escaped.push_str("\\|"),
+            '\r' => {
+                if characters.peek() == Some(&'\n') {
+                    characters.next();
+                }
+                escaped.push(' ');
+            }
+            '\n' => escaped.push(' '),
+            other => escaped.push(other),
+        }
+    }
+    escaped
 }
 
 pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
@@ -1064,12 +1133,12 @@ pub(crate) fn format_markdown_report(run: &StressRun) -> String {
         let _ = writeln!(
             output,
             "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
-            summary.name,
+            escape_markdown_cell(&summary.name),
             summary.tier,
             value,
             summary.trust_class,
             measurement_mode_label(summary),
-            measurement_question(summary),
+            escape_markdown_cell(&measurement_question(summary)),
             summary.quality,
             summary.measured_samples,
             format_duration_ns(summary.total_wall_clock_ns)
@@ -1099,8 +1168,8 @@ pub(crate) fn format_markdown_report(run: &StressRun) -> String {
                 let _ = writeln!(
                     output,
                     "| {} | {} ({:?}) | {:.3} | {:.3}..{:.3} | {} | {:?} |",
-                    summary.name,
-                    observation.name,
+                    escape_markdown_cell(&summary.name),
+                    escape_markdown_cell(&observation.name),
                     observation.unit,
                     stats.median,
                     stats.confidence_interval_95.lower,
@@ -2800,65 +2869,158 @@ fn write_sweep_tables(output: &mut String, run: &StressRun) {
         return;
     }
 
-    output.push_str("\nSweep Tables\n");
-    output.push_str("------------\n");
+    let mut header_written = false;
     for key in numeric_keys {
-        let mut rows = run
-            .summaries
-            .iter()
-            .filter_map(|summary| {
-                let x = summary.parameters.get(&key)?.parse::<f64>().ok()?;
-                let y = summary.primary_value()?;
-                Some((x, y, summary))
-            })
-            .collect::<Vec<_>>();
-        rows.sort_by(|left, right| left.0.total_cmp(&right.0));
-        if rows.len() < 2 {
-            continue;
+        let mut groups: BTreeMap<SweepGroupKey, Vec<SweepRow<'_>>> = BTreeMap::new();
+        for summary in &run.summaries {
+            let Some(raw) = summary.parameters.get(&key) else {
+                continue;
+            };
+            let Ok(x) = raw.parse::<f64>() else {
+                continue;
+            };
+            let Some(y) = summary.primary_value() else {
+                continue;
+            };
+            groups
+                .entry(sweep_group_key(summary, &key, raw))
+                .or_default()
+                .push((x, y, summary));
         }
-
-        let baseline_x = rows[0].0;
-        let baseline_y = rows[0].1;
-        let mut plateau = None;
-        let _ = writeln!(output, "Parameter: {key}");
-        for (idx, (x, y, summary)) in rows.iter().enumerate() {
-            let speedup = if summary.primary_metric.higher_is_better() {
-                y / baseline_y
-            } else {
-                baseline_y / y
-            };
-            let efficiency = if baseline_x > 0.0 && *x > 0.0 {
-                speedup / (*x / baseline_x)
-            } else {
-                0.0
-            };
-            if idx > 0 && plateau.is_none() {
-                let previous_y = rows[idx - 1].1;
-                let gain = if summary.primary_metric.higher_is_better() {
-                    (y - previous_y) / previous_y
-                } else {
-                    (previous_y - y) / previous_y
-                };
-                if gain < 0.10 {
-                    plateau = Some(*x);
-                }
+        for (group, mut rows) in groups {
+            rows.sort_by(|left, right| left.0.total_cmp(&right.0));
+            if rows.len() < 2 {
+                continue;
             }
-            let _ = writeln!(
-                output,
-                "  {}={} value={} speedup={:.2} efficiency={:.2}",
-                key,
-                x,
-                format_metric(*y, summary),
-                speedup,
-                efficiency
-            );
+            if !header_written {
+                output.push_str("\nSweep Tables\n");
+                output.push_str("------------\n");
+                header_written = true;
+            }
+            write_sweep_group(output, &key, &group, &rows);
         }
-        if let Some(point) = plateau {
-            let _ = writeln!(
-                output,
-                "  plateau: first {key} where incremental gain < 10% is {point}"
-            );
+    }
+}
+
+type SweepRow<'a> = (f64, f64, &'a BenchmarkSummary);
+
+/// Identity of one sweep: the same benchmark (name with the swept value
+/// removed, all other parameters equal) measured with the same metric and unit.
+/// Speedup is only ever computed within one group.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SweepGroupKey {
+    base_name: String,
+    measurement: String,
+    other_parameters: Vec<(String, String)>,
+}
+
+fn sweep_group_key(summary: &BenchmarkSummary, key: &str, raw_value: &str) -> SweepGroupKey {
+    let base_name = name_without_swept_value(&summary.name, key, raw_value);
+    SweepGroupKey {
+        base_name,
+        measurement: format!(
+            "{:?} {}",
+            summary.primary_metric,
+            human_measurement_label(summary)
+        ),
+        other_parameters: summary
+            .parameters
+            .iter()
+            .filter(|(name, _)| name.as_str() != key)
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+    }
+}
+
+/// Replaces the swept value in a benchmark name with `*`, matching only a
+/// delimiter-anchored token: `{key}={value}`, `{key}_{value}`,
+/// `{key}-{value}`, or a bare `{value}` bounded by non-alphanumeric characters
+/// (or the ends of the name). Key-qualified tokens win over bare values, and
+/// the last match wins within each form. A name without such a token is kept
+/// unchanged; grouping still also requires every other parameter to match.
+fn name_without_swept_value(name: &str, key: &str, raw_value: &str) -> String {
+    fn is_boundary(ch: Option<char>) -> bool {
+        ch.is_none_or(|ch| !ch.is_ascii_alphanumeric())
+    }
+    fn last_bounded(name: &str, needle: &str) -> Option<usize> {
+        if needle.is_empty() {
+            return None;
         }
+        name.match_indices(needle)
+            .filter(|(index, _)| {
+                is_boundary(name[..*index].chars().next_back())
+                    && is_boundary(name[index + needle.len()..].chars().next())
+            })
+            .map(|(index, _)| index)
+            .last()
+    }
+
+    if raw_value.is_empty() {
+        return name.to_string();
+    }
+    for separator in ["=", "_", "-"] {
+        let token = format!("{key}{separator}{raw_value}");
+        if let Some(index) = last_bounded(name, &token) {
+            let value_start = index + key.len() + separator.len();
+            let mut base = name.to_string();
+            base.replace_range(value_start..index + token.len(), "*");
+            return base;
+        }
+    }
+    if let Some(index) = last_bounded(name, raw_value) {
+        let mut base = name.to_string();
+        base.replace_range(index..index + raw_value.len(), "*");
+        return base;
+    }
+    name.to_string()
+}
+
+fn write_sweep_group(output: &mut String, key: &str, group: &SweepGroupKey, rows: &[SweepRow<'_>]) {
+    let baseline_x = rows[0].0;
+    let baseline_y = rows[0].1;
+    let mut plateau = None;
+    let _ = writeln!(
+        output,
+        "Parameter: {key} (benchmark: {}, measurement: {})",
+        group.base_name, group.measurement
+    );
+    for (idx, (x, y, summary)) in rows.iter().enumerate() {
+        let speedup = if summary.primary_metric.higher_is_better() {
+            y / baseline_y
+        } else {
+            baseline_y / y
+        };
+        let efficiency = if baseline_x > 0.0 && *x > 0.0 {
+            speedup / (*x / baseline_x)
+        } else {
+            0.0
+        };
+        if idx > 0 && plateau.is_none() {
+            let previous_y = rows[idx - 1].1;
+            let gain = if summary.primary_metric.higher_is_better() {
+                (y - previous_y) / previous_y
+            } else {
+                (previous_y - y) / previous_y
+            };
+            if gain < 0.10 {
+                plateau = Some(*x);
+            }
+        }
+        let _ = writeln!(
+            output,
+            "  {}={} value={} speedup={:.2} efficiency={:.2}",
+            key,
+            x,
+            format_metric(*y, summary),
+            speedup,
+            efficiency
+        );
+    }
+    if let Some(point) = plateau {
+        let _ = writeln!(
+            output,
+            "  plateau: first {key} where incremental gain < 10% is {point}"
+        );
     }
 }
 
@@ -3559,10 +3721,99 @@ mod tests {
     }
 
     #[test]
-    fn artifact_suite_directory_never_uses_a_dot_segment() {
-        assert_eq!(artifact_suite_directory_name(".."), "_invalid-suite");
-        assert_eq!(artifact_suite_directory_name("."), "_invalid-suite");
-        assert_eq!(artifact_suite_directory_name("a/b"), "a_b");
+    fn artifact_suite_directory_rejects_invalid_suite_names() {
+        for invalid in ["..", ".", "", "a/b", "a\\b", "a b", "a|b", "../x"] {
+            assert!(
+                artifact_suite_directory_name(invalid).is_err(),
+                "{invalid:?} must be rejected"
+            );
+        }
+        assert_eq!(
+            artifact_suite_directory_name("suite-1.v_2").expect("valid"),
+            "suite-1.v_2"
+        );
+    }
+
+    #[test]
+    fn json_reporter_rejects_invalid_suite_name() {
+        let output_dir = unique_test_path("reporter-invalid-suite");
+        let mut run = run_with_summaries(Vec::new());
+        run.suite = "../escape".to_string();
+        let error = JsonReporter::new(&output_dir)
+            .announce(false)
+            .write_results_inner(&run)
+            .expect_err("invalid suite name");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        let _ = std::fs::remove_dir_all(output_dir);
+    }
+
+    #[test]
+    fn older_run_does_not_replace_newer_latest_artifacts() {
+        let output_dir = unique_test_path("reporter-stale-latest");
+        let reporter = JsonReporter::new(&output_dir).announce(false);
+        let mut newer = run_with_summaries(vec![summary(
+            "queue::newer",
+            1.0,
+            QualityClass::Authoritative,
+        )]);
+        newer.started_at = "200".to_string();
+        let mut older = run_with_summaries(vec![summary(
+            "queue::older",
+            1.0,
+            QualityClass::Authoritative,
+        )]);
+        older.started_at = "100".to_string();
+        reporter.write_results_inner(&newer).expect("newer");
+        reporter.write_results_inner(&older).expect("older");
+
+        let suite_dir = output_dir.join("suite");
+        let latest: StressRun =
+            serde_json::from_slice(&std::fs::read(suite_dir.join("latest.json")).expect("latest"))
+                .expect("latest run");
+        assert_eq!(latest.started_at, "200");
+        let latest_md = std::fs::read_to_string(suite_dir.join("latest.md")).expect("md");
+        assert!(latest_md.contains("queue::newer"));
+        assert!(suite_dir.join("100.json").exists());
+        assert!(suite_dir.join("100.md").exists());
+        std::fs::remove_dir_all(output_dir).expect("cleanup reporter test directory");
+    }
+
+    #[test]
+    fn markdown_escapes_table_cells() {
+        assert_eq!(escape_markdown_cell("a|b\\c\nd\r\ne"), "a\\|b\\\\c d e");
+        let run = run_with_summaries(vec![summary(
+            "bad|name\nnext",
+            1.0,
+            QualityClass::Authoritative,
+        )]);
+        let markdown = format_markdown_report(&run);
+        assert!(markdown.contains("| bad\\|name next |"), "{markdown}");
+        assert!(!markdown.lines().any(|line| line.starts_with("next")));
+    }
+
+    #[test]
+    fn sweep_tables_do_not_mix_unrelated_benchmarks_or_units() {
+        let mut a1 = summary("alpha-1", 100.0, QualityClass::Acceptable);
+        a1.parameters
+            .insert("client_count".to_string(), "1".to_string());
+        let mut a2 = summary("alpha-2", 200.0, QualityClass::Acceptable);
+        a2.parameters
+            .insert("client_count".to_string(), "2".to_string());
+        let mut b4 = summary("beta-4", 10_000.0, QualityClass::Acceptable);
+        b4.parameters
+            .insert("client_count".to_string(), "4".to_string());
+        let mut a8 = summary("alpha-8", 400.0, QualityClass::Acceptable);
+        a8.parameters
+            .insert("client_count".to_string(), "8".to_string());
+        a8.parameters
+            .insert("logical_unit".to_string(), "bytes".to_string());
+        let run = run_with_summaries(vec![a1, a2, b4, a8]);
+
+        let report = format_report(&run);
+
+        assert!(report.contains("client_count=2"), "{report}");
+        assert!(!report.contains("client_count=4"), "{report}");
+        assert!(!report.contains("client_count=8"), "{report}");
     }
 
     #[test]
@@ -4120,6 +4371,20 @@ mod tests {
         assert!(report.contains("regressed -20.0%"));
         assert!(report.contains("Improvements"));
         assert!(report.contains("improved +30.0%"));
+    }
+
+    #[test]
+    fn sweep_group_removes_only_the_delimited_swept_value_from_the_name() {
+        let mut s1 = summary("n_1_iter100", 100.0, QualityClass::Acceptable);
+        s1.parameters.insert("n".to_string(), "1".to_string());
+        let mut s2 = summary("n_2_iter100", 180.0, QualityClass::Acceptable);
+        s2.parameters.insert("n".to_string(), "2".to_string());
+        let run = run_with_summaries(vec![s1, s2]);
+
+        let report = format_report(&run);
+
+        assert!(report.contains("Parameter: n "), "{report}");
+        assert!(report.contains("benchmark: n_*_iter100"), "{report}");
     }
 
     #[test]

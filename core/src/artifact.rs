@@ -15,6 +15,37 @@ pub const ARTIFACT_JSON_SCHEMA: &str = include_str!("../schema/cntryl-stress.v2.
 const LATENCY_ESTIMATOR_METADATA_KEY: &str = "cntryl_stress_latency_estimator";
 const PER_SAMPLE_P95_STUDENT_T_ESTIMATOR: &str = "per_sample_p95_mean_student_t_95";
 
+/// Run-metadata key recording which summary semantics produced the serialized
+/// summaries. Artifacts without it were written before interpolated
+/// percentiles and the p95 confidence interval existed, and are validated
+/// with the legacy nearest-rank math.
+pub(crate) const SUMMARY_SEMANTICS_METADATA_KEY: &str = "cntryl_stress_summary_semantics";
+/// Current summary semantics: linearly interpolated (Hyndman-Fan type 7)
+/// percentiles and a p95 confidence interval for p95-gated rows.
+pub(crate) const SUMMARY_SEMANTICS_CURRENT: &str = "interpolated_percentiles_p95_ci_v1";
+
+thread_local! {
+    /// Set only while re-deriving a legacy artifact's serialized summaries.
+    static LEGACY_SUMMARY_SEMANTICS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with the summary math used before summary semantics were
+/// versioned: nearest-rank percentiles and no p95 confidence interval.
+fn with_legacy_summary_semantics<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            LEGACY_SUMMARY_SEMANTICS.with(|flag| flag.set(self.0));
+        }
+    }
+    let _reset = Reset(LEGACY_SUMMARY_SEMANTICS.with(|flag| flag.replace(true)));
+    f()
+}
+
+fn legacy_summary_semantics() -> bool {
+    LEGACY_SUMMARY_SEMANTICS.with(std::cell::Cell::get)
+}
+
 /// Highest defined benchmark tier.
 pub const MAX_TIER: u32 = 6;
 
@@ -623,6 +654,19 @@ pub struct SummaryStats {
     pub p95: f64,
     /// 99th percentile.
     pub p99: f64,
+    /// Distribution-free 95% confidence interval around the p95 quantile.
+    ///
+    /// Present when the p95 is the gated statistic of pooled observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p95_confidence_interval_95: Option<ConfidenceInterval>,
+    /// Number of non-finite input values excluded from these statistics.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub non_finite_dropped: u64,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 impl SummaryStats {
@@ -650,29 +694,41 @@ impl SummaryStats {
         if sorted.is_empty() {
             return None;
         }
+        let non_finite_dropped = (values.len() - sorted.len()) as u64;
 
         sorted.sort_by(f64::total_cmp);
         let len = sorted.len();
-        let sum = sorted.iter().sum::<f64>();
-        let mean = sum / len as f64;
-        let median = percentile_sorted(&sorted, 0.50);
         let min = sorted[0];
         let max = sorted[len - 1];
+        // Rescale by the largest magnitude only when a plain sum would
+        // overflow, so ordinary inputs keep exact arithmetic.
+        let scale = if sorted.iter().sum::<f64>().is_finite() {
+            1.0
+        } else {
+            min.abs().max(max.abs())
+        };
+        let scaled_mean = sorted.iter().map(|value| value / scale).sum::<f64>() / len as f64;
+        let mean = scaled_mean * scale;
+        let median = percentile_sorted(&sorted, 0.50);
         let std_dev = if len < 2 {
             0.0
         } else {
-            let variance = sorted
+            let scaled_variance = sorted
                 .iter()
                 .map(|value| {
-                    let diff = *value - mean;
+                    let diff = *value / scale - scaled_mean;
                     diff * diff
                 })
                 .sum::<f64>()
                 / (len - 1) as f64;
-            variance.sqrt()
+            scaled_variance.sqrt() * scale
         };
         let relative_std_dev = if mean == 0.0 {
-            f64::INFINITY
+            if std_dev == 0.0 {
+                0.0
+            } else {
+                f64::INFINITY
+            }
         } else {
             std_dev / mean.abs()
         };
@@ -681,6 +737,14 @@ impl SummaryStats {
         } else {
             critical_value(len - 1) * (std_dev / (len as f64).sqrt())
         };
+        let (lower, upper) = (mean - half_width, mean + half_width);
+        if ![mean, std_dev, lower, upper]
+            .iter()
+            .all(|value| value.is_finite())
+        {
+            // Schema requires finite numbers; refuse to emit unrepresentable stats.
+            return None;
+        }
 
         Some(Self {
             mean,
@@ -689,13 +753,12 @@ impl SummaryStats {
             max,
             std_dev,
             relative_std_dev,
-            confidence_interval_95: ConfidenceInterval {
-                lower: mean - half_width,
-                upper: mean + half_width,
-            },
+            confidence_interval_95: ConfidenceInterval { lower, upper },
             p50: median,
             p95: percentile_sorted(&sorted, 0.95),
             p99: percentile_sorted(&sorted, 0.99),
+            p95_confidence_interval_95: None,
+            non_finite_dropped,
         })
     }
 }
@@ -1262,9 +1325,38 @@ impl StressRun {
 
         let topology = BaselineTopology::from_run(self)?;
         topology.validate_samples(&self.samples, &self.environment)?;
-        let (canonical, legacy) = recompute_baseline_summaries(self);
-        validate_serialized_baseline_summaries(&topology.summaries_by_id, &canonical, &legacy)?;
-        Ok(canonical)
+        match self
+            .metadata
+            .get(SUMMARY_SEMANTICS_METADATA_KEY)
+            .map(String::as_str)
+        {
+            Some(SUMMARY_SEMANTICS_CURRENT) => {
+                let (canonical, legacy) = recompute_baseline_summaries(self);
+                validate_serialized_baseline_summaries(
+                    &topology.summaries_by_id,
+                    &canonical,
+                    &legacy,
+                )?;
+                Ok(canonical)
+            }
+            None => {
+                // Written before summary semantics were versioned: validate
+                // with the math that produced it, then return summaries
+                // recomputed from the same raw samples with current math so
+                // comparisons are apples to apples.
+                let (legacy_canonical, legacy_pooled) =
+                    with_legacy_summary_semantics(|| recompute_baseline_summaries(self));
+                validate_serialized_baseline_summaries(
+                    &topology.summaries_by_id,
+                    &legacy_canonical,
+                    &legacy_pooled,
+                )?;
+                Ok(recompute_baseline_summaries(self).0)
+            }
+            Some(other) => Err(format!(
+                "baseline uses unsupported summary semantics {other:?}; expected {SUMMARY_SEMANTICS_CURRENT:?}"
+            )),
+        }
     }
 
     /// Whether every measured summary passed correctness.
@@ -1757,6 +1849,33 @@ fn phase_samples<'a>(spec: &BenchmarkSpec, samples: &'a [Sample]) -> PhaseSample
     }
 }
 
+fn primary_stats(
+    primary_metric: PrimaryMetric,
+    latency_estimator: LatencyEstimator,
+    values: &[f64],
+) -> Option<SummaryStats> {
+    if primary_metric == PrimaryMetric::LatencyP95
+        && latency_estimator == LatencyEstimator::PerSampleP95
+    {
+        SummaryStats::from_values_with_student_t(values)
+    } else if primary_metric == PrimaryMetric::LatencyP95 && !legacy_summary_semantics() {
+        // Legacy pooled estimator gates on the pooled p95, so attach a
+        // confidence interval for that quantile rather than for the mean.
+        SummaryStats::from_values(values).map(|mut stats| {
+            let mut sorted = values
+                .iter()
+                .copied()
+                .filter(|value| value.is_finite())
+                .collect::<Vec<_>>();
+            sorted.sort_by(f64::total_cmp);
+            stats.p95_confidence_interval_95 = Some(quantile_confidence_interval_95(&sorted, 0.95));
+            stats
+        })
+    } else {
+        SummaryStats::from_values(values)
+    }
+}
+
 fn summarize_benchmark_with_latency_estimator(
     spec: &BenchmarkSpec,
     samples: &[Sample],
@@ -1783,13 +1902,7 @@ fn summarize_benchmark_with_latency_estimator(
         SummaryStats::from_values(&per_op_values(&measured, |sample| sample.bytes_per_op));
     let observations = summarize_observations(&measured);
     let values = primary_values(primary_metric, &measured, latency_estimator);
-    let stats = if primary_metric == PrimaryMetric::LatencyP95
-        && latency_estimator == LatencyEstimator::PerSampleP95
-    {
-        SummaryStats::from_values_with_student_t(&values)
-    } else {
-        SummaryStats::from_values(&values)
-    };
+    let stats = primary_stats(primary_metric, latency_estimator, &values);
     let wall_clock = SummaryStats::from_values(&wall_clock_values(&measured));
     let completed_operations = completed_operation_stats(&measured);
     let total_wall_clock_ns = samples
@@ -2277,18 +2390,10 @@ fn compare_one_summary(
     }
     let baseline_value = baseline.primary_value();
     let current_value = current.primary_value();
-    let change_percent = baseline_value
-        .zip(current_value)
-        .map(|(base, current)| ((current / base) - 1.0) * 100.0);
-    let confidence_intervals_overlap =
-        baseline
-            .stats
-            .as_ref()
-            .zip(current.stats.as_ref())
-            .map(|(base, current)| {
-                base.confidence_interval_95
-                    .overlaps(current.confidence_interval_95)
-            });
+    let change_percent = change_percent(baseline_value, current_value);
+    let confidence_intervals_overlap = gated_confidence_interval(baseline)
+        .zip(gated_confidence_interval(current))
+        .map(|(base, current)| base.overlaps(current));
     let classification = classify_comparison(
         current.primary_metric,
         baseline_value,
@@ -2309,6 +2414,30 @@ fn compare_one_summary(
         confidence_intervals_overlap,
         classification,
         reason: None,
+    }
+}
+
+/// Percent change from `baseline` to `current`; `None` when undefined.
+fn change_percent(baseline: Option<f64>, current: Option<f64>) -> Option<f64> {
+    let (base, current) = baseline.zip(current)?;
+    if base == 0.0 {
+        return None;
+    }
+    Some(((current / base) - 1.0) * 100.0).filter(|value| value.is_finite())
+}
+
+/// Confidence interval for the statistic returned by `primary_value`.
+fn gated_confidence_interval(summary: &BenchmarkSummary) -> Option<ConfidenceInterval> {
+    let stats = summary.stats.as_ref()?;
+    let gates_on_p95 = summary.primary_metric == PrimaryMetric::LatencyP95
+        && summary
+            .metadata
+            .get(LATENCY_ESTIMATOR_METADATA_KEY)
+            .is_none_or(|estimator| estimator != PER_SAMPLE_P95_STUDENT_T_ESTIMATOR);
+    if gates_on_p95 {
+        stats.p95_confidence_interval_95
+    } else {
+        Some(stats.confidence_interval_95)
     }
 }
 
@@ -3566,8 +3695,41 @@ fn percentile_sorted(sorted: &[f64], quantile: f64) -> f64 {
     if sorted.len() == 1 {
         return sorted[0];
     }
-    let index = ((sorted.len() - 1) as f64 * quantile).round() as usize;
-    sorted[index.min(sorted.len() - 1)]
+    if legacy_summary_semantics() {
+        // Nearest rank, as computed before summary semantics were versioned.
+        let index = ((sorted.len() - 1) as f64 * quantile).round() as usize;
+        return sorted[index.min(sorted.len() - 1)];
+    }
+    // Linear interpolation between closest ranks (Hyndman-Fan type 7).
+    let position = (sorted.len() - 1) as f64 * quantile.clamp(0.0, 1.0);
+    let lower = (position.floor() as usize).min(sorted.len() - 1);
+    let upper = (position.ceil() as usize).min(sorted.len() - 1);
+    let fraction = position - lower as f64;
+    sorted[lower] + (sorted[upper] - sorted[lower]) * fraction
+}
+
+/// Distribution-free 95% confidence interval for a quantile of sorted values.
+///
+/// Uses the binomial order-statistic bounds with a normal approximation:
+/// ranks `floor(nq - z*sqrt(nq(1-q)))` and `ceil(nq + z*sqrt(nq(1-q)))`,
+/// clamped to the available observations. Deterministic by construction.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn quantile_confidence_interval_95(sorted: &[f64], quantile: f64) -> ConfidenceInterval {
+    debug_assert!(!sorted.is_empty());
+    let n = sorted.len() as f64;
+    let center = n * quantile;
+    let half = 1.96 * (n * quantile * (1.0 - quantile)).sqrt();
+    let last = sorted.len() - 1;
+    let lower_rank = (center - half).floor().max(1.0) as usize;
+    let upper_rank = (center + half).ceil().max(1.0) as usize;
+    ConfidenceInterval {
+        lower: sorted[(lower_rank - 1).min(last)],
+        upper: sorted[(upper_rank - 1).min(last)],
+    }
 }
 
 pub(crate) mod duration_serde {
@@ -3798,15 +3960,15 @@ mod tests {
         assert!((stats.std_dev - 1.581_138_830_084_189_8).abs() < 1e-12);
         assert!((stats.relative_std_dev - 0.527_046_276_694_729_9).abs() < 1e-12);
         assert_close(stats.p50, 3.0);
-        assert_close(stats.p95, 5.0);
-        assert_close(stats.p99, 5.0);
+        assert!((stats.p95 - 4.8).abs() < 1e-12);
+        assert!((stats.p99 - 4.96).abs() < 1e-12);
         assert!(stats.confidence_interval_95.lower < stats.mean);
         assert!(stats.confidence_interval_95.upper > stats.mean);
     }
 
     #[test]
     fn stats_relative_std_dev_round_trips_null_when_non_finite() {
-        let stats = SummaryStats::from_values(&[0.0]).expect("stats");
+        let stats = SummaryStats::from_values(&[-1.0, 1.0]).expect("stats");
 
         let json = serde_json::to_string(&stats).expect("serialize");
         let parsed = serde_json::from_str::<SummaryStats>(&json).expect("deserialize");
@@ -3828,8 +3990,9 @@ mod tests {
         let summary = summarize_benchmark(&spec, &[s, s2]);
 
         assert_eq!(summary.primary_metric, PrimaryMetric::LatencyP95);
-        assert_close(summary.stats.as_ref().expect("stats").mean, 145.0);
-        assert_close(summary.primary_value().expect("primary value"), 145.0);
+        let mean = summary.stats.as_ref().expect("stats").mean;
+        assert!((mean - 145.05).abs() < 1e-9);
+        assert!((summary.primary_value().expect("primary value") - 145.05).abs() < 1e-9);
         assert!(
             summary
                 .stats
@@ -4910,6 +5073,71 @@ mod tests {
     }
 
     #[test]
+    fn unversioned_legacy_pooled_latency_baseline_without_p95_ci_still_gates() {
+        let mut spec = spec("latency");
+        spec.metadata
+            .insert("primary_metric".to_string(), "latency".to_string());
+        let samples = [90_u128, 95, 100, 105, 110, 115]
+            .into_iter()
+            .enumerate()
+            .map(|(index, latency)| {
+                let mut sample = sample("latency", SamplePhase::Measured, index, 1_000_000);
+                sample.latency_ns = (0..20).map(|op| latency + op % 3).collect();
+                sample
+            })
+            .collect::<Vec<_>>();
+        // As written before summary semantics were versioned: nearest-rank
+        // percentiles and no p95 confidence interval on the pooled row.
+        let legacy_summary = with_legacy_summary_semantics(|| {
+            summarize_benchmark_with_latency_estimator(
+                &spec,
+                &samples,
+                LatencyEstimator::LegacyPooledObservations,
+            )
+        });
+        assert!(legacy_summary
+            .stats
+            .as_ref()
+            .is_some_and(|stats| stats.p95_confidence_interval_95.is_none()));
+        let run = StressRun {
+            schema_version: SCHEMA_VERSION.to_string(),
+            tool_version: "0.4.0".to_string(),
+            suite: "suite".to_string(),
+            run_profile: RunProfile::Default,
+            environment: test_env(),
+            benchmark_specs: vec![spec.clone()],
+            samples: samples.clone(),
+            summaries: vec![legacy_summary],
+            comparisons: Vec::new(),
+            diagnostics_summary: Vec::new(),
+            started_at: "123".to_string(),
+            total_elapsed_ns: 0,
+            metadata: BTreeMap::new(),
+        };
+
+        let baseline = run
+            .canonical_baseline_summaries()
+            .expect("unversioned legacy baseline loads");
+        assert!(gated_confidence_interval(&baseline[0]).is_some());
+
+        let regressed = samples
+            .iter()
+            .map(|sample| {
+                let mut sample = sample.clone();
+                for latency in &mut sample.latency_ns {
+                    *latency *= 2;
+                }
+                sample
+            })
+            .collect::<Vec<_>>();
+        let current = summarize_benchmark(&spec, &regressed);
+        let comparison = compare_summaries(&[current], &baseline, 0.05)
+            .pop()
+            .expect("comparison");
+        assert_eq!(comparison.classification, ComparisonClass::Regression);
+    }
+
+    #[test]
     fn canonical_baseline_accepts_verified_legacy_pooled_latency_but_recomputes_it() {
         let mut spec = spec("latency");
         spec.metadata
@@ -4942,7 +5170,10 @@ mod tests {
             diagnostics_summary: Vec::new(),
             started_at: "123".to_string(),
             total_elapsed_ns: 0,
-            metadata: BTreeMap::new(),
+            metadata: BTreeMap::from([(
+                SUMMARY_SEMANTICS_METADATA_KEY.to_string(),
+                SUMMARY_SEMANTICS_CURRENT.to_string(),
+            )]),
         };
 
         let canonical = run
@@ -5186,5 +5417,136 @@ mod tests {
             (actual - expected).abs() < f64::EPSILON,
             "expected {actual} to equal {expected}"
         );
+    }
+
+    fn legacy_latency_summary(latencies_per_sample: &[Vec<u128>]) -> BenchmarkSummary {
+        let mut spec = spec("latency");
+        spec.metadata
+            .insert("primary_metric".to_string(), "latency".to_string());
+        let samples = latencies_per_sample
+            .iter()
+            .enumerate()
+            .map(|(index, latencies)| {
+                let mut sample = sample("latency", SamplePhase::Measured, index, 1_000_000);
+                sample.latency_ns.clone_from(latencies);
+                sample
+            })
+            .collect::<Vec<_>>();
+        summarize_benchmark_with_latency_estimator(
+            &spec,
+            &samples,
+            LatencyEstimator::LegacyPooledObservations,
+        )
+    }
+
+    fn classify_gated(baseline: &BenchmarkSummary, current: &BenchmarkSummary) -> ComparisonClass {
+        let overlap = gated_confidence_interval(baseline)
+            .zip(gated_confidence_interval(current))
+            .map(|(base, current)| base.overlaps(current));
+        classify_comparison(
+            current.primary_metric,
+            baseline.primary_value(),
+            current.primary_value(),
+            0.05,
+            overlap,
+        )
+    }
+
+    fn body_and_tail(body_start: u128, tail: u128) -> Vec<u128> {
+        (0..90_u128)
+            .map(|i| body_start + i % 10)
+            .chain(std::iter::repeat_n(tail, 10))
+            .collect()
+    }
+
+    #[test]
+    fn legacy_pooled_latency_detects_tail_only_regression() {
+        let baseline = legacy_latency_summary(&vec![body_and_tail(95, 200); 5]);
+        let current = legacy_latency_summary(&vec![body_and_tail(84, 300); 5]);
+        let base_stats = baseline.stats.as_ref().expect("stats");
+        let current_stats = current.stats.as_ref().expect("stats");
+        assert!(
+            base_stats
+                .confidence_interval_95
+                .overlaps(current_stats.confidence_interval_95),
+            "fixture requires overlapping mean intervals"
+        );
+
+        assert_eq!(
+            classify_gated(&baseline, &current),
+            ComparisonClass::Regression
+        );
+    }
+
+    #[test]
+    fn legacy_pooled_latency_ignores_mean_shift_when_p95_is_noisy() {
+        let baseline = legacy_latency_summary(&vec![body_and_tail(95, 200); 5]);
+        let mut current = baseline.clone();
+        {
+            let stats = current.stats.as_mut().expect("stats");
+            stats.p95 *= 1.10;
+            stats.mean *= 2.0;
+            stats.confidence_interval_95 = ConfidenceInterval {
+                lower: stats.mean - 1.0,
+                upper: stats.mean + 1.0,
+            };
+            stats.p95_confidence_interval_95 = Some(ConfidenceInterval {
+                lower: 0.0,
+                upper: stats.p95 * 2.0,
+            });
+        }
+
+        assert_eq!(
+            classify_gated(&baseline, &current),
+            ComparisonClass::Inconclusive
+        );
+    }
+
+    #[test]
+    fn percentile_uses_linear_interpolation() {
+        assert_close(percentile_sorted(&[10.0, 20.0], 0.5), 15.0);
+        assert_close(percentile_sorted(&[1.0, 2.0, 3.0, 4.0], 0.25), 1.75);
+        let stats = SummaryStats::from_values(&[10.0, 20.0]).expect("stats");
+        assert_close(stats.median, 15.0);
+    }
+
+    #[test]
+    fn relative_std_dev_is_zero_for_all_zero_values() {
+        let stats = SummaryStats::from_values(&[0.0, 0.0, 0.0]).expect("stats");
+        assert_close(stats.relative_std_dev, 0.0);
+    }
+
+    #[test]
+    fn stats_record_dropped_non_finite_samples() {
+        let stats = SummaryStats::from_values(&[1.0, f64::NAN, 2.0, f64::INFINITY]).expect("stats");
+        assert_eq!(stats.non_finite_dropped, 2);
+        let json = serde_json::to_string(&stats).expect("json");
+        assert!(json.contains(r#""non_finite_dropped":2"#));
+        let clean = SummaryStats::from_values(&[1.0, 2.0]).expect("stats");
+        assert_eq!(clean.non_finite_dropped, 0);
+        let json = serde_json::to_string(&clean).expect("json");
+        assert!(!json.contains("non_finite_dropped"));
+    }
+
+    #[test]
+    fn stats_never_contain_non_finite_moments_on_overflow() {
+        let huge = f64::MAX / 2.0;
+        let stats = SummaryStats::from_values(&[huge, huge, huge * 1.5]);
+        if let Some(stats) = stats {
+            assert!(stats.mean.is_finite());
+            assert!(stats.std_dev.is_finite());
+            assert!(stats.confidence_interval_95.lower.is_finite());
+            assert!(stats.confidence_interval_95.upper.is_finite());
+        }
+        let stats = SummaryStats::from_values(&[huge, huge]).expect("stats");
+        assert_close(stats.mean, huge);
+    }
+
+    #[test]
+    fn change_percent_is_none_for_zero_baseline() {
+        assert_eq!(change_percent(Some(0.0), Some(5.0)), None);
+        assert_eq!(change_percent(Some(0.0), Some(0.0)), None);
+        assert_eq!(change_percent(None, Some(5.0)), None);
+        assert!((change_percent(Some(100.0), Some(110.0)).expect("change") - 10.0).abs() < 1e-9);
     }
 }
