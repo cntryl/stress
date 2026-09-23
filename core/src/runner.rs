@@ -1047,10 +1047,42 @@ fn detect_cpu_model() -> String {
             })
             .unwrap_or_else(|| "unknown".to_string())
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        command_stdout(
+            "reg",
+            &[
+                "query",
+                r"HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+                "/v",
+                "ProcessorNameString",
+            ],
+        )
+        .and_then(|output| parse_reg_query_string_value(&output, "ProcessorNameString"))
+        .or_else(|| {
+            std::env::var("PROCESSOR_IDENTIFIER")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         "unknown".to_string()
     }
+}
+
+/// Extracts a `REG_SZ` value from `reg query <key> /v <name>` output, whose
+/// value line looks like `    ProcessorNameString    REG_SZ    <value>`.
+#[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
+fn parse_reg_query_string_value(output: &str, name: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let rest = line.trim_start().strip_prefix(name)?;
+        let rest = rest.trim_start().strip_prefix("REG_SZ")?;
+        let value = rest.trim();
+        (!value.is_empty()).then(|| value.to_string())
+    })
 }
 
 fn detect_git_sha() -> Option<String> {
@@ -2088,10 +2120,23 @@ mod tests {
             .operations_per_sample(operations_per_sample);
         let mut runner = StressRunner::with_config("suite", config);
         runner.reporters(Vec::new());
+        // Pin the environment so baseline compatibility does not depend on
+        // host detection (CPU model detection is unavailable on some hosts).
+        runner.environment.cpu_model = "fixture test cpu".to_string();
         runner.run("bench", |ctx| {
             ctx.record_external("work", Duration::from_millis(10), completed_operations);
         });
         runner
+    }
+
+    #[test]
+    fn parses_windows_processor_name_from_reg_query_output() {
+        let output = "\r\nHKEY_LOCAL_MACHINE\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0\r\n    ProcessorNameString    REG_SZ    AMD EPYC 7763 64-Core Processor\r\n\r\n";
+        assert_eq!(
+            parse_reg_query_string_value(output, "ProcessorNameString").as_deref(),
+            Some("AMD EPYC 7763 64-Core Processor")
+        );
+        assert_eq!(parse_reg_query_string_value("", "ProcessorNameString"), None);
     }
 
     #[test]
