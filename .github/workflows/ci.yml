@@ -83,10 +83,13 @@ jobs:
         run: cargo check --locked --workspace --all-targets --all-features
 
       # trybuild UI stderr expectations (macros/tests/ui) are toolchain-specific
-      # and are pinned to stable diagnostics, so the UI test is skipped here and
-      # runs in the stable job instead.
+      # and are pinned to stable diagnostics, so the UI test binary is not run
+      # here; it runs in the stable job instead. (A libtest `--skip` filter
+      # cannot be used because the harness=false bench targets reject it.)
       - name: Test at MSRV
-        run: cargo test --locked --workspace --all-targets --all-features -- --skip stress_macro_ui
+        run: |
+          cargo test --locked --workspace --all-targets --all-features --exclude cntryl-stress-macros
+          cargo test --locked -p cntryl-stress-macros --lib --all-features
 
   test:
     name: test (${{ matrix.os }})
