@@ -129,7 +129,17 @@
         },
         "p50": { "type": "number" },
         "p95": { "type": "number" },
-        "p99": { "type": "number" }
+        "p99": { "type": "number" },
+        "p95_confidence_interval_95": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["lower", "upper"],
+          "properties": {
+            "lower": { "type": "number" },
+            "upper": { "type": "number" }
+          }
+        },
+        "non_finite_dropped": { "type": "integer", "minimum": 1 }
       }
     },
     "profileConfig": {
