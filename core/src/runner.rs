@@ -676,7 +676,8 @@ fn unique_record_name(records: &[MeasurementRecord], base: &str) -> String {
     if !taken(base) {
         return base.to_string();
     }
-    (2_usize..)
+    // At most `records.len()` names are taken, so this range always has a free slot.
+    (2..=records.len() + 2)
         .map(|suffix| format!("{base} ({suffix})"))
         .find(|candidate| !taken(candidate))
         .expect("an unused suffix exists")
@@ -1085,7 +1086,27 @@ fn run_timestamp_stem() -> String {
 }
 
 /// Gate decision for a finished run.
+///
+/// New gate outcomes may be added in minor releases, so matches outside this
+/// crate need a wildcard arm:
+///
+/// ```compile_fail
+/// use cntryl_stress::runner::RunGate;
+///
+/// fn label(gate: RunGate) -> &'static str {
+///     match gate {
+///         RunGate::Passed => "passed",
+///         RunGate::CorrectnessFailed => "correctness",
+///         RunGate::QualityFailed => "quality",
+///         RunGate::RegressionFailed => "regression",
+///         RunGate::DiagnosticsFailed => "diagnostics",
+///         RunGate::BudgetFailed => "budget",
+///         RunGate::ArtifactFailed => "artifact",
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RunGate {
     /// The run satisfies correctness, quality, and regression policy.
     Passed,

@@ -30,8 +30,21 @@ impl EnvConfigResolution {
 }
 
 /// Configuration for one stress suite run.
+///
+/// Fields may be added in minor releases. Build a config with
+/// [`StressRunnerConfig::new`], [`StressRunnerConfig::for_profile`], or
+/// [`Default`], then adjust it with the builder methods or by assigning public
+/// fields; struct-literal construction is not supported outside this crate:
+///
+/// ```compile_fail
+/// use cntryl_stress::StressRunnerConfig;
+///
+/// let base = StressRunnerConfig::new();
+/// let _config = StressRunnerConfig { samples: 3, ..base };
+/// ```
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
+#[non_exhaustive]
 pub struct StressRunnerConfig {
     /// Selected run profile.
     pub profile: RunProfile,

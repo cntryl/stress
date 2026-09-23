@@ -278,3 +278,21 @@ fn current_schema_run() -> cntryl_stress::artifact::StressRun {
         metadata: BTreeMap::new(),
     }
 }
+
+#[test]
+fn non_exhaustive_public_types_remain_usable_downstream() {
+    use cntryl_stress::runner::RunGate;
+
+    let mut config = StressRunnerConfig::for_profile(RunProfile::Smoke);
+    config.samples = 2;
+    config.fail_on_quality = false;
+    assert_eq!(config.samples, 2);
+    assert_eq!(StressRunnerConfig::default().profile, RunProfile::Default);
+
+    let label = match RunGate::Passed {
+        RunGate::Passed => "passed",
+        RunGate::CorrectnessFailed => "correctness",
+        _ => "other",
+    };
+    assert_eq!(label, "passed");
+}
