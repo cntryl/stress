@@ -646,6 +646,12 @@ under `cntryl_stress::reporting`, and run gate helpers are under
   correctness, and summary semantics; old artifacts are not an apples-to-apples
   regression baseline.
 
+Artifacts record their summary semantics in run metadata
+(`cntryl_stress_summary_semantics`). A 0.4 baseline written before that key
+existed is validated with the nearest-rank percentile math that produced it and
+is then re-summarized from its raw samples with current math, so it still loads
+and compares.
+
 ## Programmatic Runner
 
 `StressRunnerConfig::filter` selects programmatic benchmarks whose name (the

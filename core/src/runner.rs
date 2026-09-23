@@ -5,7 +5,8 @@ use crate::artifact::{
     attach_measurement_mode_mismatch_diagnostics, attach_regression_diagnostics,
     compare_summaries_with_specs, diagnostic_summary_for_run, summarize_benchmark,
     BenchmarkModeKind, BenchmarkSpec, EnvironmentInfo, MeasurementIntent, RunProfile, Sample,
-    SamplePhase, StressRun, MAX_TIER, SCHEMA_VERSION,
+    SamplePhase, StressRun, MAX_TIER, SCHEMA_VERSION, SUMMARY_SEMANTICS_CURRENT,
+    SUMMARY_SEMANTICS_METADATA_KEY,
 };
 use crate::config::StressRunnerConfig;
 use crate::context::{MeasurementRecord, StressContext};
@@ -350,6 +351,10 @@ impl StressRunner {
             total_elapsed_ns: self.suite_start.elapsed().as_nanos(),
             metadata: self.metadata,
         };
+        run.metadata.insert(
+            SUMMARY_SEMANTICS_METADATA_KEY.to_string(),
+            SUMMARY_SEMANTICS_CURRENT.to_string(),
+        );
 
         for reporter in self.reporters.iter().chain(&self.deferred_reporters) {
             if let Err(error) = reporter.suite_end(&run) {
@@ -2163,8 +2168,46 @@ mod tests {
         );
 
         assert_eq!(sample.elapsed_ns, 0);
-        assert!(sample.throughput.abs() < f64::EPSILON, "{}", sample.throughput);
+        assert!(
+            sample.throughput.abs() < f64::EPSILON,
+            "{}",
+            sample.throughput
+        );
         assert!(!sample.has_valid_timing());
+    }
+
+    #[test]
+    fn baseline_written_by_main_v0_4_0_loads_and_compares() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/baseline-main-v0.4.0.json");
+        let baseline: StressRun =
+            serde_json::from_str(&std::fs::read_to_string(&fixture).expect("read fixture"))
+                .expect("parse fixture");
+        baseline
+            .canonical_baseline_summaries()
+            .expect("a baseline written by main must still load");
+
+        let config = StressRunnerConfig::new()
+            .samples(7)
+            .warmup_samples(0)
+            .cooldown_samples(0);
+        let mut runner = StressRunner::with_config("fixture", config);
+        runner.reporters(Vec::new());
+        runner.run("throughput", |ctx| {
+            ctx.record_external("work", Duration::from_micros(1_000), 1_000);
+        });
+        runner.run("latency", |ctx| {
+            for _ in 0..23 {
+                ctx.record_latency(Duration::from_nanos(1_200));
+            }
+            ctx.metadata("primary_metric", "latency");
+            ctx.record_external("requests", Duration::from_micros(500), 23);
+        });
+        let run = runner
+            .finish_with_baseline(&fixture)
+            .expect("compare against a main baseline");
+
+        assert_eq!(run.comparisons.len(), 2, "{:?}", run.comparisons);
     }
 
     #[test]
@@ -2174,7 +2217,10 @@ mod tests {
             parse_reg_query_string_value(output, "ProcessorNameString").as_deref(),
             Some("AMD EPYC 7763 64-Core Processor")
         );
-        assert_eq!(parse_reg_query_string_value("", "ProcessorNameString"), None);
+        assert_eq!(
+            parse_reg_query_string_value("", "ProcessorNameString"),
+            None
+        );
     }
 
     #[test]

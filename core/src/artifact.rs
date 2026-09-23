@@ -15,6 +15,37 @@ pub const ARTIFACT_JSON_SCHEMA: &str = include_str!("../schema/cntryl-stress.v2.
 const LATENCY_ESTIMATOR_METADATA_KEY: &str = "cntryl_stress_latency_estimator";
 const PER_SAMPLE_P95_STUDENT_T_ESTIMATOR: &str = "per_sample_p95_mean_student_t_95";
 
+/// Run-metadata key recording which summary semantics produced the serialized
+/// summaries. Artifacts without it were written before interpolated
+/// percentiles and the p95 confidence interval existed, and are validated
+/// with the legacy nearest-rank math.
+pub(crate) const SUMMARY_SEMANTICS_METADATA_KEY: &str = "cntryl_stress_summary_semantics";
+/// Current summary semantics: linearly interpolated (Hyndman-Fan type 7)
+/// percentiles and a p95 confidence interval for p95-gated rows.
+pub(crate) const SUMMARY_SEMANTICS_CURRENT: &str = "interpolated_percentiles_p95_ci_v1";
+
+thread_local! {
+    /// Set only while re-deriving a legacy artifact's serialized summaries.
+    static LEGACY_SUMMARY_SEMANTICS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with the summary math used before summary semantics were
+/// versioned: nearest-rank percentiles and no p95 confidence interval.
+fn with_legacy_summary_semantics<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            LEGACY_SUMMARY_SEMANTICS.with(|flag| flag.set(self.0));
+        }
+    }
+    let _reset = Reset(LEGACY_SUMMARY_SEMANTICS.with(|flag| flag.replace(true)));
+    f()
+}
+
+fn legacy_summary_semantics() -> bool {
+    LEGACY_SUMMARY_SEMANTICS.with(std::cell::Cell::get)
+}
+
 /// Highest defined benchmark tier.
 pub const MAX_TIER: u32 = 6;
 
@@ -1294,9 +1325,38 @@ impl StressRun {
 
         let topology = BaselineTopology::from_run(self)?;
         topology.validate_samples(&self.samples, &self.environment)?;
-        let (canonical, legacy) = recompute_baseline_summaries(self);
-        validate_serialized_baseline_summaries(&topology.summaries_by_id, &canonical, &legacy)?;
-        Ok(canonical)
+        match self
+            .metadata
+            .get(SUMMARY_SEMANTICS_METADATA_KEY)
+            .map(String::as_str)
+        {
+            Some(SUMMARY_SEMANTICS_CURRENT) => {
+                let (canonical, legacy) = recompute_baseline_summaries(self);
+                validate_serialized_baseline_summaries(
+                    &topology.summaries_by_id,
+                    &canonical,
+                    &legacy,
+                )?;
+                Ok(canonical)
+            }
+            None => {
+                // Written before summary semantics were versioned: validate
+                // with the math that produced it, then return summaries
+                // recomputed from the same raw samples with current math so
+                // comparisons are apples to apples.
+                let (legacy_canonical, legacy_pooled) =
+                    with_legacy_summary_semantics(|| recompute_baseline_summaries(self));
+                validate_serialized_baseline_summaries(
+                    &topology.summaries_by_id,
+                    &legacy_canonical,
+                    &legacy_pooled,
+                )?;
+                Ok(recompute_baseline_summaries(self).0)
+            }
+            Some(other) => Err(format!(
+                "baseline uses unsupported summary semantics {other:?}; expected {SUMMARY_SEMANTICS_CURRENT:?}"
+            )),
+        }
     }
 
     /// Whether every measured summary passed correctness.
@@ -1798,7 +1858,7 @@ fn primary_stats(
         && latency_estimator == LatencyEstimator::PerSampleP95
     {
         SummaryStats::from_values_with_student_t(values)
-    } else if primary_metric == PrimaryMetric::LatencyP95 {
+    } else if primary_metric == PrimaryMetric::LatencyP95 && !legacy_summary_semantics() {
         // Legacy pooled estimator gates on the pooled p95, so attach a
         // confidence interval for that quantile rather than for the mean.
         SummaryStats::from_values(values).map(|mut stats| {
@@ -3635,6 +3695,11 @@ fn percentile_sorted(sorted: &[f64], quantile: f64) -> f64 {
     if sorted.len() == 1 {
         return sorted[0];
     }
+    if legacy_summary_semantics() {
+        // Nearest rank, as computed before summary semantics were versioned.
+        let index = ((sorted.len() - 1) as f64 * quantile).round() as usize;
+        return sorted[index.min(sorted.len() - 1)];
+    }
     // Linear interpolation between closest ranks (Hyndman-Fan type 7).
     let position = (sorted.len() - 1) as f64 * quantile.clamp(0.0, 1.0);
     let lower = (position.floor() as usize).min(sorted.len() - 1);
@@ -5008,6 +5073,71 @@ mod tests {
     }
 
     #[test]
+    fn unversioned_legacy_pooled_latency_baseline_without_p95_ci_still_gates() {
+        let mut spec = spec("latency");
+        spec.metadata
+            .insert("primary_metric".to_string(), "latency".to_string());
+        let samples = [90_u128, 95, 100, 105, 110, 115]
+            .into_iter()
+            .enumerate()
+            .map(|(index, latency)| {
+                let mut sample = sample("latency", SamplePhase::Measured, index, 1_000_000);
+                sample.latency_ns = (0..20).map(|op| latency + op % 3).collect();
+                sample
+            })
+            .collect::<Vec<_>>();
+        // As written before summary semantics were versioned: nearest-rank
+        // percentiles and no p95 confidence interval on the pooled row.
+        let legacy_summary = with_legacy_summary_semantics(|| {
+            summarize_benchmark_with_latency_estimator(
+                &spec,
+                &samples,
+                LatencyEstimator::LegacyPooledObservations,
+            )
+        });
+        assert!(legacy_summary
+            .stats
+            .as_ref()
+            .is_some_and(|stats| stats.p95_confidence_interval_95.is_none()));
+        let run = StressRun {
+            schema_version: SCHEMA_VERSION.to_string(),
+            tool_version: "0.4.0".to_string(),
+            suite: "suite".to_string(),
+            run_profile: RunProfile::Default,
+            environment: test_env(),
+            benchmark_specs: vec![spec.clone()],
+            samples: samples.clone(),
+            summaries: vec![legacy_summary],
+            comparisons: Vec::new(),
+            diagnostics_summary: Vec::new(),
+            started_at: "123".to_string(),
+            total_elapsed_ns: 0,
+            metadata: BTreeMap::new(),
+        };
+
+        let baseline = run
+            .canonical_baseline_summaries()
+            .expect("unversioned legacy baseline loads");
+        assert!(gated_confidence_interval(&baseline[0]).is_some());
+
+        let regressed = samples
+            .iter()
+            .map(|sample| {
+                let mut sample = sample.clone();
+                for latency in &mut sample.latency_ns {
+                    *latency *= 2;
+                }
+                sample
+            })
+            .collect::<Vec<_>>();
+        let current = summarize_benchmark(&spec, &regressed);
+        let comparison = compare_summaries(&[current], &baseline, 0.05)
+            .pop()
+            .expect("comparison");
+        assert_eq!(comparison.classification, ComparisonClass::Regression);
+    }
+
+    #[test]
     fn canonical_baseline_accepts_verified_legacy_pooled_latency_but_recomputes_it() {
         let mut spec = spec("latency");
         spec.metadata
@@ -5040,7 +5170,10 @@ mod tests {
             diagnostics_summary: Vec::new(),
             started_at: "123".to_string(),
             total_elapsed_ns: 0,
-            metadata: BTreeMap::new(),
+            metadata: BTreeMap::from([(
+                SUMMARY_SEMANTICS_METADATA_KEY.to_string(),
+                SUMMARY_SEMANTICS_CURRENT.to_string(),
+            )]),
         };
 
         let canonical = run
