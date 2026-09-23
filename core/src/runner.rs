@@ -1225,10 +1225,7 @@ pub fn evaluate_run_gate(run: &StressRun) -> RunGate {
     if profile_config.fail_on_regression && !run.regressions().is_empty() {
         return RunGate::RegressionFailed;
     }
-    if profile_config
-        .deny_diagnostics
-        .is_some_and(|threshold| !run.diagnostics_passed(threshold))
-    {
+    if !run.diagnostic_gate_failures().is_empty() {
         return RunGate::DiagnosticsFailed;
     }
     if profile_config.fail_on_quality && !run.meets_min_quality(profile_config.min_quality) {
@@ -2097,6 +2094,44 @@ mod tests {
             ctx.measure("work", || std::thread::sleep(Duration::from_micros(1)));
         });
         runner.finish()
+    }
+
+    #[test]
+    fn denied_codes_fail_the_gate_without_a_severity_threshold() {
+        let mut run = warning_diagnostic_run(None);
+        assert!(run
+            .diagnostics_summary
+            .iter()
+            .any(|diagnostic| diagnostic.code == "too_few_samples"));
+        run.environment.profile_config.deny_codes = vec!["regression".to_string()];
+        assert_eq!(evaluate_run_gate(&run), RunGate::Passed);
+        assert!(run.diagnostic_gate_failures().is_empty());
+
+        run.environment.profile_config.deny_codes = vec!["too_few_samples".to_string()];
+        assert_eq!(evaluate_run_gate(&run), RunGate::DiagnosticsFailed);
+        assert!(run
+            .diagnostic_gate_failures()
+            .iter()
+            .all(|diagnostic| diagnostic.code == "too_few_samples"));
+    }
+
+    #[test]
+    fn allowed_codes_are_exempt_from_severity_gating_but_deny_wins() {
+        let mut run = warning_diagnostic_run(Some(DiagnosticSeverity::Info));
+        assert_eq!(evaluate_run_gate(&run), RunGate::DiagnosticsFailed);
+        let present = run
+            .diagnostics_summary
+            .iter()
+            .map(|diagnostic| diagnostic.code.clone())
+            .collect::<Vec<_>>();
+        run.environment
+            .profile_config
+            .allow_codes
+            .clone_from(&present);
+        assert_eq!(evaluate_run_gate(&run), RunGate::Passed);
+
+        run.environment.profile_config.deny_codes = vec![present[0].clone()];
+        assert_eq!(evaluate_run_gate(&run), RunGate::DiagnosticsFailed);
     }
 
     #[test]

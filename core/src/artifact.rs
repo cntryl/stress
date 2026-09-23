@@ -1217,6 +1217,13 @@ pub struct ProfileConfig {
     /// Optional strict diagnostic gate threshold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny_diagnostics: Option<DiagnosticSeverity>,
+    /// Diagnostic codes that fail the run whenever present, at any severity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_codes: Vec<String>,
+    /// Diagnostic codes exempt from `deny_diagnostics` severity gating.
+    /// A code listed in `deny_codes` is still denied.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_codes: Vec<String>,
     /// Regression/improvement threshold as a fraction (`0.05` means 5%).
     pub regression_threshold: f64,
     /// Default fixed-duration sample budget.
@@ -1248,6 +1255,8 @@ impl Default for ProfileConfig {
             fail_on_quality: false,
             fail_on_regression: false,
             deny_diagnostics: None,
+            deny_codes: Vec::new(),
+            allow_codes: Vec::new(),
             regression_threshold: 0.05,
             sample_duration: Duration::from_millis(500),
             operations_per_sample: 1,
@@ -1999,6 +2008,27 @@ impl StressRun {
         self.diagnostics_summary
             .iter()
             .all(|diagnostic| !diagnostic.severity.at_least(threshold))
+    }
+
+    /// Diagnostics that fail the recorded diagnostic policy.
+    ///
+    /// A diagnostic fails when its code is in `deny_codes`, or when it meets
+    /// the `deny_diagnostics` severity threshold and its code is not in
+    /// `allow_codes`.
+    #[must_use]
+    pub fn diagnostic_gate_failures(&self) -> Vec<&DiagnosticSummary> {
+        let policy = &self.environment.profile_config;
+        self.diagnostics_summary
+            .iter()
+            .filter(|diagnostic| {
+                let code = diagnostic.code.as_str();
+                policy.deny_codes.iter().any(|denied| denied == code)
+                    || (policy
+                        .deny_diagnostics
+                        .is_some_and(|threshold| diagnostic.severity.at_least(threshold))
+                        && !policy.allow_codes.iter().any(|allowed| allowed == code))
+            })
+            .collect()
     }
 }
 
@@ -5635,6 +5665,10 @@ mod tests {
         assert!(!profile_required
             .iter()
             .any(|field| field == "console_names" || field == "progress"));
+        for field in ["deny_codes", "allow_codes"] {
+            assert!(schema["$defs"]["profileConfig"]["properties"][field].is_object());
+            assert!(!profile_required.iter().any(|required| required == field));
+        }
     }
 
     #[test]

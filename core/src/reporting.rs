@@ -2568,15 +2568,7 @@ fn regression_gate_count(run: &StressRun) -> usize {
 }
 
 fn diagnostic_gate_count(run: &StressRun) -> usize {
-    run.environment
-        .profile_config
-        .deny_diagnostics
-        .map_or(0, |threshold| {
-            run.diagnostics_summary
-                .iter()
-                .filter(|diagnostic| diagnostic.severity.at_least(threshold))
-                .count()
-        })
+    run.diagnostic_gate_failures().len()
 }
 
 fn comparison_count(run: &StressRun, class: ComparisonClass) -> usize {
