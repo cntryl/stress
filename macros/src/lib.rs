@@ -83,11 +83,20 @@ pub fn stress(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     let mode_kind = derived_mode;
     let mode = mode_kind.tokens(&stress_crate);
-    let max_ns_per_op = option_f64_tokens(attrs.budgets.ns_per_op);
-    let max_allocs_per_op = option_f64_tokens(attrs.budgets.allocs_per_op);
-    let max_bytes_per_op = option_f64_tokens(attrs.budgets.bytes_per_op);
-    let max_regression_pct = option_f64_tokens(attrs.budgets.regression_pct);
-    let max_rsd_pct = option_f64_tokens(attrs.budgets.rsd_pct);
+    let budget_setters = [
+        ("with_max_ns_per_op", attrs.budgets.ns_per_op),
+        ("with_max_allocs_per_op", attrs.budgets.allocs_per_op),
+        ("with_max_bytes_per_op", attrs.budgets.bytes_per_op),
+        ("with_max_regression_pct", attrs.budgets.regression_pct),
+        ("with_max_rsd_pct", attrs.budgets.rsd_pct),
+    ]
+    .into_iter()
+    .filter_map(|(setter, value)| {
+        value.map(|value| {
+            let setter = syn::Ident::new(setter, Span::call_site());
+            quote! { .#setter(#value) }
+        })
+    });
     let mut metadata = attrs.metadata;
     if let Some(role) = attrs.role {
         metadata.push(("trust_class".to_string(), role));
@@ -127,13 +136,7 @@ pub fn stress(attr: TokenStream, item: TokenStream) -> TokenStream {
             module_path: ::core::module_path!(),
             tier: #tier,
             mode: #mode,
-            budgets: #stress_crate::artifact::BenchmarkBudgets {
-                max_ns_per_op: #max_ns_per_op,
-                max_allocs_per_op: #max_allocs_per_op,
-                max_bytes_per_op: #max_bytes_per_op,
-                max_regression_pct: #max_regression_pct,
-                max_rsd_pct: #max_rsd_pct,
-            },
+            budgets: #stress_crate::artifact::BenchmarkBudgets::new()#(#budget_setters)*,
             metadata: &[#((#metadata_keys, #metadata_values)),*],
         };
     }
@@ -369,14 +372,6 @@ fn percentage_budget_value(name_value: &MetaNameValue) -> syn::Result<f64> {
             &name_value.value,
             "max_regression_pct must be between 0 and 100",
         ))
-    }
-}
-
-fn option_f64_tokens(value: Option<f64>) -> TokenStream2 {
-    if let Some(value) = value {
-        quote! { ::core::option::Option::Some(#value) }
-    } else {
-        quote! { ::core::option::Option::None }
     }
 }
 
