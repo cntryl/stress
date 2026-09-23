@@ -2446,9 +2446,9 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
     use cntryl_stress::artifact::{
-        BenchmarkBudgets, BenchmarkMode, BenchmarkSpec, BenchmarkSummary, ComparisonClass,
-        ConsoleNameMode, EnvironmentInfo, MeasurementIntent, PrimaryMetric, ProfileConfig,
-        QualityClass, RunProfile, Sample, SamplePhase, SummaryStats, TrustClass,
+        BenchmarkMode, BenchmarkSpec, BenchmarkSummary, ComparisonClass, ConsoleNameMode,
+        EnvironmentInfo, PrimaryMetric, ProfileConfig, QualityClass, RunProfile, Sample,
+        SamplePhase, SummaryStats, TrustClass,
     };
     use cntryl_stress::{runner::StressRunner, StressRunnerConfig};
     use std::collections::BTreeMap;
@@ -2726,18 +2726,14 @@ mod tests {
             EnvironmentInfo::unknown(profile_config.clone()),
         );
         run.tool_version = "0.4.0".to_string();
-        run.benchmark_specs.push(BenchmarkSpec {
-            id: format!("{suite}/bench"),
-            name: "bench".to_string(),
-            tier: 2,
-            mode: BenchmarkMode::FixedOperations {
+        run.benchmark_specs.push(BenchmarkSpec::new(
+            format!("{suite}/bench"),
+            "bench",
+            2,
+            BenchmarkMode::FixedOperations {
                 operations_per_sample: 1,
             },
-            intent: MeasurementIntent::General,
-            budgets: BenchmarkBudgets::default(),
-            parameters: BTreeMap::new(),
-            metadata: BTreeMap::new(),
-        });
+        ));
         let mut sample = Sample::new(
             format!("{suite}/bench"),
             SamplePhase::Measured,

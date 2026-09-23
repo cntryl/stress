@@ -6,7 +6,6 @@ use cntryl_stress::{
     black_box, stress, stress_allocator, LogicalUnit, OperationOutcome, RunProfile, StressContext,
     StressError, StressResult, StressRunner, StressRunnerConfig, StressRunnerOptions,
 };
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 stress_allocator!();
@@ -162,9 +161,9 @@ fn advanced_imports_compile_from_modules() {
 
 fn current_schema_run() -> cntryl_stress::artifact::StressRun {
     use cntryl_stress::artifact::{
-        BenchmarkMode, BenchmarkSpec, BenchmarkSummary, EnvironmentInfo, MeasurementIntent,
-        PrimaryMetric, ProfileConfig, QualityClass, RunProfile, Sample, SamplePhase, StressRun,
-        SummaryStats, TrustClass,
+        BenchmarkMode, BenchmarkSpec, BenchmarkSummary, EnvironmentInfo, PrimaryMetric,
+        ProfileConfig, QualityClass, RunProfile, Sample, SamplePhase, StressRun, SummaryStats,
+        TrustClass,
     };
 
     let mut profile_config = ProfileConfig::new();
@@ -180,18 +179,14 @@ fn current_schema_run() -> cntryl_stress::artifact::StressRun {
     let mut run = StressRun::new("suite", RunProfile::Smoke, environment.clone());
     run.started_at = "1".to_string();
     run.total_elapsed_ns = 1;
-    run.benchmark_specs.push(BenchmarkSpec {
-        id: "suite/bench".to_string(),
-        name: "bench".to_string(),
-        tier: 2,
-        mode: BenchmarkMode::FixedOperations {
+    run.benchmark_specs.push(BenchmarkSpec::new(
+        "suite/bench",
+        "bench",
+        2,
+        BenchmarkMode::FixedOperations {
             operations_per_sample: 1,
         },
-        intent: MeasurementIntent::General,
-        budgets: cntryl_stress::artifact::BenchmarkBudgets::default(),
-        parameters: BTreeMap::new(),
-        metadata: BTreeMap::new(),
-    });
+    ));
 
     let mut sample = Sample::new("suite/bench", SamplePhase::Measured, environment);
     sample.elapsed_ns = 1;
@@ -283,6 +278,58 @@ fn artifact_types_build_via_constructors_only() {
     assert_eq!(run.suite, "s");
     assert_eq!(run.run_profile, RunProfile::Smoke);
     assert!(run.samples.is_empty() && run.summaries.is_empty() && run.comparisons.is_empty());
+}
+
+#[test]
+fn nested_artifact_types_build_via_constructors_only() {
+    use cntryl_stress::artifact::{
+        BenchmarkBudgets, BenchmarkMode, BenchmarkSpec, BudgetResult, ConfidenceInterval,
+        CorrectnessSummary, MeasurementIntent, ObservationDirection, ObservationSummary,
+        ObservationUnit, ScalarObservation, SummaryStats,
+    };
+
+    let mode = BenchmarkMode::FixedDuration {
+        sample_duration: Duration::from_millis(1),
+    };
+    let spec = BenchmarkSpec::new("s/b", "b", 4, mode.clone());
+    assert_eq!(spec.id, "s/b");
+    assert_eq!(spec.name, "b");
+    assert_eq!(spec.tier, 4);
+    assert_eq!(spec.mode, mode);
+    assert_eq!(spec.intent, MeasurementIntent::General);
+    assert_eq!(spec.budgets, BenchmarkBudgets::default());
+    assert!(spec.parameters.is_empty() && spec.metadata.is_empty());
+
+    let interval = ConfidenceInterval::new(1.0, 2.0);
+    assert!((interval.lower - 1.0).abs() < f64::EPSILON);
+    assert!((interval.upper - 2.0).abs() < f64::EPSILON);
+
+    let budget = BudgetResult::new("max_allocs_per_op", 0.0, true);
+    assert_eq!(budget.metric, "max_allocs_per_op");
+    assert!(budget.passed);
+    assert!(budget.actual.is_none() && budget.reason.is_none());
+
+    let correctness = CorrectnessSummary::new(false);
+    assert!(!correctness.passed);
+    assert!(correctness.errors.is_empty());
+
+    let observation = ScalarObservation::new(
+        "rows",
+        3.0,
+        ObservationUnit::Count,
+        ObservationDirection::HigherIsBetter,
+    );
+    assert_eq!(observation.name, "rows");
+
+    let stats = SummaryStats::from_values(&[1.0, 2.0]).expect("finite values");
+    let summary = ObservationSummary::new(
+        "rows",
+        ObservationUnit::Count,
+        ObservationDirection::HigherIsBetter,
+        stats.clone(),
+    );
+    assert_eq!(summary.name, "rows");
+    assert_eq!(summary.stats, stats);
 }
 
 #[test]

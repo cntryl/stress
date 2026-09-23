@@ -295,7 +295,11 @@ pub enum ObservationDirection {
 }
 
 /// One scalar value recorded alongside a raw timing sample.
+///
+/// Fields may be added in minor releases, so struct-literal construction is
+/// not supported outside this crate; use the constructor and assign fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ScalarObservation {
     /// Stable observation name.
     pub name: String,
@@ -308,7 +312,11 @@ pub struct ScalarObservation {
 }
 
 /// Aggregated scalar observation across measured samples.
+///
+/// Fields may be added in minor releases, so struct-literal construction is
+/// not supported outside this crate; use the constructor and assign fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ObservationSummary {
     /// Stable observation name.
     pub name: String,
@@ -318,6 +326,42 @@ pub struct ObservationSummary {
     pub direction: ObservationDirection,
     /// Median, confidence interval, RSD, and other descriptive statistics.
     pub stats: SummaryStats,
+}
+
+impl ScalarObservation {
+    /// Create a scalar observation.
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        value: f64,
+        unit: ObservationUnit,
+        direction: ObservationDirection,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            value,
+            unit,
+            direction,
+        }
+    }
+}
+
+impl ObservationSummary {
+    /// Create an aggregated observation from precomputed statistics.
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        unit: ObservationUnit,
+        direction: ObservationDirection,
+        stats: SummaryStats,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            unit,
+            direction,
+            stats,
+        }
+    }
 }
 
 /// Benchmark authoring intent.
@@ -662,7 +706,11 @@ impl BenchmarkBudgets {
 }
 
 /// Result for one budget gate on one benchmark summary.
+///
+/// Fields may be added in minor releases, so struct-literal construction is
+/// not supported outside this crate; use the constructor and assign fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct BudgetResult {
     /// Budget metric name.
     pub metric: String,
@@ -679,7 +727,11 @@ pub struct BudgetResult {
 }
 
 /// Closed 95% confidence interval around the mean.
+///
+/// Fields may be added in minor releases, so struct-literal construction is
+/// not supported outside this crate; use the constructor and assign fields.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ConfidenceInterval {
     /// Lower bound.
     pub lower: f64,
@@ -687,7 +739,27 @@ pub struct ConfidenceInterval {
     pub upper: f64,
 }
 
+impl BudgetResult {
+    /// Create a budget result with no observed value or failure reason.
+    #[must_use]
+    pub fn new(metric: impl Into<String>, limit: f64, passed: bool) -> Self {
+        Self {
+            metric: metric.into(),
+            limit,
+            actual: None,
+            passed,
+            reason: None,
+        }
+    }
+}
+
 impl ConfidenceInterval {
+    /// Create a closed interval from its bounds.
+    #[must_use]
+    pub const fn new(lower: f64, upper: f64) -> Self {
+        Self { lower, upper }
+    }
+
     /// Return whether two confidence intervals overlap.
     #[must_use]
     pub fn overlaps(self, other: Self) -> bool {
@@ -696,7 +768,11 @@ impl ConfidenceInterval {
 }
 
 /// Statistics computed from measured raw samples only.
+///
+/// Fields may be added in minor releases, so struct-literal construction is
+/// not supported outside this crate; use the constructor and assign fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SummaryStats {
     /// Arithmetic mean.
     pub mean: f64,
@@ -1028,7 +1104,11 @@ const fn default_progress() -> bool {
 }
 
 /// Benchmark specification captured before samples are recorded.
+///
+/// Fields may be added in minor releases, so struct-literal construction is
+/// not supported outside this crate; use the constructor and assign fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct BenchmarkSpec {
     /// Stable benchmark id.
     pub id: String,
@@ -1048,6 +1128,29 @@ pub struct BenchmarkSpec {
     pub parameters: BTreeMap<String, String>,
     /// Descriptive benchmark metadata.
     pub metadata: BTreeMap<String, String>,
+}
+
+impl BenchmarkSpec {
+    /// Create a spec with `General` intent, default budgets, and no
+    /// parameters or metadata.
+    #[must_use]
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        tier: u32,
+        mode: BenchmarkMode,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            tier,
+            mode,
+            intent: MeasurementIntent::General,
+            budgets: BenchmarkBudgets::default(),
+            parameters: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+        }
+    }
 }
 
 /// One raw sample row. This is the authoritative source for summaries.
@@ -1181,7 +1284,11 @@ impl Sample {
 }
 
 /// Correctness summary across measured samples.
+///
+/// Fields may be added in minor releases, so struct-literal construction is
+/// not supported outside this crate; use the constructor and assign fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CorrectnessSummary {
     /// Whether all measured samples passed canonical correctness checks.
     pub passed: bool,
@@ -1189,6 +1296,18 @@ pub struct CorrectnessSummary {
     pub counters: CorrectnessCounters,
     /// Human-readable error labels.
     pub errors: Vec<String>,
+}
+
+impl CorrectnessSummary {
+    /// Create a correctness summary with zero counters and no errors.
+    #[must_use]
+    pub fn new(passed: bool) -> Self {
+        Self {
+            passed,
+            counters: CorrectnessCounters::default(),
+            errors: Vec::new(),
+        }
+    }
 }
 
 /// Summary computed from measured samples.
@@ -1297,11 +1416,7 @@ impl BenchmarkSummary {
             budgets: BenchmarkBudgets::default(),
             budget_results: Vec::new(),
             diagnostics: Vec::new(),
-            correctness: CorrectnessSummary {
-                passed: true,
-                counters: CorrectnessCounters::default(),
-                errors: Vec::new(),
-            },
+            correctness: CorrectnessSummary::new(true),
             parameters: BTreeMap::new(),
             metadata: BTreeMap::new(),
         }

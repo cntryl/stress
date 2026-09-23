@@ -36,6 +36,7 @@ jobs:
           test -n "${core_version}"
           test -n "${macros_version}"
           test "${core_version}" = "${macros_version}"
+          grep -Fq "cntryl-stress-macros = { version = \"=${macros_version}\"" core/Cargo.toml
           echo "version=${core_version}" >> "${GITHUB_OUTPUT}"
 
       - name: Restrict release source ref
@@ -82,6 +83,7 @@ jobs:
           test -n "${core_version}"
           test -n "${macros_version}"
           test "${core_version}" = "${macros_version}"
+          grep -Fq "cntryl-stress-macros = { version = \"=${macros_version}\"" core/Cargo.toml
           echo "version=${core_version}" >> "${GITHUB_OUTPUT}"
 
       - name: Restrict release source ref
