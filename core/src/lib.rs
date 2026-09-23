@@ -53,6 +53,7 @@ mod allocation;
 pub mod artifact;
 mod config;
 pub mod context;
+pub mod diagnostics;
 mod error;
 mod harness;
 pub mod reporting;

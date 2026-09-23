@@ -68,6 +68,8 @@ struct StressBinaryArgs {
     threshold: Option<f64>,
     fail_on_issues: Option<bool>,
     deny_diagnostics: Option<DiagnosticSeverity>,
+    deny_codes: Vec<String>,
+    allow_codes: Vec<String>,
     names: Option<ConsoleNameMode>,
     no_progress: Option<bool>,
     selection_probe: bool,
@@ -220,6 +222,22 @@ impl StressBinaryArgs {
                         "info, warning, or error",
                     )?);
                 }
+                "--deny-code" | "--allow-code" => {
+                    let flag = args[index].as_str();
+                    let value = required_flag_value(args, &mut index, flag)?;
+                    let codes = crate::diagnostics::parse_diagnostic_codes(value)
+                        .map_err(|error| format!("invalid value for {flag}: {error}"))?;
+                    let target = if flag == "--deny-code" {
+                        &mut result.deny_codes
+                    } else {
+                        &mut result.allow_codes
+                    };
+                    for code in codes {
+                        if !target.contains(&code) {
+                            target.push(code);
+                        }
+                    }
+                }
                 "--names" => {
                     let value = required_flag_value(args, &mut index, "--names")?;
                     result.names = Some(parse_flag_value("--names", value, "compact or full")?);
@@ -346,6 +364,12 @@ fn print_help() {
     eprintln!("    --threshold <FRACTION>         Regression fraction (0.05 means 5%)");
     eprintln!("    --fail-on-issues               Fail on warning-or-error diagnostics");
     eprintln!("    --deny-diagnostics <LEVEL>     Fail on diagnostics at info, warning, or error");
+    eprintln!(
+        "    --deny-code <CODE[,CODE]>      Fail when a diagnostic code is present; repeatable"
+    );
+    eprintln!(
+        "    --allow-code <CODE[,CODE]>     Exempt a code from --deny-diagnostics; repeatable"
+    );
     eprintln!("    --names <compact|full>         Human console benchmark-name mode");
     eprintln!("    --no-progress                  Disable stderr progress for human output");
 }
@@ -425,6 +449,10 @@ pub struct StressRunnerOptions {
     pub threshold_percent: Option<f64>,
     /// Strict diagnostic gate threshold.
     pub deny_diagnostics: Option<DiagnosticSeverity>,
+    /// Diagnostic codes that fail the run whenever present.
+    pub deny_codes: Vec<String>,
+    /// Diagnostic codes exempt from severity-based diagnostic gating.
+    pub allow_codes: Vec<String>,
     /// Human console benchmark-name mode.
     pub names: Option<ConsoleNameMode>,
     /// Whether human runs emit stderr progress.
@@ -551,6 +579,22 @@ impl StressRunnerOptions {
         self
     }
 
+    /// Fail the run whenever a diagnostic with `code` is present.
+    ///
+    /// Unknown codes are rejected when the run configuration is resolved.
+    #[must_use]
+    pub fn deny_code(mut self, code: impl Into<String>) -> Self {
+        self.deny_codes.push(code.into());
+        self
+    }
+
+    /// Exempt `code` from severity-based diagnostic gating.
+    #[must_use]
+    pub fn allow_code(mut self, code: impl Into<String>) -> Self {
+        self.allow_codes.push(code.into());
+        self
+    }
+
     /// Alias for warning-or-higher diagnostic gating.
     #[must_use]
     pub const fn fail_on_issues(mut self, value: bool) -> Self {
@@ -609,6 +653,8 @@ fn binary_args_from_options(options: StressRunnerOptions) -> StressBinaryArgs {
             .threshold_percent
             .map(|threshold_percent| threshold_percent / 100.0),
         deny_diagnostics: options.deny_diagnostics,
+        deny_codes: options.deny_codes,
+        allow_codes: options.allow_codes,
         names: options.names,
         no_progress: options.progress.map(|progress| !progress),
         ..StressBinaryArgs::default()
@@ -780,6 +826,30 @@ where
             "deny_diagnostics_src".to_string(),
             "cli --deny-diagnostics".to_string(),
         );
+    }
+    for (codes, target, source_key, flag) in [
+        (
+            &args.deny_codes,
+            &mut config.deny_codes,
+            "deny_codes_src",
+            "cli --deny-code",
+        ),
+        (
+            &args.allow_codes,
+            &mut config.allow_codes,
+            "allow_codes_src",
+            "cli --allow-code",
+        ),
+    ] {
+        if codes.is_empty() {
+            continue;
+        }
+        for code in codes {
+            if !target.contains(code) {
+                target.push(code.clone());
+            }
+        }
+        metadata.insert(source_key.to_string(), flag.to_string());
     }
     if let Some(mode) = args.names {
         config.console_names = mode;
@@ -1854,6 +1924,56 @@ mod tests {
         ] {
             assert_eq!(resolved.metadata.get(key).map(String::as_str), Some(source));
         }
+    }
+
+    #[test]
+    fn code_policy_flags_repeat_accept_commas_and_merge_with_env() {
+        let args = [
+            "stress-demo",
+            "--deny-code",
+            "too_fast,high_variance",
+            "--deny-code",
+            "regression",
+            "--allow-code",
+            "too_few_samples",
+        ]
+        .map(str::to_string);
+        let parsed = StressBinaryArgs::parse_from_args(&args).expect("valid code flags");
+        assert_eq!(
+            parsed.deny_codes,
+            vec!["too_fast", "high_variance", "regression"]
+        );
+        assert_eq!(parsed.allow_codes, vec!["too_few_samples"]);
+
+        let env = BTreeMap::from([("STRESS_DENY_CODES", "invalid_timing".to_string())]);
+        let resolved = resolve_from_binary_args_with(&parsed, |key| env.get(key).cloned());
+        assert_eq!(
+            resolved.config.deny_codes,
+            vec!["invalid_timing", "too_fast", "high_variance", "regression"]
+        );
+        assert_eq!(resolved.config.allow_codes, vec!["too_few_samples"]);
+        assert_eq!(
+            resolved.metadata.get("deny_codes_src").map(String::as_str),
+            Some("cli --deny-code")
+        );
+    }
+
+    #[test]
+    fn runner_options_carry_code_policy() {
+        let options = StressRunnerOptions::new()
+            .deny_code("too_fast")
+            .allow_code("too_few_samples");
+        let args = binary_args_from_options(options);
+        assert_eq!(args.deny_codes, vec!["too_fast"]);
+        assert_eq!(args.allow_codes, vec!["too_few_samples"]);
+    }
+
+    #[test]
+    fn unknown_code_flags_are_rejected_with_near_matches() {
+        let args = ["stress-demo", "--allow-code", "to_fast"].map(str::to_string);
+        let error = StressBinaryArgs::parse_from_args(&args).expect_err("unknown code");
+        assert!(error.contains("--allow-code"), "{error}");
+        assert!(error.contains("did you mean 'too_fast'"), "{error}");
     }
 
     #[test]

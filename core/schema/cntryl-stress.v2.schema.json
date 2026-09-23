@@ -160,6 +160,8 @@
         "fail_on_quality": { "type": "boolean" },
         "fail_on_regression": { "type": "boolean" },
         "deny_diagnostics": { "$ref": "#/$defs/diagnosticSeverity" },
+        "deny_codes": { "type": "array", "items": { "type": "string" } },
+        "allow_codes": { "type": "array", "items": { "type": "string" } },
         "regression_threshold": { "type": "number", "minimum": 0, "maximum": 1 },
         "sample_duration": { "$ref": "#/$defs/positiveInteger" },
         "operations_per_sample": { "$ref": "#/$defs/positiveInteger" },
@@ -186,7 +188,8 @@
         "git_commit": { "type": ["string", "null"] },
         "tool_version": { "type": "string" },
         "command_line": { "type": "array", "items": { "type": "string" } },
-        "profile_config": { "$ref": "#/$defs/profileConfig" }
+        "profile_config": { "$ref": "#/$defs/profileConfig" },
+        "timer_resolution_ns": { "$ref": "#/$defs/positiveInteger" }
       }
     },
     "benchmarkMode": {

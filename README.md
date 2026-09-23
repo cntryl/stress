@@ -440,6 +440,38 @@ Quality classes:
 Baseline regressions are meaningful only when the primary metric moves past threshold and 95% confidence intervals do not overlap.
 Benchmark budgets fail the run when exceeded. Diagnostics are structured on each summary with `code`, `severity`, `reason`, `evidence`, and `suggestions`.
 
+### Diagnostic codes
+
+Every diagnostic `code` is a stable string listed in
+`cntryl_stress::diagnostics::DIAGNOSTIC_CATALOG`, which also holds its default
+severity, causes, and the fix text used for `suggestions` and console `Fix:`
+lines. Look a code up from the command line:
+
+```bash
+cargo stress explain too_fast   # summary, causes, and fix for one code
+cargo stress explain --list     # every code with its default severity
+```
+
+Gate on specific codes in addition to, or instead of, a severity threshold:
+
+```bash
+# Fail whenever likely_optimized_away appears, at any severity.
+cargo stress --deny-code likely_optimized_away
+# Fail on warnings, except too_few_samples.
+cargo stress --deny-diagnostics warning --allow-code too_few_samples
+```
+
+`--deny-code` and `--allow-code` are repeatable and accept comma-separated
+lists. A denied code fails the run with `DiagnosticsFailed`; an allowed code is
+exempt from `--deny-diagnostics` severity gating, and a code that is both denied
+and allowed stays denied. Codes from the command line and from
+`STRESS_DENY_CODES`/`STRESS_ALLOW_CODES` are combined. Unknown codes are
+rejected with the nearest matches.
+The environment captures `Instant` granularity as `timer_resolution_ns`, which
+`too_fast` diagnostics cite as evidence; it never affects baseline
+compatibility. A `non_finite_samples_dropped` warning (error above 10% of
+samples) reports metric values excluded from statistics.
+
 ## Configuration
 
 Command-line arguments override `STRESS_*` environment variables, which override the trustworthy defaults.
@@ -468,6 +500,8 @@ Command-line arguments override `STRESS_*` environment variables, which override
 | `STRESS_BUILD_INPUT_IDENTITY` | Advanced direct-run identity for non-default feature/target builds; the wrapper sets this automatically |
 | `STRESS_FAIL_ON_ISSUES` | Fail on warning-or-error diagnostics |
 | `STRESS_DENY_DIAGNOSTICS` | Fail on diagnostics at `info`, `warning`, or `error`; when set together with `STRESS_FAIL_ON_ISSUES`, the stricter of the two applies and a disagreement prints a warning |
+| `STRESS_DENY_CODES` | Comma-separated diagnostic codes that fail the run whenever present (see `cargo stress explain --list`) |
+| `STRESS_ALLOW_CODES` | Comma-separated diagnostic codes exempt from `STRESS_DENY_DIAGNOSTICS` severity gating |
 | `STRESS_FAIL_ON_REGRESSION` | `true`/`false`: whether meaningful regressions fail the run (overrides the profile) |
 | `STRESS_FAIL_ON_QUALITY` | `true`/`false`: whether quality below the minimum fails the run (overrides the profile) |
 | `STRESS_MIN_QUALITY` | Minimum quality: `authoritative`, `acceptable`, `noisy`, or `untrustworthy` |
@@ -484,6 +518,7 @@ cargo bench --bench storage_stress -- --operations-per-sample 64 --sample-durati
 cargo bench --bench storage_stress -- --profile release --save-baseline
 cargo bench --bench storage_stress -- --baseline latest --threshold 0.05
 cargo bench --bench storage_stress -- --print-config
+cargo bench --bench storage_stress -- --deny-code too_fast,likely_optimized_away
 ```
 
 Prefer the Cargo wrapper's explicit percentage-points spelling:

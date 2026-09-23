@@ -80,6 +80,10 @@ pub struct StressRunnerConfig {
     pub fail_on_regression: bool,
     /// Optional strict diagnostic gate threshold.
     pub deny_diagnostics: Option<DiagnosticSeverity>,
+    /// Diagnostic codes that fail the run whenever present.
+    pub deny_codes: Vec<String>,
+    /// Diagnostic codes exempt from severity-based diagnostic gating.
+    pub allow_codes: Vec<String>,
     /// Regression/improvement threshold as a fraction (`0.05` means 5%).
     pub threshold: f64,
     /// Human-readable report depth label.
@@ -116,6 +120,8 @@ impl StressRunnerConfig {
                 fail_on_quality: false,
                 fail_on_regression: false,
                 deny_diagnostics: None,
+                deny_codes: Vec::new(),
+                allow_codes: Vec::new(),
                 regression_threshold: 0.05,
                 sample_duration: Duration::from_millis(500),
                 operations_per_sample: 1,
@@ -133,6 +139,8 @@ impl StressRunnerConfig {
                 fail_on_quality: false,
                 fail_on_regression: false,
                 deny_diagnostics: None,
+                deny_codes: Vec::new(),
+                allow_codes: Vec::new(),
                 regression_threshold: 0.05,
                 sample_duration: Duration::from_millis(10),
                 operations_per_sample: 1,
@@ -150,6 +158,8 @@ impl StressRunnerConfig {
                 fail_on_quality: true,
                 fail_on_regression: true,
                 deny_diagnostics: None,
+                deny_codes: Vec::new(),
+                allow_codes: Vec::new(),
                 regression_threshold: 0.05,
                 sample_duration: Duration::from_secs(1),
                 operations_per_sample: 1,
@@ -167,6 +177,8 @@ impl StressRunnerConfig {
                 fail_on_quality: false,
                 fail_on_regression: false,
                 deny_diagnostics: None,
+                deny_codes: Vec::new(),
+                allow_codes: Vec::new(),
                 regression_threshold: 0.05,
                 sample_duration: Duration::from_secs(5),
                 operations_per_sample: 1,
@@ -198,6 +210,8 @@ impl StressRunnerConfig {
             fail_on_quality: profile_config.fail_on_quality,
             fail_on_regression: profile_config.fail_on_regression,
             deny_diagnostics: profile_config.deny_diagnostics,
+            deny_codes: profile_config.deny_codes,
+            allow_codes: profile_config.allow_codes,
             threshold: profile_config.regression_threshold,
             report_depth: profile_config.report_depth,
             console_names: profile_config.console_names,
@@ -296,6 +310,11 @@ impl StressRunnerConfig {
         if !self.threshold.is_finite() || !(0.0..=1.0).contains(&self.threshold) {
             errors.push("threshold must be finite and between 0 and 1".to_string());
         }
+        for code in self.deny_codes.iter().chain(&self.allow_codes) {
+            if let Err(error) = crate::diagnostics::validate_diagnostic_code(code) {
+                errors.push(error);
+            }
+        }
         errors
     }
 
@@ -311,6 +330,8 @@ impl StressRunnerConfig {
             fail_on_quality: self.fail_on_quality,
             fail_on_regression: self.fail_on_regression,
             deny_diagnostics: self.deny_diagnostics,
+            deny_codes: self.deny_codes.clone(),
+            allow_codes: self.allow_codes.clone(),
             regression_threshold: self.threshold,
             sample_duration: self.sample_duration,
             operations_per_sample: self.operations_per_sample,
@@ -354,6 +375,8 @@ impl StressRunnerConfig {
         next.git_sha = self.git_sha;
         next.timeout = self.timeout;
         next.deny_diagnostics = self.deny_diagnostics;
+        next.deny_codes = self.deny_codes;
+        next.allow_codes = self.allow_codes;
         next.console_names = self.console_names;
         next.progress = self.progress;
         next
@@ -494,6 +517,24 @@ impl StressRunnerConfig {
         self
     }
 
+    /// Fail the run whenever a diagnostic with `code` is present.
+    ///
+    /// Unknown codes are reported by [`Self::validation_errors`].
+    #[must_use]
+    pub fn deny_code(mut self, code: impl Into<String>) -> Self {
+        push_unique(&mut self.deny_codes, code.into());
+        self
+    }
+
+    /// Exempt `code` from severity-based diagnostic gating.
+    ///
+    /// A code that is also denied with [`Self::deny_code`] stays denied.
+    #[must_use]
+    pub fn allow_code(mut self, code: impl Into<String>) -> Self {
+        push_unique(&mut self.allow_codes, code.into());
+        self
+    }
+
     /// Clear strict diagnostic gating.
     #[must_use]
     pub const fn allow_diagnostics(mut self) -> Self {
@@ -562,6 +603,7 @@ where
     apply_selection_env_overrides(get_var, resolution);
     apply_execution_env_overrides(get_var, resolution);
     apply_diagnostic_env_overrides(get_var, resolution);
+    apply_code_policy_env_overrides(get_var, resolution);
     apply_policy_env_overrides(get_var, resolution);
 }
 
@@ -784,6 +826,44 @@ where
         .insert("deny_diagnostics_src".to_string(), source.to_string());
 }
 
+fn push_unique(codes: &mut Vec<String>, code: String) {
+    if !codes.contains(&code) {
+        codes.push(code);
+    }
+}
+
+fn apply_code_policy_env_overrides<F>(get_var: &F, resolution: &mut EnvConfigResolution)
+where
+    F: Fn(&str) -> Option<String>,
+{
+    for (env_key, source_key) in [
+        ("STRESS_DENY_CODES", "deny_codes_src"),
+        ("STRESS_ALLOW_CODES", "allow_codes_src"),
+    ] {
+        let Some(value) = get_var(env_key) else {
+            continue;
+        };
+        match crate::diagnostics::parse_diagnostic_codes(&value) {
+            Ok(codes) => {
+                let target = if env_key == "STRESS_DENY_CODES" {
+                    &mut resolution.config.deny_codes
+                } else {
+                    &mut resolution.config.allow_codes
+                };
+                for code in codes {
+                    push_unique(target, code);
+                }
+                resolution
+                    .metadata
+                    .insert(source_key.to_string(), format!("env {env_key}"));
+            }
+            Err(error) => resolution
+                .warnings
+                .push(format!("invalid {env_key}: {error}")),
+        }
+    }
+}
+
 fn apply_policy_env_overrides<F>(get_var: &F, resolution: &mut EnvConfigResolution)
 where
     F: Fn(&str) -> Option<String>,
@@ -867,6 +947,8 @@ fn apply_default_sources(metadata: &mut HashMap<String, String>) {
         "tier_src",
         "git_sha_src",
         "deny_diagnostics_src",
+        "deny_codes_src",
+        "allow_codes_src",
         "console_names_src",
         "progress_src",
         "timeout_secs_src",
@@ -1202,6 +1284,54 @@ mod tests {
             .map(|(key, value)| (*key, (*value).to_string()))
             .collect::<HashMap<_, _>>();
         StressRunnerConfig::resolve_from_env_with(|key| env.get(key).cloned())
+    }
+
+    #[test]
+    fn code_policy_builders_flow_into_profile_config_and_survive_profile_changes() {
+        let cfg = StressRunnerConfig::new()
+            .deny_code("too_fast")
+            .allow_code("high_variance")
+            .profile(RunProfile::Release);
+        assert_eq!(cfg.deny_codes, vec!["too_fast".to_string()]);
+        assert_eq!(cfg.allow_codes, vec!["high_variance".to_string()]);
+        let profile = cfg.profile_config();
+        assert_eq!(profile.deny_codes, vec!["too_fast".to_string()]);
+        assert_eq!(profile.allow_codes, vec!["high_variance".to_string()]);
+        assert!(cfg.validation_errors().is_empty());
+
+        let cfg = StressRunnerConfig::new().deny_code("to_fast");
+        let errors = cfg.validation_errors();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("did you mean 'too_fast'"), "{errors:?}");
+    }
+
+    #[test]
+    fn code_policy_env_vars_parse_comma_lists_and_reject_unknown_codes() {
+        let resolution = resolve(&[
+            ("STRESS_DENY_CODES", "too_fast, high_variance"),
+            ("STRESS_ALLOW_CODES", "too_few_samples"),
+        ]);
+        assert!(resolution.warnings.is_empty(), "{:?}", resolution.warnings);
+        assert_eq!(
+            resolution.config.deny_codes,
+            vec!["too_fast".to_string(), "high_variance".to_string()]
+        );
+        assert_eq!(
+            resolution.config.allow_codes,
+            vec!["too_few_samples".to_string()]
+        );
+        assert_eq!(
+            resolution
+                .metadata
+                .get("deny_codes_src")
+                .map(String::as_str),
+            Some("env STRESS_DENY_CODES")
+        );
+
+        let resolution = resolve(&[("STRESS_ALLOW_CODES", "high_varience")]);
+        assert_eq!(resolution.warnings.len(), 1);
+        assert!(resolution.warnings[0].contains("STRESS_ALLOW_CODES"));
+        assert!(resolution.warnings[0].contains("'high_variance'"));
     }
 
     #[test]
