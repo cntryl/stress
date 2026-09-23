@@ -1122,16 +1122,22 @@ impl StressContext {
             BenchmarkMode::Micro {
                 target_sample_duration,
             } => {
-                let iterations = calibrate_setup_iterations(*target_sample_duration, setup, f);
+                let calibrated = calibrate_setup_iterations(*target_sample_duration, setup, f);
                 let mut gross_elapsed = Duration::ZERO;
                 let mut allocation_total = None;
                 let mut outcome = OperationOutcome::default();
-                for _ in 0..iterations {
+                let mut iterations = 0_u64;
+                let wall_clock = SetupWallClockBound::start(*target_sample_duration);
+                while iterations < calibrated {
                     let (elapsed, allocation_delta, invocation) =
                         time_operation_with_setup(setup, f);
                     gross_elapsed = gross_elapsed.saturating_add(elapsed);
                     accumulate_allocation(&mut allocation_total, allocation_delta);
                     outcome.accumulate(std::hint::black_box(invocation));
+                    iterations += 1;
+                    if wall_clock.exhausted() {
+                        break;
+                    }
                 }
                 let (overhead, net_elapsed) = setup_micro_overhead(iterations, gross_elapsed);
                 (
@@ -1216,15 +1222,21 @@ impl StressContext {
             BenchmarkMode::Micro {
                 target_sample_duration,
             } => {
-                let iterations = calibrate_setup_iterations(*target_sample_duration, setup, f);
+                let calibrated = calibrate_setup_iterations(*target_sample_duration, setup, f);
                 let mut gross_elapsed = Duration::ZERO;
                 let mut allocation_total = None;
                 let mut result = None;
-                for _ in 0..iterations {
+                let mut iterations = 0_u64;
+                let wall_clock = SetupWallClockBound::start(*target_sample_duration);
+                while iterations < calibrated {
                     let (elapsed, allocation_delta, output) = time_operation_with_setup(setup, f);
                     gross_elapsed = gross_elapsed.saturating_add(elapsed);
                     accumulate_allocation(&mut allocation_total, allocation_delta);
                     result = Some(std::hint::black_box(output));
+                    iterations += 1;
+                    if wall_clock.exhausted() {
+                        break;
+                    }
                 }
                 let (overhead, net_elapsed) = setup_micro_overhead(iterations, gross_elapsed);
                 let mut counters = CorrectnessCounters::default();
@@ -1529,11 +1541,12 @@ impl StressContext {
         let mut gross_elapsed = Duration::ZERO;
         let mut allocation_total = None;
         let mut progress = FallibleProgress::default();
+        let wall_clock = SetupWallClockBound::start(target);
         for _ in 0..iterations {
             let (elapsed, allocation_delta, output) = time_operation_with_setup(setup, f);
             gross_elapsed = gross_elapsed.saturating_add(elapsed);
             accumulate_allocation(&mut allocation_total, allocation_delta);
-            if !progress.observe(std::hint::black_box(output)) {
+            if !progress.observe(std::hint::black_box(output)) || wall_clock.exhausted() {
                 break;
             }
         }
@@ -2433,7 +2446,9 @@ fn accumulate_allocation(
 /// that could take an unbounded amount of real time, so these loops also stop
 /// once total wall-clock time (setup + measured work + bookkeeping) reaches
 /// `SETUP_WALL_CLOCK_FACTOR * sample_duration`. At least one operation is
-/// always measured. Throughput and per-op figures remain correct because they
+/// always measured. Micro rows with setup apply the same bound (relative to
+/// the target sample duration) to both calibration and the measured loop.
+/// Throughput and per-op figures remain correct because they
 /// are derived from the measured time and completed-operation count; the
 /// sample simply contains fewer operations.
 const SETUP_WALL_CLOCK_FACTOR: u32 = 10;
@@ -2491,11 +2506,15 @@ where
     (elapsed, allocation_delta, output)
 }
 
+/// Calibrates Micro-with-setup iterations. Setup time is excluded from the
+/// measured time, so calibration is additionally bounded by the setup
+/// wall-clock budget: once it is exhausted the current iteration count is used.
 fn calibrate_setup_iterations<S, F, I, R>(target: Duration, setup: &mut S, f: &mut F) -> u64
 where
     S: FnMut() -> I,
     F: FnMut(I) -> R,
 {
+    let wall_clock = SetupWallClockBound::start(target);
     let mut iterations = 1_u64;
     loop {
         let mut elapsed = Duration::ZERO;
@@ -2503,6 +2522,9 @@ where
             let (iteration_elapsed, _, output) = time_operation_with_setup(setup, f);
             elapsed = elapsed.saturating_add(iteration_elapsed);
             std::hint::black_box(output);
+            if wall_clock.exhausted() {
+                return iterations;
+            }
         }
         if elapsed >= target || iterations >= 1 << 32 {
             return iterations;
@@ -2527,6 +2549,7 @@ where
     S: FnMut() -> I,
     F: FnMut(I) -> Result<R, E>,
 {
+    let wall_clock = SetupWallClockBound::start(target);
     let mut iterations = 1_u64;
     let mut progress = CalibrationProgress::default();
     loop {
@@ -2536,6 +2559,9 @@ where
             elapsed = elapsed.saturating_add(iteration_elapsed);
             progress.elapsed = progress.elapsed.saturating_add(iteration_elapsed);
             progress.observe(std::hint::black_box(output))?;
+            if wall_clock.exhausted() {
+                return Ok(iterations);
+            }
         }
         if elapsed >= target || iterations >= 1 << 32 {
             return Ok(iterations);
@@ -3556,6 +3582,32 @@ mod tests {
                 target_sample_duration: target,
             },
         )
+    }
+
+    #[test]
+    fn micro_with_setup_bounds_wall_clock_when_setup_dominates() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut ctx = micro_ctx(Duration::from_millis(5));
+            let slow_setup = || std::thread::sleep(Duration::from_millis(1));
+            ctx.measure_with_setup("plain", slow_setup, |()| std::hint::black_box(1_u64));
+            let _ = ctx.measure_result_with_setup("result", slow_setup, |()| {
+                Ok::<_, ()>(std::hint::black_box(1_u64))
+            });
+            ctx.measure_outcome_with_setup("outcome", LogicalUnit::new("op"), slow_setup, |()| {
+                OperationOutcome::success(1)
+            });
+            let _ = sender.send(ctx.take_measurements());
+        });
+        let records = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("setup-dominated micro sampling must be wall-clock bounded");
+        assert_eq!(records.len(), 3);
+        for record in records {
+            assert!(record.counters.completed >= 1, "{}", record.name);
+            let micro = record.micro.expect("micro block");
+            assert_eq!(micro.iterations, record.counters.attempted, "{}", record.name);
+        }
     }
 
     #[test]
