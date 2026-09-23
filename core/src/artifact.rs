@@ -504,7 +504,11 @@ impl std::str::FromStr for ConsoleNameMode {
 }
 
 /// Structured benchmark diagnostic.
+///
+/// Fields may be added in minor releases, so struct-literal construction is
+/// not supported outside this crate; use the constructor and assign fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct BenchmarkDiagnostic {
     /// Stable diagnostic code.
     pub code: String,
@@ -519,8 +523,44 @@ pub struct BenchmarkDiagnostic {
     pub suggestions: Vec<String>,
 }
 
+impl BenchmarkDiagnostic {
+    /// Create a diagnostic with no evidence or suggestions.
+    #[must_use]
+    pub fn new(
+        code: impl Into<String>,
+        severity: DiagnosticSeverity,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            severity,
+            reason: reason.into(),
+            evidence: BTreeMap::new(),
+            suggestions: Vec::new(),
+        }
+    }
+
+    /// Add one machine-readable evidence entry.
+    #[must_use]
+    pub fn with_evidence(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.evidence.insert(key.into(), value.into());
+        self
+    }
+
+    /// Append one concrete next action.
+    #[must_use]
+    pub fn with_suggestion(mut self, suggestion: impl Into<String>) -> Self {
+        self.suggestions.push(suggestion.into());
+        self
+    }
+}
+
 /// Query-friendly row in the run-level diagnostic ledger.
+///
+/// Fields may be added in minor releases, so struct-literal construction is
+/// not supported outside this crate; use the constructor and assign fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct DiagnosticSummary {
     /// Suite that emitted the diagnostic.
     pub suite: String,
@@ -548,6 +588,31 @@ pub struct DiagnosticSummary {
     pub trust_class: TrustClass,
     /// Structured parameters for the row that emitted the diagnostic.
     pub parameters: BTreeMap<String, String>,
+}
+
+impl DiagnosticSummary {
+    /// Build a ledger row for `diagnostic` emitted by `summary` in `suite`.
+    #[must_use]
+    pub fn from_diagnostic(
+        suite: impl Into<String>,
+        summary: &BenchmarkSummary,
+        diagnostic: &BenchmarkDiagnostic,
+    ) -> Self {
+        Self {
+            suite: suite.into(),
+            benchmark_id: summary.benchmark_id.clone(),
+            name: summary.name.clone(),
+            tier: summary.tier,
+            code: diagnostic.code.clone(),
+            severity: diagnostic.severity,
+            reason: diagnostic.reason.clone(),
+            evidence: diagnostic.evidence.clone(),
+            suggestions: diagnostic.suggestions.clone(),
+            quality: summary.quality,
+            trust_class: summary.trust_class,
+            parameters: summary.parameters.clone(),
+        }
+    }
 }
 
 impl PrimaryMetric {
@@ -837,7 +902,11 @@ impl CorrectnessCounters {
 }
 
 /// Environment captured with a run and each sample.
+///
+/// Fields may be added in minor releases, so struct-literal construction is
+/// not supported outside this crate; use the constructor and assign fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct EnvironmentInfo {
     /// CPU model, or `"unknown"` when not available.
     pub cpu_model: String,
@@ -881,7 +950,11 @@ impl EnvironmentInfo {
 }
 
 /// Resolved profile configuration stored in the artifact.
+///
+/// Fields may be added in minor releases, so struct-literal construction is
+/// not supported outside this crate; use the constructor and assign fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ProfileConfig {
     /// Selected run profile.
     pub profile: RunProfile,
@@ -942,6 +1015,14 @@ impl Default for ProfileConfig {
     }
 }
 
+impl ProfileConfig {
+    /// Create the default profile configuration; adjust public fields as needed.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 const fn default_progress() -> bool {
     true
 }
@@ -970,7 +1051,11 @@ pub struct BenchmarkSpec {
 }
 
 /// One raw sample row. This is the authoritative source for summaries.
+///
+/// Fields may be added in minor releases, so struct-literal construction is
+/// not supported outside this crate; use the constructor and assign fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Sample {
     /// Benchmark id matching `BenchmarkSpec::id`.
     pub benchmark_id: String,
@@ -1042,6 +1127,43 @@ pub struct Sample {
 }
 
 impl Sample {
+    /// Create an empty sample row: zero timing and operations, no optional
+    /// metrics, `General` intent, and default correctness counters.
+    #[must_use]
+    pub fn new(
+        benchmark_id: impl Into<String>,
+        phase: SamplePhase,
+        environment: EnvironmentInfo,
+    ) -> Self {
+        Self {
+            benchmark_id: benchmark_id.into(),
+            intent: MeasurementIntent::General,
+            sample_number: 0,
+            phase,
+            elapsed_ns: 0,
+            wall_clock_ns: 0,
+            operations_attempted: 0,
+            operations_completed: 0,
+            throughput: 0.0,
+            calibrated_iterations: None,
+            gross_elapsed_ns: None,
+            overhead_ns: None,
+            net_elapsed_ns: None,
+            gross_ns_per_op: None,
+            overhead_ns_per_op: None,
+            net_ns_per_op: None,
+            allocs: None,
+            bytes: None,
+            allocs_per_op: None,
+            bytes_per_op: None,
+            latency_ns: Vec::new(),
+            observations: Vec::new(),
+            parameters: BTreeMap::new(),
+            counters: CorrectnessCounters::default(),
+            environment,
+        }
+    }
+
     /// Whether this sample has valid timing.
     #[must_use]
     pub fn has_valid_timing(&self) -> bool {
@@ -1070,7 +1192,11 @@ pub struct CorrectnessSummary {
 }
 
 /// Summary computed from measured samples.
+///
+/// Fields may be added in minor releases, so struct-literal construction is
+/// not supported outside this crate; use the constructor and assign fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct BenchmarkSummary {
     /// Benchmark id.
     pub benchmark_id: String,
@@ -1138,6 +1264,49 @@ pub struct BenchmarkSummary {
 }
 
 impl BenchmarkSummary {
+    /// Create an empty summary: no samples or statistics, `General` intent,
+    /// `Untrustworthy` quality, `Gate` trust class, default budgets, and a
+    /// passing correctness summary with zero counters.
+    #[must_use]
+    pub fn new(
+        benchmark_id: impl Into<String>,
+        name: impl Into<String>,
+        tier: u32,
+        primary_metric: PrimaryMetric,
+    ) -> Self {
+        Self {
+            benchmark_id: benchmark_id.into(),
+            name: name.into(),
+            tier,
+            intent: MeasurementIntent::General,
+            primary_metric,
+            measured_samples: 0,
+            warmup_samples: 0,
+            cooldown_samples: 0,
+            stats: None,
+            wall_clock: None,
+            total_wall_clock_ns: 0,
+            ns_per_op: None,
+            gross_ns_per_op: None,
+            overhead_ns_per_op: None,
+            allocs_per_op: None,
+            bytes_per_op: None,
+            observations: Vec::new(),
+            quality: QualityClass::Untrustworthy,
+            trust_class: TrustClass::Gate,
+            budgets: BenchmarkBudgets::default(),
+            budget_results: Vec::new(),
+            diagnostics: Vec::new(),
+            correctness: CorrectnessSummary {
+                passed: true,
+                counters: CorrectnessCounters::default(),
+                errors: Vec::new(),
+            },
+            parameters: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+        }
+    }
+
     /// Value used for baseline comparison.
     #[must_use]
     pub fn primary_value(&self) -> Option<f64> {
@@ -1197,7 +1366,11 @@ pub enum ComparisonClass {
 }
 
 /// Baseline comparison for one benchmark.
+///
+/// Fields may be added in minor releases, so struct-literal construction is
+/// not supported outside this crate; use the constructor and assign fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ComparisonResult {
     /// Benchmark id.
     pub benchmark_id: String,
@@ -1224,8 +1397,46 @@ pub struct ComparisonResult {
     pub reason: Option<String>,
 }
 
+impl ComparisonResult {
+    /// Create a comparison with no baseline/current values, overlap, or reason.
+    #[must_use]
+    pub fn new(
+        benchmark_id: impl Into<String>,
+        primary_metric: PrimaryMetric,
+        current_quality: QualityClass,
+        classification: ComparisonClass,
+        threshold: f64,
+    ) -> Self {
+        Self {
+            benchmark_id: benchmark_id.into(),
+            current_quality,
+            baseline_quality: None,
+            primary_metric,
+            baseline_value: None,
+            current_value: None,
+            change_percent: None,
+            threshold,
+            confidence_intervals_overlap: None,
+            classification,
+            reason: None,
+        }
+    }
+}
+
 /// Complete current run artifact.
+///
+/// Fields may be added in minor releases. Build a run with [`StressRun::new`]
+/// and assign public fields; struct-literal construction is not supported
+/// outside this crate:
+///
+/// ```compile_fail
+/// use cntryl_stress::artifact::{EnvironmentInfo, ProfileConfig, RunProfile, StressRun};
+///
+/// let base = StressRun::new("suite", RunProfile::Smoke, EnvironmentInfo::unknown(ProfileConfig::new()));
+/// let _run = StressRun { suite: "other".to_string(), ..base };
+/// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct StressRun {
     /// Schema version. Always [`SCHEMA_VERSION`] for new artifacts.
     pub schema_version: String,
@@ -1257,6 +1468,32 @@ pub struct StressRun {
 }
 
 impl StressRun {
+    /// Create an empty current-schema run with this crate's tool version, no
+    /// specs, samples, summaries, comparisons, or metadata, an empty
+    /// `started_at`, and zero elapsed time.
+    #[must_use]
+    pub fn new(
+        suite: impl Into<String>,
+        run_profile: RunProfile,
+        environment: EnvironmentInfo,
+    ) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION.to_string(),
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
+            suite: suite.into(),
+            run_profile,
+            environment,
+            benchmark_specs: Vec::new(),
+            samples: Vec::new(),
+            summaries: Vec::new(),
+            comparisons: Vec::new(),
+            diagnostics_summary: Vec::new(),
+            started_at: String::new(),
+            total_elapsed_ns: 0,
+            metadata: BTreeMap::new(),
+        }
+    }
+
     /// Load a current artifact.
     ///
     /// # Errors
@@ -1795,20 +2032,7 @@ pub(crate) fn diagnostic_summary_for_run(
             summary
                 .diagnostics
                 .iter()
-                .map(|diagnostic| DiagnosticSummary {
-                    suite: suite.to_string(),
-                    benchmark_id: summary.benchmark_id.clone(),
-                    name: summary.name.clone(),
-                    tier: summary.tier,
-                    code: diagnostic.code.clone(),
-                    severity: diagnostic.severity,
-                    reason: diagnostic.reason.clone(),
-                    evidence: diagnostic.evidence.clone(),
-                    suggestions: diagnostic.suggestions.clone(),
-                    quality: summary.quality,
-                    trust_class: summary.trust_class,
-                    parameters: summary.parameters.clone(),
-                })
+                .map(|diagnostic| DiagnosticSummary::from_diagnostic(suite, summary, diagnostic))
         })
         .collect()
 }

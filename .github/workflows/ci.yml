@@ -66,6 +66,26 @@ jobs:
           cargo test --locked --manifest-path "$macro_package/Cargo.toml" --doc
           cargo package --locked --list -p cntryl-stress --allow-dirty
 
+  semver-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      # Compares the public API against the published crates.io release.
+      # For 0.x crates a `minor` release type (0.4 -> 0.5) permits breaking
+      # changes, which the 0.5 line makes intentionally; any change that would
+      # need a bigger jump still fails. Move `baseline-version` forward (and
+      # drop `release-type` to derive it from Cargo.toml) after each release.
+      - name: Check semver against crates.io
+        uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
+        with:
+          package: cntryl-stress
+          baseline-version: 0.4.0
+          release-type: minor
+
   msrv:
     runs-on: ubuntu-latest
     steps:

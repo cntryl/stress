@@ -162,121 +162,146 @@ fn advanced_imports_compile_from_modules() {
 
 fn current_schema_run() -> cntryl_stress::artifact::StressRun {
     use cntryl_stress::artifact::{
-        BenchmarkBudgets, BenchmarkMode, BenchmarkSpec, BenchmarkSummary, ConsoleNameMode,
-        CorrectnessCounters, CorrectnessSummary, EnvironmentInfo, MeasurementIntent, PrimaryMetric,
-        ProfileConfig, QualityClass, RunProfile, Sample, SamplePhase, StressRun, SummaryStats,
-        SCHEMA_VERSION,
+        BenchmarkMode, BenchmarkSpec, BenchmarkSummary, EnvironmentInfo, MeasurementIntent,
+        PrimaryMetric, ProfileConfig, QualityClass, RunProfile, Sample, SamplePhase, StressRun,
+        SummaryStats, TrustClass,
     };
 
-    let profile_config = ProfileConfig {
-        profile: RunProfile::Smoke,
-        measured_samples: 1,
-        warmup_samples: 0,
-        cooldown_samples: 0,
-        min_quality: QualityClass::Untrustworthy,
-        fail_on_quality: false,
-        fail_on_regression: false,
-        deny_diagnostics: None,
-        regression_threshold: 0.05,
-        sample_duration: Duration::from_millis(10),
-        operations_per_sample: 1,
-        micro_sample_duration: Duration::from_millis(5),
-        report_depth: "summary".to_string(),
-        console_names: ConsoleNameMode::Compact,
-        progress: true,
-    };
+    let mut profile_config = ProfileConfig::new();
+    profile_config.profile = RunProfile::Smoke;
+    profile_config.measured_samples = 1;
+    profile_config.warmup_samples = 0;
+    profile_config.min_quality = QualityClass::Untrustworthy;
+    profile_config.sample_duration = Duration::from_millis(10);
+    profile_config.micro_sample_duration = Duration::from_millis(5);
+    profile_config.report_depth = "summary".to_string();
     let environment = EnvironmentInfo::unknown(profile_config);
 
-    StressRun {
-        schema_version: SCHEMA_VERSION.to_string(),
-        tool_version: env!("CARGO_PKG_VERSION").to_string(),
-        suite: "suite".to_string(),
-        run_profile: RunProfile::Smoke,
-        environment: environment.clone(),
-        benchmark_specs: vec![BenchmarkSpec {
-            id: "suite/bench".to_string(),
-            name: "bench".to_string(),
-            tier: 2,
-            mode: BenchmarkMode::FixedOperations {
-                operations_per_sample: 1,
-            },
-            intent: MeasurementIntent::General,
-            budgets: BenchmarkBudgets::default(),
-            parameters: BTreeMap::new(),
-            metadata: BTreeMap::new(),
-        }],
-        samples: vec![Sample {
-            benchmark_id: "suite/bench".to_string(),
-            intent: MeasurementIntent::General,
-            sample_number: 0,
-            phase: SamplePhase::Measured,
-            elapsed_ns: 1,
-            wall_clock_ns: 1,
-            operations_attempted: 1,
-            operations_completed: 1,
-            throughput: 1.0,
-            calibrated_iterations: None,
-            gross_elapsed_ns: None,
-            overhead_ns: None,
-            net_elapsed_ns: None,
-            gross_ns_per_op: None,
-            overhead_ns_per_op: None,
-            net_ns_per_op: None,
-            allocs: None,
-            bytes: None,
-            allocs_per_op: None,
-            bytes_per_op: None,
-            latency_ns: Vec::new(),
-            observations: Vec::new(),
-            parameters: BTreeMap::new(),
-            counters: CorrectnessCounters {
-                attempted: 1,
-                completed: 1,
-                ..CorrectnessCounters::default()
-            },
-            environment,
-        }],
-        summaries: vec![BenchmarkSummary {
-            benchmark_id: "suite/bench".to_string(),
-            name: "bench".to_string(),
-            tier: 2,
-            intent: MeasurementIntent::General,
-            primary_metric: PrimaryMetric::Throughput,
-            measured_samples: 1,
-            warmup_samples: 0,
-            cooldown_samples: 0,
-            stats: SummaryStats::from_values(&[1.0]),
-            wall_clock: None,
-            total_wall_clock_ns: 1,
-            ns_per_op: None,
-            gross_ns_per_op: None,
-            overhead_ns_per_op: None,
-            allocs_per_op: None,
-            bytes_per_op: None,
-            observations: Vec::new(),
-            quality: QualityClass::Untrustworthy,
-            trust_class: cntryl_stress::artifact::TrustClass::Gate,
-            budgets: BenchmarkBudgets::default(),
-            budget_results: Vec::new(),
-            diagnostics: Vec::new(),
-            correctness: CorrectnessSummary {
-                passed: true,
-                counters: CorrectnessCounters {
-                    attempted: 1,
-                    completed: 1,
-                    ..CorrectnessCounters::default()
-                },
-                errors: Vec::new(),
-            },
-            parameters: BTreeMap::new(),
-            metadata: BTreeMap::new(),
-        }],
-        comparisons: Vec::new(),
-        diagnostics_summary: Vec::new(),
-        started_at: "1".to_string(),
-        total_elapsed_ns: 1,
+    let mut run = StressRun::new("suite", RunProfile::Smoke, environment.clone());
+    run.started_at = "1".to_string();
+    run.total_elapsed_ns = 1;
+    run.benchmark_specs.push(BenchmarkSpec {
+        id: "suite/bench".to_string(),
+        name: "bench".to_string(),
+        tier: 2,
+        mode: BenchmarkMode::FixedOperations {
+            operations_per_sample: 1,
+        },
+        intent: MeasurementIntent::General,
+        budgets: cntryl_stress::artifact::BenchmarkBudgets::default(),
+        parameters: BTreeMap::new(),
         metadata: BTreeMap::new(),
-    }
+    });
+
+    let mut sample = Sample::new("suite/bench", SamplePhase::Measured, environment);
+    sample.elapsed_ns = 1;
+    sample.wall_clock_ns = 1;
+    sample.operations_attempted = 1;
+    sample.operations_completed = 1;
+    sample.throughput = 1.0;
+    sample.counters.attempted = 1;
+    sample.counters.completed = 1;
+    run.samples.push(sample);
+
+    let mut summary = BenchmarkSummary::new("suite/bench", "bench", 2, PrimaryMetric::Throughput);
+    summary.measured_samples = 1;
+    summary.stats = SummaryStats::from_values(&[1.0]);
+    summary.total_wall_clock_ns = 1;
+    summary.quality = QualityClass::Untrustworthy;
+    summary.trust_class = TrustClass::Gate;
+    summary.correctness.counters.attempted = 1;
+    summary.correctness.counters.completed = 1;
+    run.summaries.push(summary);
+    run
+}
+
+#[test]
+fn artifact_types_build_via_constructors_only() {
+    use cntryl_stress::artifact::{
+        BenchmarkDiagnostic, BenchmarkSummary, ComparisonClass, ComparisonResult,
+        DiagnosticSeverity, DiagnosticSummary, EnvironmentInfo, MeasurementIntent, PrimaryMetric,
+        ProfileConfig, QualityClass, Sample, SamplePhase, StressRun, SCHEMA_VERSION,
+    };
+
+    let profile_config = ProfileConfig::new();
+    assert_eq!(profile_config, ProfileConfig::default());
+
+    let environment = EnvironmentInfo::unknown(profile_config.clone());
+    assert_eq!(environment.cpu_model, "unknown");
+    assert_eq!(environment.profile_config, profile_config);
+
+    let sample = Sample::new("s/b", SamplePhase::Warmup, environment.clone());
+    assert_eq!(sample.benchmark_id, "s/b");
+    assert_eq!(sample.phase, SamplePhase::Warmup);
+    assert_eq!(sample.intent, MeasurementIntent::General);
+    assert_eq!(sample.elapsed_ns, 0);
+    assert!(sample.latency_ns.is_empty());
+    assert!(sample.parameters.is_empty());
+    assert_eq!(sample.environment, environment);
+
+    let diagnostic = BenchmarkDiagnostic::new("too_fast", DiagnosticSeverity::Warning, "reason")
+        .with_evidence("ns", "1")
+        .with_suggestion("do more work");
+    assert_eq!(diagnostic.code, "too_fast");
+    assert_eq!(diagnostic.severity, DiagnosticSeverity::Warning);
+    assert_eq!(diagnostic.reason, "reason");
+    assert_eq!(diagnostic.evidence.get("ns").map(String::as_str), Some("1"));
+    assert_eq!(diagnostic.suggestions, vec!["do more work".to_string()]);
+
+    let mut summary = BenchmarkSummary::new("s/b", "b", 3, PrimaryMetric::NsPerOp);
+    assert_eq!(summary.benchmark_id, "s/b");
+    assert_eq!(summary.name, "b");
+    assert_eq!(summary.tier, 3);
+    assert_eq!(summary.primary_metric, PrimaryMetric::NsPerOp);
+    assert!(summary.stats.is_none());
+    assert!(summary.diagnostics.is_empty());
+    summary.diagnostics.push(diagnostic.clone());
+
+    let ledger = DiagnosticSummary::from_diagnostic("s", &summary, &diagnostic);
+    assert_eq!(ledger.suite, "s");
+    assert_eq!(ledger.benchmark_id, "s/b");
+    assert_eq!(ledger.tier, 3);
+    assert_eq!(ledger.code, "too_fast");
+    assert_eq!(ledger.suggestions, diagnostic.suggestions);
+    assert_eq!(ledger.quality, summary.quality);
+
+    let comparison = ComparisonResult::new(
+        "s/b",
+        PrimaryMetric::NsPerOp,
+        QualityClass::Acceptable,
+        ComparisonClass::MissingBaseline,
+        0.05,
+    );
+    assert_eq!(comparison.benchmark_id, "s/b");
+    assert_eq!(comparison.classification, ComparisonClass::MissingBaseline);
+    assert!(comparison.baseline_value.is_none());
+    assert!(comparison.reason.is_none());
+
+    let run = StressRun::new("s", RunProfile::Smoke, environment);
+    assert_eq!(run.schema_version, SCHEMA_VERSION);
+    assert_eq!(run.tool_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(run.suite, "s");
+    assert_eq!(run.run_profile, RunProfile::Smoke);
+    assert!(run.samples.is_empty() && run.summaries.is_empty() && run.comparisons.is_empty());
+}
+
+#[test]
+fn v0_4_0_fixture_deserializes_and_reserializes() {
+    use cntryl_stress::artifact::StressRun;
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/baseline-main-v0.4.0.json");
+    let original: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read fixture"))
+            .expect("fixture is json");
+    let run: StressRun = serde_json::from_value(original.clone()).expect("v0.4 fixture loads");
+    let reserialized = serde_json::to_value(&run).expect("reserialize");
+    let reparsed: StressRun = serde_json::from_value(reserialized.clone()).expect("reparse");
+    assert_eq!(reparsed, run);
+    assert_eq!(
+        reserialized, original,
+        "v0.4 fixture must round-trip losslessly"
+    );
 }
 
 #[test]
