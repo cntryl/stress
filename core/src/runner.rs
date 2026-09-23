@@ -3,10 +3,10 @@
 use crate::allocation;
 use crate::artifact::{
     attach_measurement_mode_mismatch_diagnostics, attach_regression_diagnostics,
-    compare_summaries_with_specs, diagnostic_summary_for_run, summarize_benchmark,
-    BenchmarkModeKind, BenchmarkSpec, EnvironmentInfo, MeasurementIntent, RunProfile, Sample,
-    SamplePhase, StressRun, MAX_TIER, SCHEMA_VERSION, SUMMARY_SEMANTICS_CURRENT,
-    SUMMARY_SEMANTICS_METADATA_KEY,
+    attach_timer_resolution_evidence, compare_summaries_with_specs, diagnostic_summary_for_run,
+    summarize_benchmark, BenchmarkModeKind, BenchmarkSpec, EnvironmentInfo, MeasurementIntent,
+    RunProfile, Sample, SamplePhase, StressRun, MAX_TIER, SCHEMA_VERSION,
+    SUMMARY_SEMANTICS_CURRENT, SUMMARY_SEMANTICS_METADATA_KEY,
 };
 use crate::config::StressRunnerConfig;
 use crate::context::{MeasurementRecord, StressContext};
@@ -335,6 +335,7 @@ impl StressRunner {
     fn finish_inner(mut self, comparisons: Vec<crate::artifact::ComparisonResult>) -> StressRun {
         attach_regression_diagnostics(&mut self.summaries, &comparisons);
         attach_measurement_mode_mismatch_diagnostics(&mut self.summaries);
+        attach_timer_resolution_evidence(&mut self.summaries, self.environment.timer_resolution_ns);
         let diagnostics_summary = diagnostic_summary_for_run(&self.suite, &self.summaries);
         let mut run = StressRun {
             schema_version: SCHEMA_VERSION.to_string(),
@@ -1019,7 +1020,24 @@ fn capture_environment(config: &StressRunnerConfig) -> EnvironmentInfo {
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
         command_line: std::env::args().collect(),
         profile_config: config.profile_config(),
+        timer_resolution_ns: measure_timer_resolution_ns(),
     }
+}
+
+/// Smallest nonzero `Instant` increment observed over a few trials.
+fn measure_timer_resolution_ns() -> Option<u64> {
+    const TRIALS: usize = 16;
+    const MAX_SPINS: usize = 1_000_000;
+    (0..TRIALS)
+        .filter_map(|_| {
+            let start = Instant::now();
+            (0..MAX_SPINS).find_map(|_| {
+                let elapsed = start.elapsed();
+                (!elapsed.is_zero()).then_some(elapsed)
+            })
+        })
+        .min()
+        .and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok())
 }
 
 fn allocator_label() -> &'static str {
@@ -1267,6 +1285,14 @@ mod tests {
                 .push(evaluate_run_gate(run));
             Ok(())
         }
+    }
+
+    #[test]
+    fn captured_environment_measures_timer_resolution() {
+        let environment = capture_environment(&StressRunnerConfig::new());
+        assert!(environment
+            .timer_resolution_ns
+            .is_some_and(|resolution| resolution > 0));
     }
 
     #[test]

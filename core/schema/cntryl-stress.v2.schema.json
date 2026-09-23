@@ -186,7 +186,8 @@
         "git_commit": { "type": ["string", "null"] },
         "tool_version": { "type": "string" },
         "command_line": { "type": "array", "items": { "type": "string" } },
-        "profile_config": { "$ref": "#/$defs/profileConfig" }
+        "profile_config": { "$ref": "#/$defs/profileConfig" },
+        "timer_resolution_ns": { "$ref": "#/$defs/positiveInteger" }
       }
     },
     "benchmarkMode": {

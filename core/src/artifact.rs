@@ -1166,6 +1166,11 @@ pub struct EnvironmentInfo {
     pub command_line: Vec<String>,
     /// Resolved profile configuration.
     pub profile_config: ProfileConfig,
+    /// Smallest observed `Instant` tick in nanoseconds, when measured.
+    ///
+    /// Informational only: it never affects baseline compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timer_resolution_ns: Option<u64>,
 }
 
 impl EnvironmentInfo {
@@ -1183,6 +1188,7 @@ impl EnvironmentInfo {
             tool_version: env!("CARGO_PKG_VERSION").to_string(),
             command_line: Vec::new(),
             profile_config,
+            timer_resolution_ns: None,
         }
     }
 }
@@ -2811,6 +2817,26 @@ pub(crate) fn attach_regression_diagnostics(
     }
 }
 
+/// Add the measured timer resolution as evidence on `too_fast` diagnostics.
+pub(crate) fn attach_timer_resolution_evidence(
+    summaries: &mut [BenchmarkSummary],
+    timer_resolution_ns: Option<u64>,
+) {
+    let Some(resolution) = timer_resolution_ns else {
+        return;
+    };
+    for diagnostic in summaries
+        .iter_mut()
+        .flat_map(|summary| summary.diagnostics.iter_mut())
+        .filter(|diagnostic| diagnostic.code == "too_fast")
+    {
+        diagnostic.evidence.insert(
+            TIMER_RESOLUTION_EVIDENCE_KEY.to_string(),
+            resolution.to_string(),
+        );
+    }
+}
+
 pub(crate) fn attach_measurement_mode_mismatch_diagnostics(summaries: &mut [BenchmarkSummary]) {
     let mut families = BTreeMap::<String, BTreeMap<String, Vec<usize>>>::new();
     for (index, summary) in summaries.iter().enumerate() {
@@ -4302,6 +4328,7 @@ mod tests {
             tool_version: env!("CARGO_PKG_VERSION").to_string(),
             command_line: Vec::new(),
             profile_config: ProfileConfig::default(),
+            timer_resolution_ns: None,
         }
     }
 
@@ -5465,14 +5492,78 @@ mod tests {
         assert!(non_finite_diagnostic(10, 0).is_none());
         let warning = non_finite_diagnostic(10, 1).expect("one dropped sample is reported");
         assert_eq!(warning.severity, DiagnosticSeverity::Warning);
-        assert_eq!(warning.evidence.get("non_finite_dropped"), Some(&"1".to_string()));
-        assert_eq!(warning.evidence.get("measured_samples"), Some(&"10".to_string()));
+        assert_eq!(
+            warning.evidence.get("non_finite_dropped"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            warning.evidence.get("measured_samples"),
+            Some(&"10".to_string())
+        );
         assert_eq!(
             warning.suggestions,
             vec![crate::diagnostics::catalog_fix("non_finite_samples_dropped").to_string()]
         );
         let error = non_finite_diagnostic(10, 2).expect("two dropped samples are reported");
         assert_eq!(error.severity, DiagnosticSeverity::Error);
+    }
+
+    #[test]
+    fn timer_resolution_is_additive_and_never_breaks_environment_compatibility() {
+        let mut current = test_env();
+        current.timer_resolution_ns = Some(41);
+        let mut baseline = test_env();
+        baseline.timer_resolution_ns = Some(1);
+        assert_eq!(incompatible_environment_reason(&current, &baseline), None);
+        baseline.timer_resolution_ns = None;
+        assert_eq!(incompatible_environment_reason(&current, &baseline), None);
+
+        let json = serde_json::to_value(&baseline).expect("serialize");
+        assert!(json.get("timer_resolution_ns").is_none());
+        let json = serde_json::to_value(&current).expect("serialize");
+        assert_eq!(json["timer_resolution_ns"], 41);
+        let parsed: EnvironmentInfo = serde_json::from_value(json).expect("round trip");
+        assert_eq!(parsed.timer_resolution_ns, Some(41));
+
+        let schema =
+            serde_json::from_str::<serde_json::Value>(ARTIFACT_JSON_SCHEMA).expect("schema");
+        let environment = &schema["$defs"]["environment"];
+        assert!(environment["properties"]["timer_resolution_ns"].is_object());
+        assert!(!environment["required"]
+            .as_array()
+            .expect("required")
+            .iter()
+            .any(|field| field == "timer_resolution_ns"));
+    }
+
+    #[test]
+    fn too_fast_carries_timer_resolution_evidence() {
+        let spec = spec("bench");
+        let samples = (0..5)
+            .map(|index| completed_sample("bench", index, 50, 1))
+            .collect::<Vec<_>>();
+        let mut summaries = vec![summarize_benchmark(&spec, &samples)];
+        assert!(summaries[0]
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "too_fast"));
+
+        attach_timer_resolution_evidence(&mut summaries, Some(41));
+
+        let too_fast = summaries[0]
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "too_fast")
+            .expect("too_fast");
+        assert_eq!(
+            too_fast.evidence.get("timer_resolution_ns"),
+            Some(&"41".to_string())
+        );
+        assert!(summaries[0]
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code != "too_fast")
+            .all(|diagnostic| !diagnostic.evidence.contains_key("timer_resolution_ns")));
     }
 
     #[test]
@@ -5493,7 +5584,9 @@ mod tests {
                 .evidence
                 .insert("timer_resolution_ns".to_string(), "41".to_string());
         }
-        summary.diagnostics.retain(|diagnostic| diagnostic.code != "non_finite_samples_dropped");
+        summary
+            .diagnostics
+            .retain(|diagnostic| diagnostic.code != "non_finite_samples_dropped");
         let run = StressRun {
             schema_version: SCHEMA_VERSION.to_string(),
             tool_version: "0.4.0".to_string(),
