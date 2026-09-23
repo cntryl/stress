@@ -135,6 +135,8 @@ stress_main!();
 Allocation tracking uses process-wide allocator counters. Keep unrelated
 background work quiescent while enforcing per-operation allocation budgets;
 allocations performed by workload-owned threads are intentionally included.
+Zeroed allocations count like ordinary ones. A growing `realloc` counts as one
+allocation and only the growth in bytes; a shrinking `realloc` counts nothing.
 
 ```bash
 cargo bench --bench storage_stress
