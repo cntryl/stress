@@ -50,6 +50,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "cargo_stress/init.rs"]
+mod init;
+
 // ============================================================================
 // CLI Definition
 // ============================================================================
@@ -396,6 +399,116 @@ enum StressCommand {
     /// 2 incompatible environment, invalid input, or no row could be
     /// validly compared.
     Compare(CompareArgs),
+    /// Scaffold benches/stress.rs and register it in Cargo.toml
+    Init(InitArgs),
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct InitArgs {
+    /// Bench target name (writes `benches/<NAME>.rs`)
+    #[arg(long, default_value = "stress", value_parser = parse_init_name)]
+    name: String,
+
+    /// Overwrite an existing bench file
+    #[arg(long)]
+    force: bool,
+
+    /// Workspace member package to initialize
+    #[arg(long, short = 'p')]
+    package: Option<String>,
+
+    /// Path to the package (or workspace) Cargo.toml
+    #[arg(long, value_name = "PATH")]
+    manifest_path: Option<PathBuf>,
+}
+
+fn parse_init_name(value: &str) -> std::result::Result<String, String> {
+    init::validate_bench_name(value).map(|()| value.to_string())
+}
+
+/// Locate the manifest `init` edits: an explicit path, else the nearest
+/// Cargo.toml upward; `-p` selects a workspace member via cargo metadata.
+fn init_manifest(args: &InitArgs, cwd: &Path) -> Result<PathBuf> {
+    let manifest = match &args.manifest_path {
+        Some(path) if path.is_file() => cwd.join(path),
+        Some(path) => bail!("manifest path is not a file: {}", path.display()),
+        None => {
+            let mut dir = cwd.to_path_buf();
+            loop {
+                let candidate = dir.join("Cargo.toml");
+                if candidate.is_file() {
+                    break candidate;
+                }
+                if !dir.pop() {
+                    bail!(
+                        "could not find Cargo.toml in {} or any parent",
+                        cwd.display()
+                    );
+                }
+            }
+        }
+    };
+    let Some(package) = &args.package else {
+        return Ok(manifest);
+    };
+    let output = Command::new("cargo")
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--manifest-path",
+        ])
+        .arg(&manifest)
+        .stderr(Stdio::piped())
+        .output()
+        .context("Failed to run cargo metadata")?;
+    if !output.status.success() {
+        bail!(
+            "cargo metadata failed for {}: {}",
+            manifest.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let metadata: CargoMetadata =
+        serde_json::from_slice(&output.stdout).context("Failed to parse cargo metadata JSON")?;
+    metadata
+        .packages
+        .into_iter()
+        .find(|candidate| {
+            &candidate.name == package && metadata.workspace_members.contains(&candidate.id)
+        })
+        .map(|candidate| candidate.manifest_path)
+        .with_context(|| format!("package `{package}` is not a member of this workspace"))
+}
+
+fn run_init(args: &InitArgs) -> Result<()> {
+    let cwd = std::env::current_dir().context("Failed to get current directory")?;
+    let manifest = init_manifest(args, &cwd)?;
+    let report = init::init_package(
+        &manifest,
+        &args.name,
+        args.force,
+        &init::default_dependency_spec(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let verb = if report.overwrote_bench_file {
+        "overwrote"
+    } else {
+        "created"
+    };
+    println!("{verb} {}", report.bench_file.display());
+    if report.added_dependency {
+        println!(
+            "added cntryl-stress to [dev-dependencies] in {}",
+            manifest.display()
+        );
+    }
+    if report.added_bench {
+        println!("added [[bench]] `{}` to {}", args.name, manifest.display());
+    }
+    println!("next: cargo stress --bench {}", args.name);
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -726,6 +839,7 @@ fn main() -> Result<()> {
                 Ok(())
             }
             Some(StressCommand::Compare(compare)) => run_compare(compare),
+            Some(StressCommand::Init(init)) => run_init(init),
             None => run_stress(&args),
         },
     }
@@ -4784,5 +4898,175 @@ mod compare_tests {
         ]);
         assert_eq!(code, 1, "{stdout}{stderr}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod init_tests {
+    use super::*;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "cargo-stress-init-cli-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    fn parse_init(argv: &[&str]) -> InitArgs {
+        let cli = Cli::try_parse_from(argv).expect("parse");
+        let Commands::Stress(stress) = cli.cmd;
+        let Some(StressCommand::Init(init)) = stress.command else {
+            panic!("expected init");
+        };
+        init
+    }
+
+    #[test]
+    fn init_parses_name_force_package_and_manifest() {
+        let init = parse_init(&["cargo", "stress", "init"]);
+        assert_eq!(init.name, "stress");
+        assert!(!init.force && init.package.is_none() && init.manifest_path.is_none());
+        let init = parse_init(&[
+            "cargo",
+            "stress",
+            "init",
+            "--name",
+            "io",
+            "--force",
+            "-p",
+            "member",
+            "--manifest-path",
+            "ws/Cargo.toml",
+        ]);
+        assert_eq!(init.name, "io");
+        assert!(init.force);
+        assert_eq!(init.package.as_deref(), Some("member"));
+        assert_eq!(init.manifest_path, Some(PathBuf::from("ws/Cargo.toml")));
+        assert!(Cli::try_parse_from(["cargo", "stress", "init", "--name", "../x"]).is_err());
+    }
+
+    #[test]
+    fn init_selects_workspace_member_with_package_flag() {
+        let root = temp_dir("workspace");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"member\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("member/src")).unwrap();
+        fs::write(
+            root.join("member/Cargo.toml"),
+            "[package]\nname = \"member\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("member/src/lib.rs"), "").unwrap();
+        let mut args = parse_init(&["cargo", "stress", "init", "-p", "member"]);
+        let manifest = init_manifest(&args, &root).unwrap();
+        assert_eq!(
+            manifest.canonicalize().unwrap(),
+            root.join("member/Cargo.toml").canonicalize().unwrap()
+        );
+        args.package = Some("missing".to_string());
+        assert!(init_manifest(&args, &root).is_err());
+        let error =
+            init::init_package(&root.join("Cargo.toml"), "stress", false, "\"0.4\"").unwrap_err();
+        assert!(error.contains("-p"), "{error}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The scaffold must compile against the real API and pass under the
+    /// default profile with no diagnostics.
+    #[test]
+    fn scaffolded_bench_runs_clean_under_default_profile() {
+        let root = temp_dir("run");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"init-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "").unwrap();
+        fs::create_dir_all(root.join(".cargo")).unwrap();
+        fs::write(root.join(".cargo/config.toml"), "[net]\noffline = true\n").unwrap();
+        let core = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        let report = init::init_package(
+            &root.join("Cargo.toml"),
+            "stress",
+            false,
+            &format!("{{ path = \"{core}\" }}"),
+        )
+        .unwrap();
+        assert!(report.added_dependency && report.added_bench);
+        // Shape diagnostics are deterministic and always fail this test;
+        // `high_variance` depends on host noise, so retry a few times.
+        let mut last = Vec::new();
+        for attempt in 0..4 {
+            let output_dir = root.join(format!("out-{attempt}"));
+            let output = Command::new("cargo")
+                .current_dir(&root)
+                .env_remove("STRESS_SUITE")
+                .env_remove("STRESS_ARTIFACT_NAMESPACE")
+                .env_remove("STRESS_BASELINE")
+                .env_remove("STRESS_SAVE_BASELINE")
+                .env_remove("CARGO_TARGET_DIR")
+                .env("STRESS_GITHUB", "0")
+                .args([
+                    "bench",
+                    "--bench",
+                    "stress",
+                    "--",
+                    "--profile",
+                    "default",
+                    "--output-dir",
+                ])
+                .arg(&output_dir)
+                .output()
+                .expect("run cargo bench");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let latest = [
+                output_dir.join("stress/latest.json"),
+                output_dir.join("latest.json"),
+            ]
+            .into_iter()
+            .find(|path| path.is_file())
+            .expect("latest.json written");
+            let run = StressRun::load(&latest).expect("load latest.json");
+            assert!(!run.summaries.is_empty());
+            last = run
+                .summaries
+                .iter()
+                .flat_map(|summary| summary.diagnostics.iter())
+                .map(|diagnostic| diagnostic.code.clone())
+                .collect::<Vec<_>>();
+            assert!(
+                last.iter().all(|code| code == "high_variance"),
+                "shape diagnostics on scaffold: {last:?}"
+            );
+            if last.is_empty() && run.diagnostics_summary.is_empty() {
+                break;
+            }
+        }
+        // Under a loaded host (parallel tests, shared runners) every attempt
+        // may be noisy; require a clean run only when asked to, e.g.
+        // `STRESS_INIT_STRICT=1 cargo test ... scaffolded -- --test-threads 1`.
+        if std::env::var_os("STRESS_INIT_STRICT").is_some() {
+            assert!(last.is_empty(), "scaffold never ran clean: {last:?}");
+        } else if !last.is_empty() {
+            eprintln!("note: scaffold only showed host-noise diagnostics: {last:?}");
+        }
+        let _ = fs::remove_dir_all(root);
     }
 }
