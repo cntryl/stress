@@ -3252,7 +3252,7 @@ mod tests {
             RunProfile::Release,
             EnvironmentInfo::unknown(profile_config.clone()),
         );
-        run.tool_version = "0.4.0".to_string();
+        run.tool_version = env!("CARGO_PKG_VERSION").to_string();
         run.benchmark_specs.push(BenchmarkSpec::new(
             format!("{suite}/bench"),
             "bench",

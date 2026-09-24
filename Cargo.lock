@@ -100,7 +100,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cntryl-stress"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -125,7 +125,7 @@ dependencies = [
 
 [[package]]
 name = "cntryl-stress-macros"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "cntryl-stress",
  "proc-macro-crate",

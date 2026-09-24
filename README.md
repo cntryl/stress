@@ -104,7 +104,7 @@ Or set it up by hand:
 
 ```toml
 [dev-dependencies]
-cntryl-stress = "0.4"
+cntryl-stress = "0.5"
 
 [[bench]]
 name = "storage_stress"
@@ -380,7 +380,7 @@ async fn async_lookup(ctx: &mut StressContext) -> Result<(), &'static str> {
 
 By default async benchmarks run on a tiny built-in executor with no timers or
 IO reactor. For tokio timers, channels, or IO, enable the `tokio` feature
-(`cntryl-stress = { version = "0.4", features = ["tokio"] }`) and pick a
+(`cntryl-stress = { version = "0.5", features = ["tokio"] }`) and pick a
 runtime per benchmark. The benchmark uses the `cntryl_stress::tokio`
 re-export, so no direct tokio dependency is needed:
 
