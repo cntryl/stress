@@ -82,6 +82,26 @@ authoring and reporting experience.
 
 ## Quick Start
 
+The fastest start is `cargo stress init` (from a package directory):
+
+```sh
+cargo stress init                  # writes benches/stress.rs and updates Cargo.toml
+cargo stress init --name io_path   # benches/io_path.rs, [[bench]] name = "io_path"
+cargo stress init -p my-member     # a workspace member (or --manifest-path)
+cargo stress
+```
+
+`init` adds `cntryl-stress` to `[dev-dependencies]` and a
+`[[bench]] harness = false` entry only when they are missing, preserving the
+rest of `Cargo.toml` byte for byte (an existing, possibly renamed, dependency
+is reused). Every edit is re-parsed and verified; if the manifest cannot be
+edited safely, `init` prints the entries to add by hand and changes nothing.
+It refuses to overwrite an existing bench file unless `--force` is passed. The
+scaffold is a small tier-2 benchmark that passes with no diagnostics under the
+default profile.
+
+Or set it up by hand:
+
 ```toml
 [dev-dependencies]
 cntryl-stress = "0.4"
