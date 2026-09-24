@@ -31,6 +31,10 @@ linkme = "0.3"
 tokio = { version = "1.38", default-features = false, features = ["rt", "rt-multi-thread", "time", "sync"], optional = true }
 cntryl-stress-macros = { version = "=0.4.0", path = "../macros" }
 
+[target.'cfg(unix)'.dependencies]
+# Already in the tree through fs2; used directly for getrusage peak RSS.
+libc = "0.2"
+
 [dev-dependencies]
 trybuild = "=1.0.119"
 

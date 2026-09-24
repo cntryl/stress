@@ -150,6 +150,14 @@ pub const DIAGNOSTIC_CATALOG: &[DiagnosticInfo] = &[
         docs_anchor: "diagnostics/non_finite_samples_dropped.md",
     },
     DiagnosticInfo {
+        code: "peak_rss_exceeded",
+        default_severity: DiagnosticSeverity::Warning,
+        summary: "Process peak RSS exceeded the row's max_peak_rss_mb budget.",
+        causes: "This row, or an earlier row in the same process, grew the resident set past the budget; peak RSS is process-wide and monotonic.",
+        fix: "Reduce peak memory in the benchmark, run memory-heavy rows in their own suite, or raise max_peak_rss_mb.",
+        docs_anchor: "diagnostics/peak_rss_exceeded.md",
+    },
+    DiagnosticInfo {
         code: "regression",
         default_severity: DiagnosticSeverity::Error,
         summary: "The row regressed against the selected baseline.",
