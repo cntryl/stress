@@ -172,7 +172,19 @@
         "micro_sample_duration": { "$ref": "#/$defs/positiveInteger" },
         "report_depth": { "type": "string" },
         "console_names": { "enum": ["compact", "full"] },
-        "progress": { "type": "boolean" }
+        "progress": { "type": "boolean" },
+        "require_quiet_env": { "type": "boolean" }
+      }
+    },
+    "environmentObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "value", "adverse"],
+      "properties": {
+        "key": { "type": "string" },
+        "value": { "type": "string" },
+        "adverse": { "type": "boolean" },
+        "detail": { "type": "string" }
       }
     },
     "environment": {
@@ -193,7 +205,8 @@
         "tool_version": { "type": "string" },
         "command_line": { "type": "array", "items": { "type": "string" } },
         "profile_config": { "$ref": "#/$defs/profileConfig" },
-        "timer_resolution_ns": { "$ref": "#/$defs/positiveInteger" }
+        "timer_resolution_ns": { "$ref": "#/$defs/positiveInteger" },
+        "observations": { "type": "array", "items": { "$ref": "#/$defs/environmentObservation" } }
       }
     },
     "benchmarkMode": {

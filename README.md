@@ -485,6 +485,24 @@ The environment captures `Instant` granularity as `timer_resolution_ns`, which
 compatibility. A `non_finite_samples_dropped` warning (error above 10% of
 samples) reports metric values excluded from statistics.
 
+### Environment observations
+
+At run start the harness records best-effort, read-only host facts in
+`environment.observations` (each with `key`, `value`, `adverse`, and `detail`):
+
+| Key | Source | Adverse when |
+|-----|--------|--------------|
+| `cpu_governor` | Linux `cpufreq/scaling_governor` | any core is not `performance` |
+| `cpu_boost` | Linux `intel_pstate/no_turbo` or `cpufreq/boost` | turbo/boost is enabled |
+| `load_average` | Linux `/proc/loadavg` | 1-minute load exceeds half the online host CPUs |
+| `cpu_quota` | tightest cgroup v2 `cpu.max` or v1 CFS quota of the process cgroup (only when limited) | quota is below the online host CPUs |
+| `power_source` | macOS `pmset -g batt` | running on battery |
+
+Unreadable sources are skipped. Observations appear in the console and
+Markdown reports and never affect baseline compatibility. Pass
+`--require-quiet-env` (or set `STRESS_REQUIRE_QUIET_ENV=1`) to fail the run with
+`EnvironmentFailed` when any observation is adverse.
+
 ## Configuration
 
 Command-line arguments override `STRESS_*` environment variables, which override the trustworthy defaults.
@@ -515,6 +533,7 @@ Command-line arguments override `STRESS_*` environment variables, which override
 | `STRESS_BUILD_INPUT_IDENTITY` | Advanced direct-run identity for non-default feature/target builds; the wrapper sets this automatically |
 | `STRESS_FAIL_ON_ISSUES` | Fail on warning-or-error diagnostics |
 | `STRESS_DENY_DIAGNOSTICS` | Fail on diagnostics at `info`, `warning`, or `error`; when set together with `STRESS_FAIL_ON_ISSUES`, the stricter of the two applies and a disagreement prints a warning |
+| `STRESS_REQUIRE_QUIET_ENV` | `1`/`true` fails the run when an environment observation is adverse |
 | `STRESS_DENY_CODES` | Comma-separated diagnostic codes that fail the run whenever present (see `cargo stress explain --list`) |
 | `STRESS_ALLOW_CODES` | Comma-separated diagnostic codes exempt from `STRESS_DENY_DIAGNOSTICS` severity gating |
 | `STRESS_FAIL_ON_REGRESSION` | `true`/`false`: whether meaningful regressions fail the run (overrides the profile) |

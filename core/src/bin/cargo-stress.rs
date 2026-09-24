@@ -322,6 +322,11 @@ struct StressArgs {
     #[arg(long = "allow-code", value_name = "CODE", value_delimiter = ',', value_parser = parse_diagnostic_code)]
     allow_codes: Vec<String>,
 
+    /// Fail when an environment observation is adverse (CPU governor, boost,
+    /// load, CPU quota, battery); falls back to `STRESS_REQUIRE_QUIET_ENV`
+    #[arg(long)]
+    require_quiet_env: bool,
+
     // ========================================================================
     // Build Options
     // ========================================================================
@@ -2509,6 +2514,9 @@ fn build_passthrough_args(cmd: &mut Command, args: &StressArgs, passthrough_json
     for code in args.allow_codes.iter().filter(|code| !code.is_empty()) {
         cmd.arg("--allow-code").arg(code);
     }
+    if args.require_quiet_env {
+        cmd.arg("--require-quiet-env");
+    }
 }
 
 // ============================================================================
@@ -2863,6 +2871,7 @@ mod tests {
         StressArgs {
             deny_codes: Vec::new(),
             allow_codes: Vec::new(),
+            require_quiet_env: false,
             command: None,
             workload: None,
             include_ignored: false,
@@ -3504,6 +3513,23 @@ mod tests {
             error.to_string().contains("did you mean 'too_fast'"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn require_quiet_env_forwards_to_child_binaries() {
+        let cli =
+            Cli::try_parse_from(["cargo", "stress", "--require-quiet-env"]).expect("flag parses");
+        let Commands::Stress(args) = cli.cmd;
+        assert!(args.require_quiet_env);
+        let mut cmd = Command::new("stress-child");
+        build_passthrough_args(&mut cmd, &args, true);
+        assert!(cmd.get_args().any(|arg| arg == "--require-quiet-env"));
+
+        let cli = Cli::try_parse_from(["cargo", "stress"]).expect("no flag");
+        let Commands::Stress(args) = cli.cmd;
+        let mut cmd = Command::new("stress-child");
+        build_passthrough_args(&mut cmd, &args, true);
+        assert!(!cmd.get_args().any(|arg| arg == "--require-quiet-env"));
     }
 
     #[test]

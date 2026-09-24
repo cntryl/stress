@@ -78,6 +78,7 @@ struct StressBinaryArgs {
     allow_codes: Vec<String>,
     names: Option<ConsoleNameMode>,
     no_progress: Option<bool>,
+    require_quiet_env: Option<bool>,
     selection_probe: bool,
 }
 
@@ -301,6 +302,9 @@ impl StressBinaryArgs {
                 "--no-progress" => {
                     result.no_progress = Some(true);
                 }
+                "--require-quiet-env" => {
+                    result.require_quiet_env = Some(true);
+                }
                 "--__cntryl-stress-selection-probe" => {
                     result.selection_probe = true;
                 }
@@ -351,6 +355,7 @@ fn singleton_argument(argument: &str) -> Option<&'static str> {
         "--deny-diagnostics" => Some("--deny-diagnostics"),
         "--names" => Some("--names"),
         "--no-progress" => Some("--no-progress"),
+        "--require-quiet-env" => Some("--require-quiet-env"),
         "--__cntryl-stress-selection-probe" => Some("--__cntryl-stress-selection-probe"),
         _ => None,
     }
@@ -436,6 +441,7 @@ fn print_help() {
     );
     eprintln!("    --names <compact|full>         Human console benchmark-name mode");
     eprintln!("    --no-progress                  Disable stderr progress for human output");
+    eprintln!("    --require-quiet-env            Fail when an environment observation is adverse");
 }
 
 /// Entry point used by `stress_main!`.
@@ -525,6 +531,8 @@ pub struct StressRunnerOptions {
     pub names: Option<ConsoleNameMode>,
     /// Whether human runs emit stderr progress.
     pub progress: Option<bool>,
+    /// Fail the run when any environment observation is adverse.
+    pub require_quiet_env: Option<bool>,
 }
 
 impl StressRunnerOptions {
@@ -692,6 +700,13 @@ impl StressRunnerOptions {
         self
     }
 
+    /// Fail the run when any captured environment observation is adverse.
+    #[must_use]
+    pub const fn require_quiet_env(mut self, value: bool) -> Self {
+        self.require_quiet_env = Some(value);
+        self
+    }
+
     /// Set human console benchmark-name mode.
     #[must_use]
     pub const fn names(mut self, mode: ConsoleNameMode) -> Self {
@@ -745,6 +760,7 @@ fn binary_args_from_options(options: StressRunnerOptions) -> StressBinaryArgs {
         allow_codes: options.allow_codes,
         names: options.names,
         no_progress: options.progress.map(|progress| !progress),
+        require_quiet_env: options.require_quiet_env,
         ..StressBinaryArgs::default()
     }
 }
@@ -991,6 +1007,13 @@ where
     if args.no_progress == Some(true) {
         config.progress = false;
         metadata.insert("progress_src".to_string(), "cli --no-progress".to_string());
+    }
+    if let Some(value) = args.require_quiet_env {
+        config.require_quiet_env = value;
+        metadata.insert(
+            "require_quiet_env_src".to_string(),
+            "cli --require-quiet-env".to_string(),
+        );
     }
     let artifact_namespace = get_var("STRESS_ARTIFACT_NAMESPACE")
         .filter(|namespace| !namespace.trim().is_empty())
@@ -1853,6 +1876,14 @@ fn print_resolved_config(suite: &str, resolved: &ResolvedStressConfig) {
             .map_or("unknown", String::as_str)
     );
     println!("Progress: {}", resolved.config.progress);
+    println!(
+        "Require quiet env: {} ({})",
+        resolved.config.require_quiet_env,
+        resolved
+            .metadata
+            .get("require_quiet_env_src")
+            .map_or("unknown", String::as_str)
+    );
 }
 
 fn source_for<F>(get_var: &F, env_key: &'static str) -> String
@@ -2314,6 +2345,33 @@ mod tests {
         let args = binary_args_from_options(options);
         assert_eq!(args.deny_codes, vec!["too_fast"]);
         assert_eq!(args.allow_codes, vec!["too_few_samples"]);
+    }
+
+    #[test]
+    fn require_quiet_env_flag_env_and_options_resolve() {
+        let args = ["stress-demo", "--require-quiet-env"].map(str::to_string);
+        let parsed = StressBinaryArgs::parse_from_args(&args).expect("valid flag");
+        assert_eq!(parsed.require_quiet_env, Some(true));
+        let resolved = resolve_from_binary_args_with(&parsed, |_| None);
+        assert!(resolved.config.require_quiet_env);
+        assert_eq!(
+            resolved
+                .metadata
+                .get("require_quiet_env_src")
+                .map(String::as_str),
+            Some("cli --require-quiet-env")
+        );
+
+        let resolved = resolve_from_binary_args_with(&StressBinaryArgs::default(), |key| {
+            (key == "STRESS_REQUIRE_QUIET_ENV").then(|| "true".to_string())
+        });
+        assert!(resolved.config.require_quiet_env);
+
+        let resolved = resolve_from_binary_args_with(&StressBinaryArgs::default(), |_| None);
+        assert!(!resolved.config.require_quiet_env);
+
+        let args = binary_args_from_options(StressRunnerOptions::new().require_quiet_env(true));
+        assert_eq!(args.require_quiet_env, Some(true));
     }
 
     #[test]
