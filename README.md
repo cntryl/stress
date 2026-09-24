@@ -507,6 +507,16 @@ The environment captures `Instant` granularity as `timer_resolution_ns`, which
 compatibility. A `non_finite_samples_dropped` warning (error above 10% of
 samples) reports metric values excluded from statistics.
 
+Rows with at least 10 measured and 2 warmup samples (the `lab` and `release`
+profiles, or explicit overrides) are also checked for stationarity. The Info
+diagnostic `insufficient_warmup` fires when the warmup tail and the first
+measured samples sit at clearly different levels, and suggests a warmup count.
+`measurement_drift` fires when a Theil-Sen trend over the measured samples is
+significant and totals more than 10% of the median. Neither changes any
+measurement, and baselines saved without these codes stay valid. See
+[`insufficient_warmup`](docs/diagnostics/insufficient_warmup.md) and
+[`measurement_drift`](docs/diagnostics/measurement_drift.md).
+
 ### Environment observations
 
 At run start the harness records best-effort, read-only host facts in
