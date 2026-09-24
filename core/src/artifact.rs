@@ -2458,6 +2458,7 @@ fn normalized_summary_for_validation(
                 | "insufficient_warmup"
                 | "measurement_drift"
                 | "peak_rss_exceeded"
+                | "scaling_anomaly"
         )
     });
     for diagnostic in &mut normalized.diagnostics {
@@ -6069,6 +6070,30 @@ mod tests {
         );
         run.canonical_baseline_summaries()
             .expect("older baselines lack the new codes");
+    }
+
+    #[test]
+    fn baselines_with_cross_row_scaling_codes_stay_valid() {
+        // `scaling_anomaly` is a cross-row pass over the finished run, so a
+        // per-row recomputation never reproduces it.
+        let spec = spec("bench");
+        let samples = phased_samples(&[1_000_000], &[1_000_000; 5]);
+        let mut summary = summarize_benchmark(&spec, &samples);
+        summary.diagnostics.push(BenchmarkDiagnostic::new(
+            "scaling_anomaly",
+            DiagnosticSeverity::Info,
+            "scales",
+        ));
+        let mut run = StressRun::new("suite", RunProfile::Default, test_env());
+        run.benchmark_specs = vec![spec];
+        run.samples = samples;
+        run.summaries = vec![summary];
+        run.metadata.insert(
+            SUMMARY_SEMANTICS_METADATA_KEY.to_string(),
+            SUMMARY_SEMANTICS_CURRENT.to_string(),
+        );
+        run.canonical_baseline_summaries()
+            .expect("scaling_anomaly is not part of per-row recomputation");
     }
 
     #[test]

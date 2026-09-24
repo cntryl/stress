@@ -660,6 +660,10 @@ impl StressRunner {
     fn finish_inner(mut self, comparisons: Vec<crate::artifact::ComparisonResult>) -> StressRun {
         attach_regression_diagnostics(&mut self.summaries, &comparisons);
         attach_measurement_mode_mismatch_diagnostics(&mut self.summaries);
+        crate::scaling::attach_scaling_diagnostics(
+            &mut self.summaries,
+            self.environment.core_count,
+        );
         attach_timer_resolution_evidence(&mut self.summaries, self.environment.timer_resolution_ns);
         let diagnostics_summary = diagnostic_summary_for_run(&self.suite, &self.summaries);
         let mut run = StressRun {
@@ -2798,6 +2802,33 @@ mod tests {
                 && diagnostic.parameters.get("clients") == Some(&"4".to_string())
                 && diagnostic.code == "too_few_samples"
         }));
+    }
+
+    #[test]
+    fn finished_runs_carry_scaling_diagnostics_for_sweeps() {
+        let config = StressRunnerConfig::new()
+            .samples(5)
+            .warmup_samples(0)
+            .cooldown_samples(0)
+            .operations_per_sample(1);
+        let mut runner = StressRunner::with_config("suite", config);
+        runner.reporters(Vec::new());
+        for size in [1_u64, 2, 4, 8] {
+            runner.run(&format!("scan/size={size}"), move |ctx| {
+                ctx.parameter("size", size);
+                ctx.record_external("work", Duration::from_millis(size), 1);
+            });
+        }
+        let run = runner.finish();
+
+        assert!(run.summaries.iter().all(|summary| summary
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "scaling_anomaly")));
+        assert!(run
+            .diagnostics_summary
+            .iter()
+            .any(|diagnostic| diagnostic.code == "scaling_anomaly"));
     }
 
     fn external_throughput_runner(completed_operations: u64) -> StressRunner {
