@@ -2,7 +2,8 @@
 //!
 //! One row per benchmark summary. Text cells are quoted when they contain a
 //! comma, quote, or line break, and cells that a spreadsheet would evaluate
-//! as a formula (leading `=`, `+`, `-`, `@`, tab, or carriage return) are
+//! as a formula (leading `=`, `+`, `-`, `@`, possibly after whitespace, or a
+//! leading tab, carriage return, or line feed) are
 //! prefixed with `'`. Numeric cells are written by this crate and never
 //! guarded, so negative changes stay numeric.
 //!
@@ -15,8 +16,9 @@ use crate::artifact::{
 };
 use std::fmt::Write as _;
 
-/// Column header of [`format_csv_report`].
-pub const CSV_HEADER: [&str; 17] = [
+/// Column header of [`format_csv_report`]. Columns may be appended in
+/// minor releases; existing columns keep their position.
+pub const CSV_HEADER: &[&str] = &[
     "suite",
     "benchmark_id",
     "name",
@@ -40,11 +42,13 @@ pub const CSV_HEADER: [&str; 17] = [
 /// guard).
 #[must_use]
 pub fn csv_text_cell(value: &str) -> String {
-    let guarded = if value.starts_with(['=', '+', '-', '@', '\t', '\r']) {
-        format!("'{value}")
-    } else {
-        value.to_string()
-    };
+    let trimmed = value.trim_start_matches([' ', '\t', '\r', '\n']);
+    let guarded =
+        if value.starts_with(['\t', '\r', '\n']) || trimmed.starts_with(['=', '+', '-', '@']) {
+            format!("'{value}")
+        } else {
+            value.to_string()
+        };
     if guarded.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", guarded.replace('"', "\"\""))
     } else {
@@ -108,17 +112,9 @@ fn primary_unit(summary: &BenchmarkSummary) -> String {
     }
 }
 
-/// Confidence interval matching the primary value.
+/// Confidence interval of the statistic the gate compares.
 fn primary_interval(summary: &BenchmarkSummary) -> Option<ConfidenceInterval> {
-    let stats = summary.stats.as_ref()?;
-    let value = summary.primary_value()?;
-    if summary.primary_metric == PrimaryMetric::LatencyP95 && value.to_bits() == stats.p95.to_bits()
-    {
-        if let Some(interval) = &stats.p95_confidence_interval_95 {
-            return Some(*interval);
-        }
-    }
-    Some(stats.confidence_interval_95)
+    crate::artifact::gated_confidence_interval(summary)
 }
 
 fn summary_row(run: &StressRun, summary: &BenchmarkSummary) -> String {
@@ -154,7 +150,11 @@ fn summary_row(run: &StressRun, summary: &BenchmarkSummary) -> String {
 /// Render the run as CSV: a header plus one row per benchmark summary.
 #[must_use]
 pub fn format_csv_report(run: &StressRun) -> String {
-    let mut output = csv_record(&CSV_HEADER.map(ToString::to_string));
+    let header = CSV_HEADER
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let mut output = csv_record(&header);
     for summary in &run.summaries {
         let _ = write!(output, "{}", summary_row(run, summary));
     }
@@ -192,6 +192,30 @@ mod tests {
             assert_eq!(csv_text_cell(input), expected, "{input:?}");
         }
         assert_eq!(csv_text_cell("a=b"), "a=b");
+    }
+
+    #[test]
+    fn formulas_behind_leading_whitespace_are_neutralized() {
+        assert_eq!(csv_text_cell("\n=cmd"), "\"'\n=cmd\"");
+        assert_eq!(csv_text_cell("  =cmd"), "'  =cmd");
+        assert_eq!(csv_text_cell("  plain"), "  plain");
+    }
+
+    #[test]
+    fn interval_follows_the_gated_statistic() {
+        let mut summary = BenchmarkSummary::new("b", "b", 2, PrimaryMetric::LatencyP95);
+        summary.stats = crate::artifact::SummaryStats::from_values(&[1.0, 2.0, 3.0]);
+        // Legacy pooled p95 without a p95 interval: no interval, never the
+        // mean's interval next to a p95 value.
+        assert!(primary_interval(&summary).is_none());
+        summary.primary_metric = PrimaryMetric::NsPerOp;
+        assert_eq!(
+            primary_interval(&summary),
+            summary
+                .stats
+                .as_ref()
+                .map(|stats| stats.confidence_interval_95)
+        );
     }
 
     #[test]

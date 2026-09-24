@@ -3209,7 +3209,7 @@ fn change_percent(baseline: Option<f64>, current: Option<f64>) -> Option<f64> {
 }
 
 /// Confidence interval for the statistic returned by `primary_value`.
-fn gated_confidence_interval(summary: &BenchmarkSummary) -> Option<ConfidenceInterval> {
+pub(crate) fn gated_confidence_interval(summary: &BenchmarkSummary) -> Option<ConfidenceInterval> {
     let stats = summary.stats.as_ref()?;
     let gates_on_p95 = summary.primary_metric == PrimaryMetric::LatencyP95
         && summary

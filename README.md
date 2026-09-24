@@ -869,9 +869,11 @@ as `op/s` or `ns/op`, and the CI bounds match it. `regression_class` and
 `change_percent` are empty unless the run was compared with a baseline.
 Parameters share one column as `key=value` pairs sorted by key and joined by
 `;`, with `\`, `;`, and `=` backslash-escaped inside keys and values. Text
-cells that start with `=`, `+`, `-`, `@`, tab, or carriage return are prefixed
-with `'` so spreadsheets do not evaluate them; numeric cells are never
-prefixed. `cntryl_stress::csv` exposes the same renderer.
+cells that start with `=`, `+`, `-`, or `@` (also after leading whitespace),
+or with a tab, carriage return, or line feed, are prefixed with `'` so
+spreadsheets do not evaluate them (the stored text then differs from the
+JSON); numeric cells are never prefixed. CI bounds are empty when the gated
+statistic has no interval. `cntryl_stress::csv` exposes the same renderer.
 
 All eight files are staged and synced before publication. A durable transaction
 manifest distinguishes a commit in progress from a fully committed generation.
