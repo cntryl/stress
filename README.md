@@ -494,8 +494,8 @@ At run start the harness records best-effort, read-only host facts in
 |-----|--------|--------------|
 | `cpu_governor` | Linux `cpufreq/scaling_governor` | any core is not `performance` |
 | `cpu_boost` | Linux `intel_pstate/no_turbo` or `cpufreq/boost` | turbo/boost is enabled |
-| `load_average` | Linux `/proc/loadavg` | 1-minute load exceeds half the logical cores |
-| `cpu_quota` | cgroup v2 `cpu.max` or v1 CFS quota (only when limited) | quota is below the core count |
+| `load_average` | Linux `/proc/loadavg` | 1-minute load exceeds half the online host CPUs |
+| `cpu_quota` | tightest cgroup v2 `cpu.max` or v1 CFS quota of the process cgroup (only when limited) | quota is below the online host CPUs |
 | `power_source` | macOS `pmset -g batt` | running on battery |
 
 Unreadable sources are skipped. Observations appear in the console and

@@ -1876,6 +1876,14 @@ fn print_resolved_config(suite: &str, resolved: &ResolvedStressConfig) {
             .map_or("unknown", String::as_str)
     );
     println!("Progress: {}", resolved.config.progress);
+    println!(
+        "Require quiet env: {} ({})",
+        resolved.config.require_quiet_env,
+        resolved
+            .metadata
+            .get("require_quiet_env_src")
+            .map_or("unknown", String::as_str)
+    );
 }
 
 fn source_for<F>(get_var: &F, env_key: &'static str) -> String

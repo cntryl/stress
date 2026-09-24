@@ -45,6 +45,11 @@ pub(crate) fn linux_observations(
     root: &Path,
     core_count: Option<usize>,
 ) -> Vec<EnvironmentObservation> {
+    // `available_parallelism` already honors cgroup quotas and affinity, so
+    // compare load and quota against the host's online CPUs when known.
+    let core_count = read_trimmed(&root.join("sys/devices/system/cpu/online"))
+        .and_then(|list| parse_cpu_list(&list))
+        .or(core_count);
     [
         governor_observation(root),
         boost_observation(root),
@@ -143,28 +148,101 @@ fn load_observation(root: &Path, core_count: Option<usize>) -> Option<Environmen
     ))
 }
 
-/// CPU quota in CPUs from cgroup v2 `cpu.max` or v1 CFS files, when limited.
-fn cgroup_cpu_quota(root: &Path) -> Option<f64> {
-    let cgroup = root.join("sys/fs/cgroup");
-    let (quota, period) = if let Some(max) = read_trimmed(&cgroup.join("cpu.max")) {
-        let mut parts = max.split_whitespace();
-        let quota = parts.next()?;
-        let period = parts.next()?;
-        (quota.parse::<f64>().ok()?, period.parse::<f64>().ok()?)
-    } else {
-        let v1 = cgroup.join("cpu");
-        (
-            read_trimmed(&v1.join("cpu.cfs_quota_us"))?
-                .parse::<f64>()
-                .ok()?,
-            read_trimmed(&v1.join("cpu.cfs_period_us"))?
-                .parse::<f64>()
-                .ok()?,
-        )
-    };
+/// Count CPUs in a Linux CPU list such as `0-3,8,10-11`.
+pub(crate) fn parse_cpu_list(list: &str) -> Option<usize> {
+    list.trim().split(',').try_fold(0usize, |count, part| {
+        let part = part.trim();
+        let (start, end) = part.split_once('-').unwrap_or((part, part));
+        let start = start.parse::<usize>().ok()?;
+        let end = end.parse::<usize>().ok()?;
+        (end >= start).then(|| count + (end - start + 1))
+    })
+}
+
+/// Controller path for the current process from `/proc/self/cgroup`: the v2
+/// unified path (`0::/path`), or `<controllers>/path` for the v1 hierarchy
+/// whose controller list includes `cpu`.
+fn process_cgroup_path(root: &Path, v2: bool) -> Option<String> {
+    let content = std::fs::read_to_string(root.join("proc/self/cgroup")).ok()?;
+    content.lines().find_map(|line| {
+        let mut parts = line.splitn(3, ':');
+        let _id = parts.next()?;
+        let controllers = parts.next()?;
+        let path = parts.next()?;
+        if v2 {
+            controllers.is_empty().then(|| path.to_string())
+        } else {
+            controllers
+                .split(',')
+                .any(|controller| controller == "cpu")
+                .then(|| format!("{controllers}{path}"))
+        }
+    })
+}
+
+/// Directories from `base/relative` up to `base`, nearest first.
+fn ancestors_within(base: &Path, relative: &str) -> Vec<std::path::PathBuf> {
+    let mut dirs = vec![base.to_path_buf()];
+    let mut current = base.to_path_buf();
+    for component in relative
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != "." && *part != "..")
+    {
+        current.push(component);
+        dirs.push(current.clone());
+    }
+    dirs.reverse();
+    dirs
+}
+
+fn quota_ratio(quota: &str, period: &str) -> Option<f64> {
+    let quota = quota.trim().parse::<f64>().ok()?;
+    let period = period.trim().parse::<f64>().ok()?;
     (quota > 0.0 && period > 0.0)
         .then(|| quota / period)
         .filter(|cpus| cpus.is_finite())
+}
+
+/// Tightest cgroup v2 `cpu.max` quota along the process cgroup's ancestry.
+fn cgroup_v2_quota(root: &Path) -> Option<f64> {
+    let base = root.join("sys/fs/cgroup");
+    let relative = process_cgroup_path(root, true).unwrap_or_default();
+    ancestors_within(&base, &relative)
+        .iter()
+        .filter_map(|dir| read_trimmed(&dir.join("cpu.max")))
+        .filter_map(|max| {
+            let mut parts = max.split_whitespace();
+            quota_ratio(parts.next()?, parts.next()?)
+        })
+        .reduce(f64::min)
+}
+
+/// Tightest cgroup v1 CFS quota along the process cgroup's ancestry.
+fn cgroup_v1_quota(root: &Path) -> Option<f64> {
+    let base = root.join("sys/fs/cgroup");
+    let candidates = match process_cgroup_path(root, false) {
+        Some(path) => {
+            let (controllers, relative) = path.split_once('/').unwrap_or((path.as_str(), ""));
+            let mut candidates = ancestors_within(&base.join(controllers), relative);
+            candidates.extend(ancestors_within(&base.join("cpu"), relative));
+            candidates
+        }
+        None => vec![base.join("cpu")],
+    };
+    candidates
+        .iter()
+        .filter_map(|dir| {
+            quota_ratio(
+                &read_trimmed(&dir.join("cpu.cfs_quota_us"))?,
+                &read_trimmed(&dir.join("cpu.cfs_period_us"))?,
+            )
+        })
+        .reduce(f64::min)
+}
+
+/// CPU quota in CPUs from cgroup v2 `cpu.max` or v1 CFS files, when limited.
+fn cgroup_cpu_quota(root: &Path) -> Option<f64> {
+    cgroup_v2_quota(root).or_else(|| cgroup_v1_quota(root))
 }
 
 fn cpu_quota_observation(root: &Path, core_count: Option<usize>) -> Option<EnvironmentObservation> {
@@ -377,6 +455,61 @@ mod tests {
         root.write("sys/fs/cgroup/cpu/cpu.cfs_quota_us", "-1\n")
             .write("sys/fs/cgroup/cpu/cpu.cfs_period_us", "100000\n");
         assert!(linux_observations(&root.0, Some(4)).is_empty());
+    }
+
+    #[test]
+    fn online_host_cpus_are_the_denominator_not_the_quota_limited_parallelism() {
+        // available_parallelism() already reflects the cgroup quota, so a
+        // 2-CPU container on a 64-CPU host must still be flagged.
+        let root = FakeRoot::new("online");
+        root.write("sys/devices/system/cpu/online", "0-63\n")
+            .write("sys/fs/cgroup/cpu.max", "200000 100000\n")
+            .write("proc/loadavg", "40.00 1 1 1/1 1\n");
+        let observations = linux_observations(&root.0, Some(2));
+        let quota = find(&observations, "cpu_quota");
+        assert_eq!(quota.value, "2.00 CPUs (64 cores)");
+        assert!(quota.adverse);
+        let load = find(&observations, "load_average");
+        assert_eq!(load.value, "40.00 (64 cores)");
+        assert!(load.adverse);
+
+        assert_eq!(parse_cpu_list("0-3,8,10-11"), Some(7));
+        assert_eq!(parse_cpu_list("0"), Some(1));
+        assert_eq!(parse_cpu_list("x"), None);
+    }
+
+    #[test]
+    fn cgroup_v2_reads_the_process_cgroup_and_takes_the_tightest_ancestor() {
+        let root = FakeRoot::new("cg2-nested");
+        root.write("proc/self/cgroup", "0::/user.slice/app.scope\n")
+            .write("sys/fs/cgroup/user.slice/cpu.max", "100000 100000\n")
+            .write("sys/fs/cgroup/user.slice/app.scope/cpu.max", "max 100000\n");
+        let observations = linux_observations(&root.0, Some(4));
+        let quota = find(&observations, "cpu_quota");
+        assert_eq!(quota.value, "1.00 CPUs (4 cores)");
+        assert!(quota.adverse);
+    }
+
+    #[test]
+    fn cgroup_v1_reads_the_cpu_controller_path() {
+        let root = FakeRoot::new("cg1-nested");
+        root.write(
+            "proc/self/cgroup",
+            "12:memory:/docker/abc\n4:cpu,cpuacct:/docker/abc\n",
+        )
+        .write(
+            "sys/fs/cgroup/cpu,cpuacct/docker/abc/cpu.cfs_quota_us",
+            "50000\n",
+        )
+        .write(
+            "sys/fs/cgroup/cpu,cpuacct/docker/abc/cpu.cfs_period_us",
+            "100000\n",
+        );
+        let observations = linux_observations(&root.0, Some(4));
+        assert_eq!(
+            find(&observations, "cpu_quota").value,
+            "0.50 CPUs (4 cores)"
+        );
     }
 
     #[test]
