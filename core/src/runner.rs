@@ -6,8 +6,9 @@ use crate::artifact::{
     attach_timer_resolution_evidence, compare_summaries_with_specs, diagnostic_summary_for_run,
     incompatible_environment_reason, pooled_baseline_summaries, summarize_benchmark,
     BenchmarkModeKind, BenchmarkSpec, BenchmarkSummary, ComparisonClass, ComparisonResult,
-    ConfirmationRun, EnvironmentInfo, MeasurementIntent, RunProfile, Sample, SamplePhase, SourceLocation, StressRun, MAX_TIER, SCHEMA_VERSION,
-    SUMMARY_SEMANTICS_CURRENT, SUMMARY_SEMANTICS_METADATA_KEY,
+    ConfirmationRun, EnvironmentInfo, MeasurementIntent, RunProfile, Sample, SamplePhase,
+    SourceLocation, StressRun, MAX_TIER, SCHEMA_VERSION, SUMMARY_SEMANTICS_CURRENT,
+    SUMMARY_SEMANTICS_METADATA_KEY,
 };
 use crate::config::StressRunnerConfig;
 use crate::context::{MeasurementRecord, StressContext};
@@ -605,7 +606,10 @@ impl StressRunner {
             .benchmark_specs
             .iter()
             .filter(|candidate| {
-                self.measurement_bases.get(&candidate.id).map(String::as_str) == Some(base_id)
+                self.measurement_bases
+                    .get(&candidate.id)
+                    .map(String::as_str)
+                    == Some(base_id)
             })
             .collect::<Vec<_>>();
         let topology_matches = expected.len() == topology.spec_order.len()
@@ -2902,8 +2906,11 @@ mod tests {
 
     fn write_baseline(name: &str, run: &StressRun) -> std::path::PathBuf {
         let path = unique_temp_path(name);
-        std::fs::write(&path, serde_json::to_string(run).expect("serialize baseline"))
-            .expect("write baseline");
+        std::fs::write(
+            &path,
+            serde_json::to_string(run).expect("serialize baseline"),
+        )
+        .expect("write baseline");
         path
     }
 
@@ -3004,7 +3011,10 @@ mod tests {
         assert_eq!(pool.summaries[0].measured_samples, 20);
 
         let run = runner.finish_with_baseline_pool(&pool);
-        assert_eq!(run.metadata.get("baseline_runs_pooled"), Some(&"2".to_string()));
+        assert_eq!(
+            run.metadata.get("baseline_runs_pooled"),
+            Some(&"2".to_string())
+        );
         assert!(run
             .metadata
             .get("baseline_runs_skipped")
@@ -3016,7 +3026,7 @@ mod tests {
 
         // max_runs caps the pool including the anchor.
         let capped = external_throughput_runner(1_000)
-            .load_baseline_pool(&anchor_path, &[older_path.clone()], 1)
+            .load_baseline_pool(&anchor_path, std::slice::from_ref(&older_path), 1)
             .expect("capped pool");
         assert_eq!(capped.pooled_runs.len(), 1);
 
@@ -3032,9 +3042,7 @@ mod tests {
         let slow = Duration::from_micros(10_600);
 
         let (unconfirmed, _) = timed_runner(10, slow);
-        let pool = unconfirmed
-            .load_baseline_pool(&path, &[], 1)
-            .expect("pool");
+        let pool = unconfirmed.load_baseline_pool(&path, &[], 1).expect("pool");
         let mut run = unconfirmed.finish_with_baseline_pool(&pool);
         run.environment.profile_config.fail_on_regression = true;
         assert_eq!(evaluate_run_gate(&run), RunGate::RegressionFailed);
@@ -3047,7 +3055,12 @@ mod tests {
         let mut run = runner.finish_with_baseline_pool(&pool);
         run.environment.profile_config.fail_on_regression = true;
 
-        assert_eq!(run.confirmation_runs.len(), 1, "{:?}", run.confirmation_runs);
+        assert_eq!(
+            run.confirmation_runs.len(),
+            1,
+            "{:?}",
+            run.confirmation_runs
+        );
         let attempt = &run.confirmation_runs[0];
         assert_eq!(attempt.attempt, 1);
         assert_eq!(attempt.benchmark_ids, vec!["suite/bench".to_string()]);
@@ -3059,10 +3072,18 @@ mod tests {
         assert_eq!(attempt.samples_added, 10);
         assert_eq!(run.samples.len(), 20);
         assert_eq!(run.summaries[0].measured_samples, 20);
-        assert!(run.summaries[0].source.is_some(), "confirmation keeps the source");
+        assert!(
+            run.summaries[0].source.is_some(),
+            "confirmation keeps the source"
+        );
         run.canonical_baseline_summaries()
             .expect("a confirmed run is internally consistent");
-        assert_eq!(evaluate_run_gate(&run), RunGate::Passed, "{:?}", run.comparisons);
+        assert_eq!(
+            evaluate_run_gate(&run),
+            RunGate::Passed,
+            "{:?}",
+            run.comparisons
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -3103,9 +3124,12 @@ mod tests {
         let pool = runner.load_baseline_pool(&path, &[], 1).expect("pool");
         runner.confirm_regressions(&pool, 3, |runner, _| {
             runner
-                .confirm_spec("suite/bench", |_ctx: &mut StressContext| -> crate::error::StressResult {
-                    Err(crate::error::StressError::new("boom"))
-                })
+                .confirm_spec(
+                    "suite/bench",
+                    |_ctx: &mut StressContext| -> crate::error::StressResult {
+                        Err(crate::error::StressError::new("boom"))
+                    },
+                )
                 .map(|_| ())
         });
         let mut run = runner.finish_with_baseline_pool(&pool);

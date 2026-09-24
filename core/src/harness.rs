@@ -69,6 +69,8 @@ struct StressBinaryArgs {
     baseline: Option<PathBuf>,
     baseline_dir: Option<PathBuf>,
     save_baseline: Option<bool>,
+    baseline_runs: Option<NonZeroU64>,
+    confirm_regressions: Option<usize>,
     threshold: Option<f64>,
     fail_on_issues: Option<bool>,
     deny_diagnostics: Option<DiagnosticSeverity>,
@@ -90,6 +92,8 @@ struct ResolvedStressConfig {
     baseline: Option<PathBuf>,
     baseline_dir: PathBuf,
     save_baseline: bool,
+    baseline_runs: usize,
+    confirm_regressions: usize,
     print_config: bool,
     github_actions: Option<GitHubActionsSettings>,
 }
@@ -241,6 +245,19 @@ impl StressBinaryArgs {
                 "--save-baseline" => {
                     result.save_baseline = Some(true);
                 }
+                "--baseline-runs" => {
+                    let value = required_flag_value(args, &mut index, "--baseline-runs")?;
+                    result.baseline_runs =
+                        Some(parse_positive_flag_value("--baseline-runs", value)?);
+                }
+                "--confirm-regressions" => {
+                    let value = required_flag_value(args, &mut index, "--confirm-regressions")?;
+                    result.confirm_regressions = Some(parse_flag_value(
+                        "--confirm-regressions",
+                        value,
+                        "a non-negative integer",
+                    )?);
+                }
                 "--threshold" => {
                     let value = required_flag_value(args, &mut index, "--threshold")?;
                     let expected = "a finite fraction from 0 to 1 (0.05 means 5%)";
@@ -327,6 +344,8 @@ fn singleton_argument(argument: &str) -> Option<&'static str> {
         "--baseline" => Some("--baseline"),
         "--baseline-dir" => Some("--baseline-dir"),
         "--save-baseline" => Some("--save-baseline"),
+        "--baseline-runs" => Some("--baseline-runs"),
+        "--confirm-regressions" => Some("--confirm-regressions"),
         "--threshold" => Some("--threshold"),
         "--fail-on-issues" => Some("--fail-on-issues"),
         "--deny-diagnostics" => Some("--deny-diagnostics"),
@@ -400,6 +419,12 @@ fn print_help() {
         "    --baseline-dir <PATH>          Baseline directory (default target/stress/baselines)"
     );
     eprintln!("    --save-baseline                Save passed runs under baseline-dir");
+    eprintln!(
+        "    --baseline-runs <N>            Keep/pool the N most recent saved runs (default 1)"
+    );
+    eprintln!(
+        "    --confirm-regressions <K>      Re-run regressed benchmarks up to K times (default 0)"
+    );
     eprintln!("    --threshold <FRACTION>         Regression fraction (0.05 means 5%)");
     eprintln!("    --fail-on-issues               Fail on warning-or-error diagnostics");
     eprintln!("    --deny-diagnostics <LEVEL>     Fail on diagnostics at info, warning, or error");
@@ -484,6 +509,10 @@ pub struct StressRunnerOptions {
     pub baseline_dir: Option<PathBuf>,
     /// Optional save-passed-runs override.
     pub save_baseline: Option<bool>,
+    /// How many recent saved baseline runs to retain and pool.
+    pub baseline_runs: Option<NonZeroU64>,
+    /// How many times to re-run benchmarks with regression rows.
+    pub confirm_regressions: Option<usize>,
     /// Regression threshold in percentage points (`5.0` means five percent).
     pub threshold_percent: Option<f64>,
     /// Strict diagnostic gate threshold.
@@ -596,6 +625,24 @@ impl StressRunnerOptions {
         self
     }
 
+    /// Retain and pool up to `runs` recent saved baseline runs per suite.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `runs` is zero.
+    #[must_use]
+    pub fn baseline_runs(mut self, runs: u64) -> Self {
+        self.baseline_runs = Some(NonZeroU64::new(runs).expect("baseline runs must be positive"));
+        self
+    }
+
+    /// Re-run benchmarks with regression rows up to `attempts` times.
+    #[must_use]
+    pub const fn confirm_regressions(mut self, attempts: usize) -> Self {
+        self.confirm_regressions = Some(attempts);
+        self
+    }
+
     /// Set the regression threshold in percentage points (`5.0` means 5%).
     ///
     /// # Panics
@@ -688,6 +735,8 @@ fn binary_args_from_options(options: StressRunnerOptions) -> StressBinaryArgs {
         baseline: options.baseline,
         baseline_dir: options.baseline_dir,
         save_baseline: options.save_baseline,
+        baseline_runs: options.baseline_runs,
+        confirm_regressions: options.confirm_regressions,
         threshold: options
             .threshold_percent
             .map(|threshold_percent| threshold_percent / 100.0),
@@ -759,6 +808,37 @@ where
     metadata.insert(
         "save_baseline_src".to_string(),
         source_for(&get_var, "STRESS_SAVE_BASELINE"),
+    );
+
+    let mut baseline_runs = get_var("STRESS_BASELINE_RUNS")
+        .and_then(|value| {
+            let parsed = value.trim().parse::<NonZeroU64>().ok();
+            if parsed.is_none() {
+                warnings
+                    .push("invalid STRESS_BASELINE_RUNS; expected a positive integer".to_string());
+            }
+            parsed
+        })
+        .map_or(1, |runs| usize::try_from(runs.get()).unwrap_or(usize::MAX));
+    metadata.insert(
+        "baseline_runs_src".to_string(),
+        source_for(&get_var, "STRESS_BASELINE_RUNS"),
+    );
+    let mut confirm_regressions = get_var("STRESS_CONFIRM_REGRESSIONS")
+        .and_then(|value| {
+            let parsed = value.trim().parse::<usize>().ok();
+            if parsed.is_none() {
+                warnings.push(
+                    "invalid STRESS_CONFIRM_REGRESSIONS; expected a non-negative integer"
+                        .to_string(),
+                );
+            }
+            parsed
+        })
+        .unwrap_or(0);
+    metadata.insert(
+        "confirm_regressions_src".to_string(),
+        source_for(&get_var, "STRESS_CONFIRM_REGRESSIONS"),
     );
 
     if let Some(tier) = args.tier {
@@ -848,6 +928,20 @@ where
             "cli --save-baseline".to_string(),
         );
     }
+    if let Some(runs) = args.baseline_runs {
+        baseline_runs = usize::try_from(runs.get()).unwrap_or(usize::MAX);
+        metadata.insert(
+            "baseline_runs_src".to_string(),
+            "cli --baseline-runs".to_string(),
+        );
+    }
+    if let Some(attempts) = args.confirm_regressions {
+        confirm_regressions = attempts;
+        metadata.insert(
+            "confirm_regressions_src".to_string(),
+            "cli --confirm-regressions".to_string(),
+        );
+    }
     if let Some(threshold) = args.threshold {
         config.threshold = threshold;
         metadata.insert("threshold_src".to_string(), "cli --threshold".to_string());
@@ -923,6 +1017,8 @@ where
         baseline,
         baseline_dir,
         save_baseline,
+        baseline_runs,
+        confirm_regressions,
         print_config: args.print_config,
     }
 }
@@ -1013,6 +1109,20 @@ fn run_spec_with_timeout(
     func: fn(&mut StressContext) -> StressResult,
     timeout: Duration,
 ) -> Result<(), SpecRunError> {
+    with_timeout_invoker(spec, func, timeout, |invoke| {
+        runner.run_spec_at(spec, source, invoke);
+    })
+    .1
+}
+
+/// Drive `func` through `drive` with every invocation on one isolated worker
+/// thread under a shared deadline (see [`run_spec_with_timeout`]).
+fn with_timeout_invoker<R>(
+    spec: &BenchmarkSpec,
+    func: fn(&mut StressContext) -> StressResult,
+    timeout: Duration,
+    drive: impl FnOnce(&dyn Fn(&mut StressContext) -> StressResult) -> R,
+) -> (R, Result<(), SpecRunError>) {
     let deadline = std::time::Instant::now() + timeout;
     let failure: std::cell::RefCell<Option<SpecRunError>> = std::cell::RefCell::new(None);
     let worker: std::cell::RefCell<Option<IsolatedWorker>> = std::cell::RefCell::new(None);
@@ -1037,12 +1147,12 @@ fn run_spec_with_timeout(
             }
         }
     };
-    runner.run_spec_at(spec, source, invoke);
+    let result = drive(&invoke);
     let failure = failure.into_inner();
     if let Some(worker) = worker.into_inner() {
         worker.finish(failure.is_none());
     }
-    failure.map_or(Ok(()), Err)
+    (result, failure.map_or(Ok(()), Err))
 }
 
 type InvocationReply = (StressContext, StressResult);
@@ -1159,6 +1269,7 @@ fn harness_reporters(resolved: &ResolvedStressConfig) -> Vec<Box<dyn Reporter>> 
         reporters.push(Box::new(BaselineReporter::new(
             &resolved.baseline_dir,
             resolved.artifact_namespace.as_deref(),
+            resolved.baseline_runs,
         )));
     }
     if let Some(settings) = &resolved.github_actions {
@@ -1169,6 +1280,7 @@ fn harness_reporters(resolved: &ResolvedStressConfig) -> Vec<Box<dyn Reporter>> 
     reporters
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_with_resolved_config(resolved: ResolvedStressConfig) {
     exit_on_invalid_config(&resolved.config);
 
@@ -1204,6 +1316,11 @@ fn run_with_resolved_config(resolved: ResolvedStressConfig) {
             std::process::exit(2);
         }
     }
+    let extras = if baseline.is_some() {
+        baseline_pool_candidates(&resolved, &suite_name)
+    } else {
+        Vec::new()
+    };
     let config_for_specs = resolved.config.clone();
     let extra_reporters = harness_reporters(&resolved);
     let mut runner =
@@ -1213,6 +1330,7 @@ fn run_with_resolved_config(resolved: ResolvedStressConfig) {
     }
 
     let mut aborted: Option<SpecRunError> = None;
+    let mut ran = BTreeMap::<String, RegisteredBenchmark>::new();
     for entry in benchmarks {
         let stable_name = format!("{}::{}", entry.module_path, entry.function_name);
         let display_name = format!("{}::{}", entry.module_path, entry.name);
@@ -1233,6 +1351,7 @@ fn run_with_resolved_config(resolved: ResolvedStressConfig) {
             metadata,
         };
         let source = Some(crate::artifact::SourceLocation::new(entry.file, entry.line));
+        ran.insert(spec.id.clone(), (spec.clone(), entry.func));
         if let Some(timeout) = config_for_specs.timeout {
             if let Err(error) =
                 run_spec_with_timeout(&mut runner, &spec, source.as_ref(), entry.func, timeout)
@@ -1250,13 +1369,36 @@ fn run_with_resolved_config(resolved: ResolvedStressConfig) {
     }
 
     let run_result = if let Some(baseline_path) = baseline {
-        runner.finish_with_baseline(baseline_path)
+        match runner.load_baseline_pool(&baseline_path, &extras, resolved.baseline_runs) {
+            Ok(pool) => {
+                for note in &pool.skipped {
+                    eprintln!("Stress baseline run skipped from the pool: {note}");
+                }
+                if aborted.is_none() && resolved.confirm_regressions > 0 {
+                    aborted = confirm_regressions_in_harness(
+                        &mut runner,
+                        &pool,
+                        resolved.confirm_regressions,
+                        &ran,
+                        config_for_specs.timeout,
+                    );
+                }
+                Ok(runner.finish_with_baseline_pool(&pool))
+            }
+            Err(error) => Err(error),
+        }
     } else {
         Ok(runner.finish())
     };
 
     match run_result {
         Ok(run) => {
+            if config_for_specs.json_stdout {
+                // Human output already shows these; keep JSON stdout clean.
+                for line in crate::reporting::noise_gating_lines(&run) {
+                    eprintln!("Stress {line}");
+                }
+            }
             let gate = evaluate_run_gate(&run);
             if gate != RunGate::Passed {
                 eprintln!("Stress run failed: {gate:?}");
@@ -1273,6 +1415,62 @@ fn run_with_resolved_config(resolved: ResolvedStressConfig) {
             std::process::exit(aborted.map_or(1, |error| error.exit_code()));
         }
     }
+}
+
+type RegisteredBenchmark = (BenchmarkSpec, fn(&mut StressContext) -> StressResult);
+
+/// Re-run regressed benchmarks through the same (optionally timed) path as the
+/// main run. Returns the first timeout/panic so the caller exits non-zero.
+fn confirm_regressions_in_harness(
+    runner: &mut StressRunner,
+    pool: &crate::runner::BaselinePool,
+    attempts: usize,
+    ran: &BTreeMap<String, RegisteredBenchmark>,
+    timeout: Option<Duration>,
+) -> Option<SpecRunError> {
+    let mut aborted = None;
+    runner.confirm_regressions(pool, attempts, |runner, base_id| {
+        let (spec, func) = ran
+            .get(base_id)
+            .ok_or_else(|| format!("benchmark {base_id:?} was not run"))?;
+        let Some(timeout) = timeout else {
+            return runner.confirm_spec(base_id, *func).map(|_| ());
+        };
+        let (result, failure) = with_timeout_invoker(spec, *func, timeout, |invoke| {
+            runner.confirm_spec(base_id, invoke)
+        });
+        if let Err(error) = failure {
+            eprintln!("Stress confirmation run failed: {error}");
+            aborted = Some(error);
+        }
+        result.map(|_| ())
+    });
+    aborted
+}
+
+/// Extra saved runs to pool with `--baseline latest`, newest first.
+fn baseline_pool_candidates(resolved: &ResolvedStressConfig, suite: &str) -> Vec<PathBuf> {
+    if resolved.baseline_runs <= 1 {
+        return Vec::new();
+    }
+    if resolved
+        .baseline
+        .as_deref()
+        .is_none_or(|configured| configured.as_os_str() != "latest")
+    {
+        eprintln!(
+            "Stress note: --baseline-runs pools saved runs only with --baseline latest; comparing against the single explicit baseline."
+        );
+        return Vec::new();
+    }
+    timestamped_baseline_runs(
+        &resolved.baseline_dir,
+        resolved.artifact_namespace.as_deref(),
+        suite,
+    )
+    .into_iter()
+    .take(resolved.baseline_runs)
+    .collect()
 }
 
 fn empty_selection_error(resolved: &ResolvedStressConfig) -> String {
@@ -1613,6 +1811,22 @@ fn print_resolved_config(suite: &str, resolved: &ResolvedStressConfig) {
             .map_or("unknown", String::as_str)
     );
     println!(
+        "Baseline runs: {} ({})",
+        resolved.baseline_runs,
+        resolved
+            .metadata
+            .get("baseline_runs_src")
+            .map_or("unknown", String::as_str)
+    );
+    println!(
+        "Confirm regressions: {} ({})",
+        resolved.confirm_regressions,
+        resolved
+            .metadata
+            .get("confirm_regressions_src")
+            .map_or("unknown", String::as_str)
+    );
+    println!(
         "Threshold: {} ({})",
         resolved.config.threshold,
         resolved
@@ -1707,6 +1921,7 @@ fn save_baseline_artifacts(
     run: &StressRun,
     baseline_dir: &std::path::Path,
     artifact_namespace: Option<&str>,
+    retain_runs: usize,
 ) -> std::io::Result<()> {
     ensure_baseline_save_eligible(run)?;
     let timestamped = baseline_path(
@@ -1726,19 +1941,77 @@ fn save_baseline_artifacts(
         std::fs::create_dir_all(parent)?;
     }
     atomic_write(&latest, json.as_bytes())?;
+    if retain_runs > 1 {
+        prune_timestamped_baselines(baseline_dir, artifact_namespace, &run.suite, retain_runs)?;
+    }
+    Ok(())
+}
+
+/// Saved timestamped runs of `suite`, newest first. `latest` is excluded.
+fn timestamped_baseline_runs(
+    baseline_dir: &std::path::Path,
+    artifact_namespace: Option<&str>,
+    suite: &str,
+) -> Vec<PathBuf> {
+    let mut root = baseline_dir.to_path_buf();
+    if let Some(namespace) = artifact_namespace {
+        root.push(namespace);
+    }
+    let file_name = format!("{}.json", baseline_suite_name(suite));
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut buckets = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|bucket| bucket != "latest")
+        .filter(|bucket| root.join(bucket).join(&file_name).is_file())
+        .collect::<Vec<_>>();
+    // Run timestamp stems are fixed-width and lexically sortable.
+    buckets.sort_unstable_by(|left, right| right.cmp(left));
+    buckets
+        .into_iter()
+        .map(|bucket| root.join(bucket).join(&file_name))
+        .collect()
+}
+
+/// Remove this suite's timestamped runs beyond the `retain_runs` newest.
+fn prune_timestamped_baselines(
+    baseline_dir: &std::path::Path,
+    artifact_namespace: Option<&str>,
+    suite: &str,
+    retain_runs: usize,
+) -> std::io::Result<()> {
+    for stale in timestamped_baseline_runs(baseline_dir, artifact_namespace, suite)
+        .into_iter()
+        .skip(retain_runs)
+    {
+        std::fs::remove_file(&stale)?;
+        if let Some(bucket) = stale.parent() {
+            // Other suites may share the bucket; only drop it when empty.
+            let _ = std::fs::remove_dir(bucket);
+        }
+    }
     Ok(())
 }
 
 struct BaselineReporter {
     baseline_dir: PathBuf,
     artifact_namespace: Option<String>,
+    retain_runs: usize,
 }
 
 impl BaselineReporter {
-    fn new(baseline_dir: impl Into<PathBuf>, artifact_namespace: Option<&str>) -> Self {
+    fn new(
+        baseline_dir: impl Into<PathBuf>,
+        artifact_namespace: Option<&str>,
+        retain_runs: usize,
+    ) -> Self {
         Self {
             baseline_dir: baseline_dir.into(),
             artifact_namespace: artifact_namespace.map(str::to_string),
+            retain_runs,
         }
     }
 }
@@ -1748,10 +2021,15 @@ impl Reporter for BaselineReporter {
         if evaluate_run_gate(run) != RunGate::Passed {
             return Ok(());
         }
-        save_baseline_artifacts(run, &self.baseline_dir, self.artifact_namespace.as_deref())
-            .map_err(|error| {
-                std::io::Error::new(error.kind(), format!("failed to save baseline: {error}"))
-            })
+        save_baseline_artifacts(
+            run,
+            &self.baseline_dir,
+            self.artifact_namespace.as_deref(),
+            self.retain_runs,
+        )
+        .map_err(|error| {
+            std::io::Error::new(error.kind(), format!("failed to save baseline: {error}"))
+        })
     }
 }
 
@@ -2651,7 +2929,7 @@ mod tests {
         let baseline_dir = unique_temp_dir("stress-baseline-save");
         let run = eligible_baseline_run("suite-name");
 
-        save_baseline_artifacts(&run, &baseline_dir, None).expect("save baseline");
+        save_baseline_artifacts(&run, &baseline_dir, None, 1).expect("save baseline");
 
         let timestamped = baseline_path(&baseline_dir, None, &run.started_at, &run.suite);
         let latest = baseline_path(&baseline_dir, None, "latest", &run.suite);
@@ -2661,6 +2939,115 @@ mod tests {
         assert_eq!(latest_run.suite, "suite-name");
 
         let _ = std::fs::remove_dir_all(&baseline_dir);
+    }
+
+    #[test]
+    fn multi_run_baselines_retain_the_most_recent_runs_per_suite() {
+        let baseline_dir = unique_temp_dir("stress-baseline-retain");
+        let runs = (0..4)
+            .map(|_| eligible_baseline_run("suite-name"))
+            .collect::<Vec<_>>();
+        let other_suite = eligible_baseline_run("other-suite");
+        save_baseline_artifacts(&other_suite, &baseline_dir, None, 2).expect("save other");
+        for run in &runs {
+            save_baseline_artifacts(run, &baseline_dir, None, 2).expect("save baseline");
+        }
+
+        let retained = timestamped_baseline_runs(&baseline_dir, None, "suite-name");
+        assert_eq!(
+            retained,
+            vec![
+                baseline_path(&baseline_dir, None, &runs[3].started_at, "suite-name"),
+                baseline_path(&baseline_dir, None, &runs[2].started_at, "suite-name"),
+            ]
+        );
+        assert!(
+            !baseline_path(&baseline_dir, None, &runs[0].started_at, "suite-name")
+                .parent()
+                .expect("parent")
+                .exists()
+        );
+        assert!(baseline_path(&baseline_dir, None, "latest", "suite-name").exists());
+        assert_eq!(
+            timestamped_baseline_runs(&baseline_dir, None, "other-suite").len(),
+            1,
+            "pruning one suite never touches another"
+        );
+
+        let _ = std::fs::remove_dir_all(&baseline_dir);
+    }
+
+    #[test]
+    fn single_run_baselines_keep_every_timestamped_run() {
+        let baseline_dir = unique_temp_dir("stress-baseline-retain-one");
+        for _ in 0..3 {
+            let run = eligible_baseline_run("suite-name");
+            save_baseline_artifacts(&run, &baseline_dir, None, 1).expect("save baseline");
+        }
+        assert_eq!(
+            timestamped_baseline_runs(&baseline_dir, None, "suite-name").len(),
+            3
+        );
+        let _ = std::fs::remove_dir_all(&baseline_dir);
+    }
+
+    #[test]
+    fn noise_flags_parse_resolve_and_default_to_unchanged_behavior() {
+        let parsed = StressBinaryArgs::parse_from_args(&[
+            "bench".to_string(),
+            "--baseline-runs".to_string(),
+            "3".to_string(),
+            "--confirm-regressions".to_string(),
+            "2".to_string(),
+        ])
+        .expect("parse");
+        assert_eq!(parsed.baseline_runs, NonZeroU64::new(3));
+        assert_eq!(parsed.confirm_regressions, Some(2));
+        for bad in [
+            vec!["--baseline-runs", "0"],
+            vec!["--confirm-regressions", "-1"],
+            vec!["--baseline-runs", "2", "--baseline-runs", "3"],
+        ] {
+            let mut args = vec!["bench".to_string()];
+            args.extend(bad.iter().map(|value| (*value).to_string()));
+            assert!(StressBinaryArgs::parse_from_args(&args).is_err(), "{bad:?}");
+        }
+
+        let defaults = resolve_from_binary_args_with(&StressBinaryArgs::default(), |_| None);
+        assert_eq!(defaults.baseline_runs, 1);
+        assert_eq!(defaults.confirm_regressions, 0);
+
+        let env = |key: &str| match key {
+            "STRESS_BASELINE_RUNS" => Some("4".to_string()),
+            "STRESS_CONFIRM_REGRESSIONS" => Some("3".to_string()),
+            _ => None,
+        };
+        let from_env = resolve_from_binary_args_with(&StressBinaryArgs::default(), env);
+        assert_eq!(from_env.baseline_runs, 4);
+        assert_eq!(from_env.confirm_regressions, 3);
+        let from_cli = resolve_from_binary_args_with(&parsed, env);
+        assert_eq!(from_cli.baseline_runs, 3);
+        assert_eq!(from_cli.confirm_regressions, 2);
+        assert_eq!(
+            from_cli.metadata.get("baseline_runs_src"),
+            Some(&"cli --baseline-runs".to_string())
+        );
+
+        let invalid = resolve_from_binary_args_with(&StressBinaryArgs::default(), |key| {
+            (key == "STRESS_BASELINE_RUNS").then(|| "0".to_string())
+        });
+        assert_eq!(invalid.baseline_runs, 1);
+        assert!(invalid
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("STRESS_BASELINE_RUNS")));
+
+        let options = StressRunnerOptions::new()
+            .baseline_runs(5)
+            .confirm_regressions(1);
+        let args = binary_args_from_options(options);
+        assert_eq!(args.baseline_runs, NonZeroU64::new(5));
+        assert_eq!(args.confirm_regressions, Some(1));
     }
 
     #[test]
@@ -2684,7 +3071,7 @@ mod tests {
             .expect("create latest parent");
         std::fs::write(&latest, b"accepted previous baseline").expect("write previous latest");
 
-        let error = save_baseline_artifacts(&run, &baseline_dir, None)
+        let error = save_baseline_artifacts(&run, &baseline_dir, None, 1)
             .expect_err("smoke-quality evidence cannot become a baseline");
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
@@ -2711,6 +3098,7 @@ mod tests {
         runner.reporters(vec![Box::new(BaselineReporter::new(
             &blocking_baseline_dir,
             None,
+            1,
         ))]);
         runner.run("bench", |ctx| {
             ctx.record_external("work", Duration::from_millis(10), 500);
@@ -2734,7 +3122,11 @@ mod tests {
             .warmup_samples(0)
             .cooldown_samples(0);
         let mut runner = StressRunner::with_config("suite-name", config);
-        runner.reporters(vec![Box::new(BaselineReporter::new(&baseline_dir, None))]);
+        runner.reporters(vec![Box::new(BaselineReporter::new(
+            &baseline_dir,
+            None,
+            1,
+        ))]);
         runner.run("bench", |ctx| {
             ctx.measure("work", || {});
             let _ = ctx.correctness().attempted(1).completed(0).failures(1);
@@ -2760,9 +3152,9 @@ mod tests {
             .metadata
             .insert("fixture_package".to_string(), "beta".to_string());
 
-        save_baseline_artifacts(&alpha_run, &baseline_dir, Some("alpha"))
+        save_baseline_artifacts(&alpha_run, &baseline_dir, Some("alpha"), 1)
             .expect("save alpha baseline");
-        save_baseline_artifacts(&beta_run, &baseline_dir, Some("beta"))
+        save_baseline_artifacts(&beta_run, &baseline_dir, Some("beta"), 1)
             .expect("save beta baseline");
 
         let alpha_latest = resolve_baseline_path(

@@ -36,3 +36,8 @@ required-features = ["cli"]
 name = "github_actions_json"
 path = "tests/github_actions_json.rs"
 harness = false
+
+[[test]]
+name = "noise_aware_gating"
+path = "tests/noise_aware_gating.rs"
+harness = false
