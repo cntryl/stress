@@ -77,7 +77,11 @@ fn run_child(
         .env("GITHUB_STEP_SUMMARY", summary_path)
         .env_remove("STRESS_BASELINE")
         .env_remove("STRESS_SAVE_BASELINE")
-        .env_remove("STRESS_PROFILE");
+        .env_remove("STRESS_PROFILE")
+        .env_remove("STRESS_FILTER")
+        .env_remove("STRESS_WORKLOAD")
+        .env_remove("STRESS_TIER")
+        .env_remove("STRESS_SAMPLES");
     match stress_github {
         Some(value) => command.env("STRESS_GITHUB", value),
         None => command.env_remove("STRESS_GITHUB"),

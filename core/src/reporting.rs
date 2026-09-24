@@ -1068,7 +1068,14 @@ fn format_github_annotations(run: &StressRun) -> String {
         .map(|summary| summary.benchmark_id.as_str())
         .collect::<BTreeSet<_>>();
     let comparisons = comparison_by_benchmark(run);
-    let fail_on_regression = run.environment.profile_config.fail_on_regression;
+    let gating_regressions = if run.environment.profile_config.fail_on_regression {
+        run.regressions()
+            .into_iter()
+            .map(|comparison| comparison.benchmark_id.as_str())
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
     let mut output = String::new();
     for summary in &run.summaries {
         if !summary.correctness.passed {
@@ -1095,17 +1102,21 @@ fn format_github_annotations(run: &StressRun) -> String {
                 AnnotationLevel::Error,
                 summary,
                 "quality gate failed",
-                &format!(
-                    "quality={} below min={}",
-                    summary.quality, run.environment.profile_config.min_quality
-                ),
+                &if summary.is_gate() {
+                    format!(
+                        "quality={} below min={}",
+                        summary.quality, run.environment.profile_config.min_quality
+                    )
+                } else {
+                    format!("trust={} is not gate-eligible", summary.trust_class)
+                },
             );
         }
         if let Some(comparison) = comparisons
             .get(summary.benchmark_id.as_str())
             .filter(|comparison| comparison.classification == ComparisonClass::Regression)
         {
-            let level = if fail_on_regression && summary.is_intended_gate() {
+            let level = if gating_regressions.contains(summary.benchmark_id.as_str()) {
                 AnnotationLevel::Error
             } else {
                 AnnotationLevel::Warning
@@ -1141,7 +1152,23 @@ fn format_github_annotations(run: &StressRun) -> String {
             );
         }
     }
+    push_run_gate_annotation(&mut output, run);
     output
+}
+
+/// Some gate failures (missing baselines, regression budgets, invalid rows,
+/// empty runs, artifact errors) have no single row annotation, so always
+/// state the run verdict.
+fn push_run_gate_annotation(output: &mut String, run: &StressRun) {
+    let gate = crate::runner::evaluate_run_gate(run);
+    if gate != crate::runner::RunGate::Passed {
+        let _ = writeln!(
+            output,
+            "::error title={}::{}",
+            escape_workflow_property("stress: gate failed"),
+            escape_workflow_data(&format!("{}: {gate:?}", run.suite))
+        );
+    }
 }
 
 fn push_annotation(
@@ -4264,6 +4291,53 @@ mod tests {
             .expect("step summary errors are not reporter failures");
 
         assert!(annotations(&buffer).contains("::warning title=stress%3A step summary::"));
+    }
+
+    #[test]
+    fn github_reporter_emits_a_run_level_error_when_the_gate_fails() {
+        let run = run_with_summaries(Vec::new());
+        assert_ne!(
+            crate::runner::evaluate_run_gate(&run),
+            crate::runner::RunGate::Passed
+        );
+        let (reporter, buffer) = github_reporter_for_test(None);
+
+        reporter.suite_end(&run).expect("github reporter");
+
+        assert!(
+            annotations(&buffer).contains("::error title=stress%3A gate failed::suite"),
+            "{}",
+            annotations(&buffer)
+        );
+    }
+
+    #[test]
+    fn github_reporter_only_errors_on_regressions_that_fail_the_gate() {
+        let mut row = summary("queue::row", 1_000.0, QualityClass::Acceptable);
+        row.trust_class = TrustClass::Diagnostic;
+        row.metadata
+            .insert("trust_class".to_string(), "gate".to_string());
+        let mut run = run_with_summaries(vec![row]);
+        run.environment.profile_config.fail_on_regression = true;
+        let mut comparison = ComparisonResult::new(
+            "queue::row",
+            PrimaryMetric::Throughput,
+            QualityClass::Acceptable,
+            ComparisonClass::Regression,
+            5.0,
+        );
+        comparison.change_percent = Some(-20.0);
+        run.comparisons.push(comparison);
+        assert!(run.regressions().is_empty());
+        let (reporter, buffer) = github_reporter_for_test(None);
+
+        reporter.suite_end(&run).expect("github reporter");
+
+        let output = annotations(&buffer);
+        assert!(
+            output.contains("::warning title=stress%3A regression::"),
+            "{output}"
+        );
     }
 
     #[test]

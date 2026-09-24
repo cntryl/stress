@@ -620,6 +620,8 @@ Annotations carry `file=` and `line=` when the row's source location is known,
 so they appear inline on the pull request diff. If `GITHUB_STEP_SUMMARY` is set,
 the markdown report is appended to the job summary. Set `STRESS_GITHUB=0` (or
 `false`) to opt out, or `STRESS_GITHUB=1` to force the output outside Actions.
+Like other `STRESS_*` booleans, an unparseable value is rejected at startup.
+When the gate fails, a run-level `::error` states the verdict.
 
 ## Artifacts
 
