@@ -166,6 +166,14 @@ pub const DIAGNOSTIC_CATALOG: &[DiagnosticInfo] = &[
         docs_anchor: "diagnostics/regression.md",
     },
     DiagnosticInfo {
+        code: "scaling_anomaly",
+        default_severity: DiagnosticSeverity::Info,
+        summary: "A parameter sweep's primary value changes measurably with the swept parameter.",
+        causes: "Algorithmic cost growth, contention or saturation as threads grow, or a cache or capacity cliff between sweep points.",
+        fix: "Check the exponent and thread efficiency against the expected complexity; investigate reversals before trusting the sweep.",
+        docs_anchor: "diagnostics/scaling_anomaly.md",
+    },
+    DiagnosticInfo {
         code: "setup_dominates_measurement",
         default_severity: DiagnosticSeverity::Error,
         summary: "Timing overhead or setup dominates the measured work.",
@@ -387,6 +395,7 @@ mod tests {
             production_source(include_str!("context.rs")),
             production_source(include_str!("harness.rs")),
             production_source(include_str!("config.rs")),
+            production_source(include_str!("scaling.rs")),
         ];
         let patterns = [
             "diagnostic(",

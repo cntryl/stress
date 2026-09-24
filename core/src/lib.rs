@@ -61,6 +61,7 @@ mod harness;
 mod memory;
 pub mod reporting;
 pub mod runner;
+mod scaling;
 mod stationarity;
 
 #[cfg(test)]

@@ -557,6 +557,14 @@ measurement, and baselines saved without these codes stay valid. See
 [`insufficient_warmup`](docs/diagnostics/insufficient_warmup.md) and
 [`measurement_drift`](docs/diagnostics/measurement_drift.md).
 
+Sweeps grouped as in the report's sweep tables are also checked for scaling.
+When a group of at least 3 points changes beyond its confidence intervals,
+the Info diagnostic `scaling_anomaly` is attached to each row with the
+log-log exponent, its fit quality, and whether the group is non-monotonic.
+`threads` sweeps skip counts above the available parallelism and report
+parallel efficiency for throughput rows. See
+[`scaling_anomaly`](docs/diagnostics/scaling_anomaly.md).
+
 ### Environment observations
 
 At run start the harness records best-effort, read-only host facts in

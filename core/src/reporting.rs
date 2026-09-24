@@ -7,6 +7,7 @@ use crate::artifact::{
 };
 use crate::config::StressRunnerConfig;
 use crate::diagnostics::catalog_fix;
+use crate::scaling::{sweep_groups, SweepGroupKey};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as FmtWrite;
 use std::io::Write;
@@ -3321,116 +3322,26 @@ fn write_quality_section(output: &mut String, run: &StressRun) {
 }
 
 fn write_sweep_tables(output: &mut String, run: &StressRun) {
-    let numeric_keys = numeric_parameter_keys(&run.summaries);
-    if numeric_keys.is_empty() {
-        return;
-    }
-
     let mut header_written = false;
-    for key in numeric_keys {
-        let mut groups: BTreeMap<SweepGroupKey, Vec<SweepRow<'_>>> = BTreeMap::new();
-        for summary in &run.summaries {
-            let Some(raw) = summary.parameters.get(&key) else {
-                continue;
-            };
-            let Ok(x) = raw.parse::<f64>() else {
-                continue;
-            };
-            let Some(y) = summary.primary_value() else {
-                continue;
-            };
-            groups
-                .entry(sweep_group_key(summary, &key, raw))
-                .or_default()
-                .push((x, y, summary));
+    for group in sweep_groups(&run.summaries) {
+        if group.points.len() < 2 {
+            continue;
         }
-        for (group, mut rows) in groups {
-            rows.sort_by(|left, right| left.0.total_cmp(&right.0));
-            if rows.len() < 2 {
-                continue;
-            }
-            if !header_written {
-                output.push_str("\nSweep Tables\n");
-                output.push_str("------------\n");
-                header_written = true;
-            }
-            write_sweep_group(output, &key, &group, &rows);
+        if !header_written {
+            output.push_str("\nSweep Tables\n");
+            output.push_str("------------\n");
+            header_written = true;
         }
+        let rows = group
+            .points
+            .iter()
+            .map(|point| (point.x, point.y, &run.summaries[point.index]))
+            .collect::<Vec<SweepRow<'_>>>();
+        write_sweep_group(output, &group.parameter, &group.key, &rows);
     }
 }
 
 type SweepRow<'a> = (f64, f64, &'a BenchmarkSummary);
-
-/// Identity of one sweep: the same benchmark (name with the swept value
-/// removed, all other parameters equal) measured with the same metric and unit.
-/// Speedup is only ever computed within one group.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct SweepGroupKey {
-    base_name: String,
-    measurement: String,
-    other_parameters: Vec<(String, String)>,
-}
-
-fn sweep_group_key(summary: &BenchmarkSummary, key: &str, raw_value: &str) -> SweepGroupKey {
-    let base_name = name_without_swept_value(&summary.name, key, raw_value);
-    SweepGroupKey {
-        base_name,
-        measurement: format!(
-            "{:?} {}",
-            summary.primary_metric,
-            human_measurement_label(summary)
-        ),
-        other_parameters: summary
-            .parameters
-            .iter()
-            .filter(|(name, _)| name.as_str() != key)
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect(),
-    }
-}
-
-/// Replaces the swept value in a benchmark name with `*`, matching only a
-/// delimiter-anchored token: `{key}={value}`, `{key}_{value}`,
-/// `{key}-{value}`, or a bare `{value}` bounded by non-alphanumeric characters
-/// (or the ends of the name). Key-qualified tokens win over bare values, and
-/// the last match wins within each form. A name without such a token is kept
-/// unchanged; grouping still also requires every other parameter to match.
-fn name_without_swept_value(name: &str, key: &str, raw_value: &str) -> String {
-    fn is_boundary(ch: Option<char>) -> bool {
-        ch.is_none_or(|ch| !ch.is_ascii_alphanumeric())
-    }
-    fn last_bounded(name: &str, needle: &str) -> Option<usize> {
-        if needle.is_empty() {
-            return None;
-        }
-        name.match_indices(needle)
-            .filter(|(index, _)| {
-                is_boundary(name[..*index].chars().next_back())
-                    && is_boundary(name[index + needle.len()..].chars().next())
-            })
-            .map(|(index, _)| index)
-            .last()
-    }
-
-    if raw_value.is_empty() {
-        return name.to_string();
-    }
-    for separator in ["=", "_", "-"] {
-        let token = format!("{key}{separator}{raw_value}");
-        if let Some(index) = last_bounded(name, &token) {
-            let value_start = index + key.len() + separator.len();
-            let mut base = name.to_string();
-            base.replace_range(value_start..index + token.len(), "*");
-            return base;
-        }
-    }
-    if let Some(index) = last_bounded(name, raw_value) {
-        let mut base = name.to_string();
-        base.replace_range(index..index + raw_value.len(), "*");
-        return base;
-    }
-    name.to_string()
-}
 
 fn write_sweep_group(output: &mut String, key: &str, group: &SweepGroupKey, rows: &[SweepRow<'_>]) {
     let baseline_x = rows[0].0;
@@ -3481,21 +3392,6 @@ fn write_sweep_group(output: &mut String, key: &str, group: &SweepGroupKey, rows
     }
 }
 
-fn numeric_parameter_keys(summaries: &[BenchmarkSummary]) -> Vec<String> {
-    let mut values: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for summary in summaries {
-        for (key, value) in &summary.parameters {
-            if value.parse::<f64>().is_ok() {
-                values.entry(key.clone()).or_default().insert(value.clone());
-            }
-        }
-    }
-    values
-        .into_iter()
-        .filter_map(|(key, seen)| (seen.len() > 1).then_some(key))
-        .collect()
-}
-
 fn format_metric(value: f64, summary: &BenchmarkSummary) -> String {
     format_metric_value(value, summary)
 }
@@ -3542,7 +3438,7 @@ fn measurement_question(summary: &BenchmarkSummary) -> String {
     parts.join("; ")
 }
 
-fn human_measurement_label(summary: &BenchmarkSummary) -> String {
+pub(crate) fn human_measurement_label(summary: &BenchmarkSummary) -> String {
     let unit = display_unit(summary);
     match summary.primary_metric {
         PrimaryMetric::Throughput => format!("{unit}/s"),
