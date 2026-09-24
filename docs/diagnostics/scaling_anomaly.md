@@ -10,9 +10,11 @@ parameter, or reverses direction across it.
 Rows are grouped exactly as the report's sweep tables group them: the same
 benchmark name with the swept value removed, the same metric and unit, and
 equal values for every other parameter. A group is evaluated when it has at
-least 3 points with a positive parameter value. The diagnostic fires when two
-points differ by more than 5% and their 95% confidence intervals do not
-overlap. It is attached to every row of the group, with this evidence:
+least 3 points whose parameter and primary value are positive and finite.
+The diagnostic fires when two points differ by more than 5% and their 95%
+confidence intervals do not overlap. It is attached to every evaluated row of
+the group; a row swept over several parameters can carry one per parameter.
+Evidence:
 
 - `exponent` and `r_squared`: the least-squares slope of `ln(value)` on
   `ln(parameter)` and its fit quality. An exponent near 1 is linear, near 2 is

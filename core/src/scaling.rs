@@ -161,11 +161,13 @@ pub(crate) fn attach_scaling_diagnostics(
     available_parallelism: Option<usize>,
 ) {
     for group in sweep_groups(summaries) {
-        let Some(diagnostic) = scaling_diagnostic(summaries, &group, available_parallelism) else {
+        let Some((diagnostic, evaluated)) =
+            scaling_diagnostic(summaries, &group, available_parallelism)
+        else {
             continue;
         };
-        for point in &group.points {
-            let summary = &mut summaries[point.index];
+        for index in evaluated {
+            let summary = &mut summaries[index];
             let duplicate = summary.diagnostics.iter().any(|existing| {
                 existing.code == "scaling_anomaly"
                     && existing.evidence.get("parameter") == Some(&group.parameter)
@@ -190,7 +192,7 @@ fn scaling_diagnostic(
     summaries: &[BenchmarkSummary],
     group: &SweepGroup,
     available_parallelism: Option<usize>,
-) -> Option<BenchmarkDiagnostic> {
+) -> Option<(BenchmarkDiagnostic, Vec<usize>)> {
     let threads = group.parameter == "threads";
     let limit = available_parallelism.filter(|_| threads);
     #[allow(clippy::cast_precision_loss)]
@@ -324,7 +326,10 @@ fn scaling_diagnostic(
     if !fix.is_empty() {
         diagnostic.suggestions.push(fix.to_string());
     }
-    Some(diagnostic)
+    Some((
+        diagnostic,
+        evaluated.iter().map(|point| point.index).collect(),
+    ))
 }
 
 /// The 95% interval that belongs to the row's primary value.
@@ -556,8 +561,8 @@ mod tests {
         assert_eq!(diagnostic.evidence["points"], "4");
         assert!(diagnostic.evidence["related_diagnostics"].contains("flat_or_capped_throughput"));
         assert!(
-            scaling(&rows[4]).is_some(),
-            "skipped rows still get the note"
+            scaling(&rows[4]).is_none(),
+            "skipped rows are listed in evidence, not annotated"
         );
     }
 
