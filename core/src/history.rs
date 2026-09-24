@@ -152,9 +152,12 @@ fn history_stems(directory: &Path) -> std::io::Result<Vec<String>> {
     Ok(stems)
 }
 
+/// A suite directory has `latest.json` or a JSON artifact whose stem has the
+/// standard `started_at` form; a stray `*.json` alone does not qualify.
 fn is_suite_directory(directory: &Path) -> bool {
     directory.join("latest.json").is_file()
-        || history_stems(directory).is_ok_and(|stems| !stems.is_empty())
+        || history_stems(directory)
+            .is_ok_and(|stems| stems.iter().any(|stem| stem_timestamp(stem).is_some()))
 }
 
 /// Suite directories under an artifact root: the root itself when it is a
@@ -579,7 +582,14 @@ fn stem_files(directory: &Path, stem: &str) -> std::io::Result<Vec<PathBuf>> {
                 .then(|| entry.path())
         })
         .collect::<Vec<_>>();
-    files.sort();
+    // Mirror publication, which writes JSON last: remove JSON last so an
+    // interrupted prune leaves a set that is still a prune candidate.
+    files.sort_by_key(|path| {
+        (
+            path.extension().is_some_and(|ext| ext == "json"),
+            path.clone(),
+        )
+    });
     Ok(files)
 }
 
@@ -855,6 +865,33 @@ mod tests {
 
         assert_eq!(plan_prune(&suite, 0).unwrap().delete.len(), 8);
         assert!(apply_prune(&suite, 5).unwrap().delete.is_empty());
+    }
+
+    #[test]
+    fn stray_json_does_not_make_a_directory_a_suite() {
+        let dir = Dir::new("stray");
+        std::fs::write(dir.0.join("summary.json"), "{}").unwrap();
+        std::fs::create_dir_all(dir.0.join("pkg")).unwrap();
+        std::fs::write(dir.0.join("pkg/notes.json"), "{}").unwrap();
+        write(&dir.0.join("pkg/suite"), &run("suite", T1, None, 10));
+        let found = discover_suite_directories(&dir.0).unwrap();
+        assert_eq!(found, vec![dir.0.join("pkg/suite")]);
+    }
+
+    #[test]
+    fn prune_deletes_json_last_within_each_set() {
+        let dir = Dir::new("prune-order");
+        let suite = dir.0.join("suite");
+        for stamp in [T1, T2] {
+            write(&suite, &run("suite", stamp, None, 10));
+        }
+        let plan = plan_prune(&suite, 1).unwrap();
+        assert_eq!(plan.delete.len(), 4);
+        assert!(
+            plan.delete[3].ends_with(format!("{T1}.json")),
+            "{:?}",
+            plan.delete
+        );
     }
 
     #[test]

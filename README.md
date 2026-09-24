@@ -889,8 +889,8 @@ cargo stress history --prune --keep 20          # dry run: lists what would be d
 cargo stress history --prune --keep 20 --yes    # delete
 ```
 
-Pruning keeps the newest N timestamped sets per suite (`--suite` limits it to
-one suite) and deletes every file of an older set together (`.json`, `.txt`,
+Pruning keeps the newest N (at least 1) timestamped sets per suite, counting
+runs from every environment (`--suite` limits it to one suite), and deletes every file of an older set together (`.json`, `.txt`,
 `.md`, `.csv`). Only sets whose `.json` is a run artifact with a matching
 `started_at` are candidates; `latest.*`, the `baselines` directory, hidden
 publication state, and unrelated files are never touched. Deletion happens

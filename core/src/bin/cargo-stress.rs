@@ -442,8 +442,8 @@ struct HistoryArgs {
     prune: bool,
 
     /// Number of newest artifact sets per suite to keep when pruning
-    #[arg(long, value_name = "N", requires = "prune")]
-    keep: Option<usize>,
+    #[arg(long, value_name = "N", requires = "prune", value_parser = clap::value_parser!(u64).range(1..))]
+    keep: Option<u64>,
 
     /// Actually delete when pruning
     #[arg(long, requires = "prune")]
@@ -539,6 +539,7 @@ fn history_output(args: &HistoryArgs, cwd: &Path) -> (i32, String, String) {
         options = options.suite(suite.clone());
     }
     if let (true, Some(keep)) = (args.prune, args.keep) {
+        let keep = usize::try_from(keep).unwrap_or(usize::MAX);
         return prune_output(&root, &options, keep, args.yes);
     }
     if let Some(bench) = &args.bench {
@@ -5310,6 +5311,7 @@ mod history_tests {
             &["cargo", "stress", "history", "--prune"][..],
             &["cargo", "stress", "history", "--yes"][..],
             &["cargo", "stress", "history", "--last", "0"][..],
+            &["cargo", "stress", "history", "--prune", "--keep", "0"][..],
         ] {
             assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
         }
