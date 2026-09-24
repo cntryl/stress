@@ -1,7 +1,8 @@
 //! Rank-based stationarity checks behind `insufficient_warmup` and
 //! `measurement_drift`.
 //!
-//! These functions only read sample values in execution order. They never
+//! These functions only read sample values in recorded order (samples
+//! without a value for the primary metric are skipped). They never
 //! change measurements; callers turn findings into Info diagnostics.
 
 /// Minimum measured samples before either check is evaluated.
@@ -130,7 +131,10 @@ pub(crate) fn insufficient_warmup(warmup: &[f64], measured: &[f64]) -> Option<Wa
         } else {
             (tail_median - head_median) / head_median.abs() * 100.0
         },
-        suggested_warmup_samples: (warmup.len() * 2).max(warmup.len() + unsettled),
+        // Capped so a run that also drifts does not suggest warming up for
+        // most of the run.
+        suggested_warmup_samples: (warmup.len() * 2)
+            .max(warmup.len() + unsettled.min(measured.len() / 2)),
     })
 }
 
@@ -229,7 +233,7 @@ mod tests {
     fn stationary_noise_rarely_fires_either_check() {
         const TRIALS: usize = 4_000;
         let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
-        for measured_len in [5_usize, 10, 30] {
+        for measured_len in [5_usize, 10, 11, 30] {
             for warmup_len in [2_usize, 5] {
                 for rsd in [0.01, 0.10, 0.30] {
                     let mut warmup_hits = 0;
@@ -267,6 +271,17 @@ mod tests {
         assert!(finding.shift_percent > 10.0, "{finding:?}");
         assert!(finding.suggested_warmup_samples >= 5, "{finding:?}");
         assert!(finding.suggested_warmup_samples <= 10, "{finding:?}");
+    }
+
+    #[test]
+    fn warmup_suggestion_is_capped_when_the_run_also_drifts() {
+        let warmup = vec![3_000.0, 2_900.0];
+        let measured = (0..20)
+            .map(|index| 2_000.0 - 50.0 * f64::from(index))
+            .collect::<Vec<_>>();
+        if let Some(finding) = insufficient_warmup(&warmup, &measured) {
+            assert!(finding.suggested_warmup_samples <= warmup.len() + measured.len() / 2);
+        }
     }
 
     #[test]

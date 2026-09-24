@@ -3774,9 +3774,27 @@ fn stationarity_diagnostics(
     if latency_estimator == LatencyEstimator::LegacyPooledObservations {
         return Vec::new();
     }
-    let warmup = samples
+    let row = samples
         .iter()
-        .filter(|sample| sample.benchmark_id == spec.id && sample.phase == SamplePhase::Warmup)
+        .filter(|sample| sample.benchmark_id == spec.id)
+        .collect::<Vec<_>>();
+    // Confirmation attempts and pooled baselines append whole runs back to
+    // back. A warmup sample after a measured one marks such a pool, where
+    // level changes between runs are neither drift nor missing warmup.
+    let first_measured = row
+        .iter()
+        .position(|sample| sample.phase == SamplePhase::Measured);
+    let pooled = first_measured.is_some_and(|first| {
+        row[first..]
+            .iter()
+            .any(|sample| sample.phase == SamplePhase::Warmup)
+    });
+    if pooled {
+        return Vec::new();
+    }
+    let warmup = row
+        .into_iter()
+        .filter(|sample| sample.phase == SamplePhase::Warmup)
         .collect::<Vec<_>>();
     let warmup_values = primary_values(primary_metric, &warmup, latency_estimator);
     let mut diagnostics = Vec::new();
@@ -5943,6 +5961,36 @@ mod tests {
 
         let flat = vec![1_000_000_u128; 20];
         let summary = summarize_benchmark(&spec, &phased_samples(&[1_000_000, 1_000_000], &flat));
+        assert!(find_code(&summary, "measurement_drift").is_none());
+        assert!(find_code(&summary, "insufficient_warmup").is_none());
+    }
+
+    #[test]
+    fn pooled_attempts_at_different_levels_skip_stationarity_checks() {
+        // Confirmation attempts and pooled baselines append whole runs
+        // (warmup then measured) back to back; a level change between
+        // attempts is not drift or missing warmup.
+        let spec = spec("bench");
+        let mut samples = Vec::new();
+        for (attempt, level) in [1_000_000_u128, 1_300_000, 1_600_000]
+            .into_iter()
+            .enumerate()
+        {
+            samples.extend(
+                phased_samples(
+                    &[level; 2],
+                    &(0..10_u128)
+                        .map(|index| level + index * 100)
+                        .collect::<Vec<_>>(),
+                )
+                .into_iter()
+                .map(|mut sample| {
+                    sample.sample_number += attempt * 12;
+                    sample
+                }),
+            );
+        }
+        let summary = summarize_benchmark(&spec, &samples);
         assert!(find_code(&summary, "measurement_drift").is_none());
         assert!(find_code(&summary, "insufficient_warmup").is_none());
     }
