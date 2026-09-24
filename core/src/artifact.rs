@@ -712,6 +712,7 @@ impl PrimaryMetric {
 ///     max_bytes_per_op: None,
 ///     max_regression_pct: None,
 ///     max_rsd_pct: None,
+///     max_peak_rss_mb: None,
 /// };
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
@@ -732,6 +733,10 @@ pub struct BenchmarkBudgets {
     /// Maximum relative standard deviation percentage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rsd_pct: Option<f64>,
+    /// Maximum process peak RSS in MiB. Diagnostic-class only: exceeding it
+    /// emits a `peak_rss_exceeded` warning and never fails the budget gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_peak_rss_mb: Option<f64>,
 }
 
 impl BenchmarkBudgets {
@@ -744,7 +749,15 @@ impl BenchmarkBudgets {
             max_bytes_per_op: None,
             max_regression_pct: None,
             max_rsd_pct: None,
+            max_peak_rss_mb: None,
         }
+    }
+
+    /// Set the maximum process peak RSS in MiB (diagnostic only, never gating).
+    #[must_use]
+    pub const fn with_max_peak_rss_mb(mut self, value: f64) -> Self {
+        self.max_peak_rss_mb = Some(value);
+        self
     }
 
     /// Set the maximum net nanoseconds per operation.
@@ -796,7 +809,34 @@ impl BenchmarkBudgets {
             && self.max_bytes_per_op.is_none()
             && self.max_regression_pct.is_none()
             && self.max_rsd_pct.is_none()
+            && self.max_peak_rss_mb.is_none()
     }
+}
+
+/// Attach a `peak_rss_exceeded` warning when `peak_rss_bytes` exceeds the
+/// row's `max_peak_rss_mb` budget. Never produces a budget failure.
+pub(crate) fn attach_peak_rss_diagnostic(summary: &mut BenchmarkSummary) {
+    let (Some(limit_mb), Some(bytes)) = (summary.budgets.max_peak_rss_mb, summary.peak_rss_bytes)
+    else {
+        return;
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let actual_mb = bytes as f64 / (1024.0 * 1024.0);
+    if actual_mb <= limit_mb {
+        return;
+    }
+    let mut diagnostic = BenchmarkDiagnostic::new(
+        "peak_rss_exceeded",
+        DiagnosticSeverity::Warning,
+        "Process peak RSS exceeded the max_peak_rss_mb budget.",
+    )
+    .with_evidence("peak_rss_bytes", bytes.to_string())
+    .with_evidence("peak_rss_mb", format!("{actual_mb:.1}"))
+    .with_evidence("max_peak_rss_mb", format!("{limit_mb}"));
+    if let Some(info) = crate::diagnostics::diagnostic_info("peak_rss_exceeded") {
+        diagnostic = diagnostic.with_suggestion(info.fix);
+    }
+    summary.diagnostics.push(diagnostic);
 }
 
 /// Result for one budget gate on one benchmark summary.
@@ -1616,6 +1656,13 @@ pub struct BenchmarkSummary {
     /// ignored by baseline validation because paths differ across checkouts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<SourceLocation>,
+    /// Process peak resident set size in bytes, sampled after the benchmark
+    /// finished. Process-wide and monotonic: it is the high-water mark of the
+    /// whole process so far, so it is meaningful per suite and for the first
+    /// row that grows it. `None` when the platform does not expose it.
+    /// Informational only; ignored by baseline validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_rss_bytes: Option<u64>,
 }
 
 /// Source location of a benchmark row or registered benchmark function.
@@ -1691,6 +1738,7 @@ impl BenchmarkSummary {
             parameters: BTreeMap::new(),
             metadata: BTreeMap::new(),
             source: None,
+            peak_rss_bytes: None,
         }
     }
 
@@ -2396,6 +2444,8 @@ fn normalized_summary_for_validation(
     let mut normalized = summary.clone();
     // Source paths differ across machines and checkouts.
     normalized.source = None;
+    // Peak RSS is a process-wide observation, not derived from raw samples.
+    normalized.peak_rss_bytes = None;
     // Comparison-time codes depend on the other artifact, and codes or
     // evidence added after v0.4 are absent from older baselines. Suggestions
     // are advisory text that may be reworded between releases.
@@ -2407,6 +2457,7 @@ fn normalized_summary_for_validation(
                 | "non_finite_samples_dropped"
                 | "insufficient_warmup"
                 | "measurement_drift"
+                | "peak_rss_exceeded"
         )
     });
     for diagnostic in &mut normalized.diagnostics {
@@ -2693,6 +2744,7 @@ fn summarize_benchmark_with_latency_estimator(
         parameters: merged_parameters(spec, &measured),
         metadata,
         source: None,
+        peak_rss_bytes: None,
     }
 }
 

@@ -47,6 +47,8 @@ const MAX_TIER: u32 = 6;
 /// - `max_bytes_per_op = 0`
 /// - `max_regression_pct = 5`
 /// - `max_rsd_pct = 10`
+/// - `max_peak_rss_mb = 512` (process-wide peak RSS; emits a
+///   `peak_rss_exceeded` warning diagnostic and never fails the budget gate)
 /// - `runtime = "tokio"` or `"tokio-multi"` (async functions only; needs the
 ///   `tokio` feature of cntryl-stress) drives the benchmark on a fresh
 ///   current-thread or multi-thread tokio runtime instead of the built-in executor
@@ -92,6 +94,7 @@ pub fn stress(attr: TokenStream, item: TokenStream) -> TokenStream {
         ("with_max_bytes_per_op", attrs.budgets.bytes_per_op),
         ("with_max_regression_pct", attrs.budgets.regression_pct),
         ("with_max_rsd_pct", attrs.budgets.rsd_pct),
+        ("with_max_peak_rss_mb", attrs.budgets.peak_rss_mb),
     ]
     .into_iter()
     .filter_map(|(setter, value)| {
@@ -169,6 +172,7 @@ struct StressBudgets {
     bytes_per_op: Option<f64>,
     regression_pct: Option<f64>,
     rsd_pct: Option<f64>,
+    peak_rss_mb: Option<f64>,
 }
 
 impl Default for StressAttrs {
@@ -250,6 +254,10 @@ impl StressAttrs {
                 Meta::NameValue(name_value) if name_value.path.is_ident("max_rsd_pct") => {
                     mark_singleton(&mut singleton_attributes, "max_rsd_pct", &name_value)?;
                     attrs.budgets.rsd_pct = Some(nonnegative_budget_value(&name_value)?);
+                }
+                Meta::NameValue(name_value) if name_value.path.is_ident("max_peak_rss_mb") => {
+                    mark_singleton(&mut singleton_attributes, "max_peak_rss_mb", &name_value)?;
+                    attrs.budgets.peak_rss_mb = Some(nonnegative_budget_value(&name_value)?);
                 }
                 Meta::List(list) if list.path.is_ident("metadata") => {
                     let metadata = parse_metadata(list.tokens.clone())?;

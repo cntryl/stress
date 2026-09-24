@@ -438,6 +438,7 @@ the first error.
 #[stress(tier = 4)]
 #[stress(tier = 1, max_ns_per_op = 250, max_regression_pct = 5)]
 #[stress(max_allocs_per_op = 0, max_bytes_per_op = 0, max_rsd_pct = 10)]
+#[stress(tier = 3, max_peak_rss_mb = 512)]
 #[stress(name = "custom_name", ignore)]
 #[stress(tier = 5, role = "diagnostic")]
 #[stress(metadata(component = "queue", scenario = "fanout"))]
@@ -473,7 +474,26 @@ Quality classes:
 - `untrustworthy`: too few samples, zero completed ops, invalid timing, or correctness failure
 
 Baseline regressions are meaningful only when the primary metric moves past threshold and 95% confidence intervals do not overlap.
-Benchmark budgets fail the run when exceeded. Diagnostics are structured on each summary with `code`, `severity`, `reason`, `evidence`, and `suggestions`.
+Benchmark budgets fail the run when exceeded. The exception is
+`max_peak_rss_mb`, which is diagnostic-class only.
+
+#### Peak RSS
+
+Each summary records `peak_rss_bytes`. It comes from
+`getrusage(RUSAGE_SELF).ru_maxrss` on Unix (macOS reports bytes, Linux
+reports KiB, and both are normalized to bytes). It is absent on other
+platforms. The value is process-wide and monotonic: it is the high-water mark
+of the whole benchmark process so far, not a per-row delta. That makes it
+meaningful for the whole suite and for the first row that grows it. The
+console and Markdown reports show the suite peak and the row with the largest
+growth after the first row, which also carries the process baseline.
+`#[stress(max_peak_rss_mb = 512)]` (or
+`BenchmarkBudgets::with_max_peak_rss_mb`) emits a `peak_rss_exceeded`
+warning. It never fails the budget gate. Opt into gating with
+`--deny-code peak_rss_exceeded`. Baseline validation ignores peak RSS. Run
+memory-heavy rows in their own bench binary to attribute them cleanly.
+
+Diagnostics are structured on each summary with `code`, `severity`, `reason`, `evidence`, and `suggestions`.
 
 ### Diagnostic codes
 

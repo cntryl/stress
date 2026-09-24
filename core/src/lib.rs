@@ -58,6 +58,7 @@ pub mod diagnostics;
 mod environment;
 mod error;
 mod harness;
+mod memory;
 pub mod reporting;
 pub mod runner;
 mod stationarity;

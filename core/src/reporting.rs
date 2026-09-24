@@ -1374,6 +1374,21 @@ fn write_markdown_environment(output: &mut String, run: &StressRun) {
     }
 }
 
+fn write_markdown_memory(output: &mut String, run: &StressRun) {
+    if let Some((peak_mb, grower)) = peak_rss_overview(run) {
+        let _ = writeln!(output, "## Memory");
+        let _ = writeln!(output);
+        let growth = grower.map_or_else(String::new, |id| {
+            format!("; largest growth at `{}`", escape_markdown_cell(id))
+        });
+        let _ = writeln!(
+            output,
+            "- Peak RSS: {peak_mb:.1} MiB (process-wide{growth})"
+        );
+        let _ = writeln!(output);
+    }
+}
+
 pub(crate) fn format_markdown_report(run: &StressRun) -> String {
     let mut output = String::new();
     let _ = writeln!(output, "# {}", run.suite);
@@ -1403,6 +1418,7 @@ pub(crate) fn format_markdown_report(run: &StressRun) -> String {
         let _ = writeln!(output);
     }
     write_markdown_environment(&mut output, run);
+    write_markdown_memory(&mut output, run);
     let _ = writeln!(output, "## Needs attention");
     let _ = writeln!(output);
     write_markdown_attention(&mut output, run);
@@ -1588,10 +1604,41 @@ pub(crate) fn noise_gating_lines(run: &StressRun) -> Vec<String> {
     lines
 }
 
+/// Suite peak RSS in MiB and the row whose invocation grew it the most.
+///
+/// Peak RSS is process-wide and monotonic, so per-row values are cumulative
+/// high-water marks. The first recorded row also carries the process baseline
+/// (runtime, harness, earlier setup), so growth is only attributed to later
+/// rows; `None` when no later row raised the mark.
+fn peak_rss_overview(run: &StressRun) -> Option<(f64, Option<&str>)> {
+    let mut values = run
+        .summaries
+        .iter()
+        .filter_map(|summary| summary.peak_rss_bytes.map(|bytes| (bytes, summary)));
+    let (mut previous, _) = values.next()?;
+    let mut peak = previous;
+    let mut largest_growth: Option<(u64, &str)> = None;
+    for (bytes, summary) in values {
+        let growth = bytes.saturating_sub(previous);
+        if growth > 0 && largest_growth.is_none_or(|(largest, _)| growth > largest) {
+            largest_growth = Some((growth, summary.benchmark_id.as_str()));
+        }
+        previous = previous.max(bytes);
+        peak = peak.max(bytes);
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let peak_mb = peak as f64 / (1024.0 * 1024.0);
+    Some((peak_mb, largest_growth.map(|(_, id)| id)))
+}
+
 fn write_suite_block(output: &mut String, run: &StressRun) {
     let _ = writeln!(output, "{}", run.suite);
     for line in environment_lines(run) {
         let _ = writeln!(output, "{line}");
+    }
+    if let Some((peak_mb, grower)) = peak_rss_overview(run) {
+        let growth = grower.map_or_else(String::new, |id| format!("; largest growth at {id}"));
+        let _ = writeln!(output, "peak RSS: {peak_mb:.1} MiB (process-wide{growth})");
     }
     for line in noise_gating_lines(run) {
         let _ = writeln!(output, "{line}");
@@ -3594,6 +3641,7 @@ mod tests {
             parameters: BTreeMap::new(),
             metadata: BTreeMap::new(),
             source: None,
+            peak_rss_bytes: None,
         }
     }
 
@@ -4297,6 +4345,33 @@ mod tests {
         assert!(
             markdown.contains("at `benches/queue.rs:42`"),
             "missing location in:\n{markdown}"
+        );
+    }
+
+    #[test]
+    fn peak_rss_renders_in_console_and_markdown() {
+        let mut run = run_with_summaries(vec![located_micro_summary(), located_micro_summary()]);
+        run.summaries[1].benchmark_id = "suite/grower".to_string();
+        assert!(!format_console_output(&run).contains("peak RSS"));
+        assert!(!format_markdown_report(&run).contains("## Memory"));
+
+        run.summaries[0].peak_rss_bytes = Some(200 * 1024 * 1024);
+        assert!(
+            format_console_output(&run).contains("peak RSS: 200.0 MiB (process-wide)\n"),
+            "a lone first row carries the process baseline, not growth"
+        );
+        run.summaries[1].peak_rss_bytes = Some(300 * 1024 * 1024);
+        let console = format_console_output(&run);
+        assert!(
+            console.contains("peak RSS: 300.0 MiB (process-wide; largest growth at suite/grower)"),
+            "{console}"
+        );
+        let markdown = format_markdown_report(&run);
+        assert!(markdown.contains("## Memory"), "{markdown}");
+        assert!(
+            markdown
+                .contains("- Peak RSS: 300.0 MiB (process-wide; largest growth at `suite/grower`)"),
+            "{markdown}"
         );
     }
 

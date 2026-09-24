@@ -15,6 +15,11 @@ fn macro_expansion_uses_namespaced_artifact_types(ctx: &mut StressContext) {
     ctx.measure("hot path", || black_box(1_u64));
 }
 
+#[stress(tier = 2, max_peak_rss_mb = 4096)]
+fn peak_rss_budget_attribute_compiles(ctx: &mut StressContext) {
+    ctx.measure("rss", || black_box(1_u64));
+}
+
 #[stress(tier = 2, metadata(component = "api"))]
 fn fallible_macro_benchmark(ctx: &mut StressContext) -> StressResult {
     let value = "42"
@@ -345,6 +350,10 @@ fn v0_4_0_fixture_deserializes_and_reserializes() {
     let reserialized = serde_json::to_value(&run).expect("reserialize");
     let reparsed: StressRun = serde_json::from_value(reserialized.clone()).expect("reparse");
     assert_eq!(reparsed, run);
+    assert!(run
+        .summaries
+        .iter()
+        .all(|summary| summary.peak_rss_bytes.is_none()));
     assert_eq!(
         reserialized, original,
         "v0.4 fixture must round-trip losslessly"
@@ -378,7 +387,9 @@ fn budgets_and_counters_build_via_constructors() {
         .with_max_allocs_per_op(1.0)
         .with_max_bytes_per_op(64.0)
         .with_max_regression_pct(5.0)
-        .with_max_rsd_pct(3.0);
+        .with_max_rsd_pct(3.0)
+        .with_max_peak_rss_mb(512.0);
+    assert_eq!(BUDGETS.max_peak_rss_mb, Some(512.0));
     assert_eq!(BUDGETS.max_ns_per_op, Some(10.0));
     assert_eq!(BUDGETS.max_allocs_per_op, Some(1.0));
     assert_eq!(BUDGETS.max_bytes_per_op, Some(64.0));

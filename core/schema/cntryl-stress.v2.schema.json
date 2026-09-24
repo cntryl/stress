@@ -248,7 +248,8 @@
         "max_allocs_per_op": { "type": "number", "minimum": 0 },
         "max_bytes_per_op": { "type": "number", "minimum": 0 },
         "max_regression_pct": { "type": "number", "minimum": 0, "maximum": 100 },
-        "max_rsd_pct": { "type": "number", "minimum": 0 }
+        "max_rsd_pct": { "type": "number", "minimum": 0 },
+        "max_peak_rss_mb": { "type": "number", "minimum": 0 }
       }
     },
     "benchmarkSpec": {
@@ -384,7 +385,8 @@
         "correctness": { "$ref": "#/$defs/correctnessSummary" },
         "parameters": { "$ref": "#/$defs/stringMap" },
         "metadata": { "$ref": "#/$defs/stringMap" },
-        "source": { "$ref": "#/$defs/sourceLocation" }
+        "source": { "$ref": "#/$defs/sourceLocation" },
+        "peak_rss_bytes": { "type": "integer", "minimum": 0 }
       }
     },
     "confirmationRun": {

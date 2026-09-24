@@ -346,12 +346,15 @@ impl StressRunner {
             ..
         } = topology;
         let base_id = spec.id.clone();
+        let peak_rss_bytes = crate::memory::peak_rss_bytes();
         for spec_id in spec_order {
             let spec = specs
                 .remove(&spec_id)
                 .expect("spec order contains known ids");
             let mut summary = summarize_benchmark(&spec, &self.samples[start_sample..]);
             summary.source = sources.remove(&spec_id).or_else(|| source.cloned());
+            summary.peak_rss_bytes = peak_rss_bytes;
+            crate::artifact::attach_peak_rss_diagnostic(&mut summary);
             for reporter in &self.reporters {
                 reporter.bench_end(&summary);
             }
@@ -944,6 +947,7 @@ fn benchmark_spec_validation_errors(spec: &BenchmarkSpec) -> Vec<String> {
             Some(100.0),
         ),
         ("max_rsd_pct", spec.budgets.max_rsd_pct, None),
+        ("max_peak_rss_mb", spec.budgets.max_peak_rss_mb, None),
     ] {
         if value.is_some_and(|value| {
             !value.is_finite() || value < 0.0 || maximum.is_some_and(|maximum| value > maximum)
@@ -1856,6 +1860,99 @@ mod tests {
 
         assert_eq!(run.comparisons.len(), 1);
         let _ = std::fs::remove_file(&baseline_path);
+    }
+
+    #[test]
+    fn baseline_with_peak_rss_and_its_diagnostic_still_compares() {
+        let mut baseline = external_throughput_runner(1_000).finish();
+        baseline.summaries[0].peak_rss_bytes = Some(123_456_789);
+        baseline.summaries[0]
+            .diagnostics
+            .push(crate::artifact::BenchmarkDiagnostic::new(
+                "peak_rss_exceeded",
+                DiagnosticSeverity::Warning,
+                "Process peak RSS exceeded max_peak_rss_mb.",
+            ));
+        let baseline_path = unique_temp_path("stress-baseline-peak-rss.json");
+        std::fs::write(
+            &baseline_path,
+            serde_json::to_string(&baseline).expect("serialize baseline"),
+        )
+        .expect("write baseline");
+
+        let run = external_throughput_runner(1_000)
+            .finish_with_baseline(&baseline_path)
+            .expect("peak RSS must not affect baseline validation");
+
+        assert_eq!(run.comparisons.len(), 1);
+        let _ = std::fs::remove_file(&baseline_path);
+    }
+
+    fn peak_rss_spec(budget_mb: f64) -> BenchmarkSpec {
+        BenchmarkSpec {
+            id: "suite/rss".to_string(),
+            name: "rss".to_string(),
+            tier: 2,
+            mode: BenchmarkMode::FixedOperations {
+                operations_per_sample: 1,
+            },
+            intent: crate::artifact::MeasurementIntent::General,
+            budgets: BenchmarkBudgets::new().with_max_peak_rss_mb(budget_mb),
+            parameters: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    fn run_peak_rss_spec(budget_mb: f64) -> StressRun {
+        let config = StressRunnerConfig::new()
+            .samples(2)
+            .warmup_samples(0)
+            .cooldown_samples(0)
+            .progress(false);
+        let mut runner = StressRunner::with_config("suite", config);
+        runner.reporters(Vec::new());
+        runner.run_spec(&peak_rss_spec(budget_mb), |ctx| {
+            ctx.measure("work", || std::hint::black_box(1_u64));
+        });
+        runner.finish()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exceeded_peak_rss_budget_is_a_warning_diagnostic_not_a_budget_failure() {
+        let run = run_peak_rss_spec(0.001);
+        let summary = &run.summaries[0];
+
+        assert!(summary.peak_rss_bytes.is_some_and(|bytes| bytes > 0));
+        let diagnostic = summary
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "peak_rss_exceeded")
+            .expect("peak_rss_exceeded diagnostic");
+        assert_eq!(diagnostic.severity, DiagnosticSeverity::Warning);
+        assert!(diagnostic.evidence.contains_key("peak_rss_bytes"));
+        assert!(summary
+            .budget_results
+            .iter()
+            .all(|result| result.metric != "max_peak_rss_mb"));
+        assert!(run.budgets_passed());
+        assert!(run.diagnostic_gate_failures().is_empty());
+    }
+
+    #[test]
+    fn generous_peak_rss_budget_emits_no_diagnostic() {
+        let run = run_peak_rss_spec(1_000_000.0);
+
+        assert!(run.summaries[0]
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "peak_rss_exceeded"));
+    }
+
+    #[test]
+    #[should_panic(expected = "max_peak_rss_mb must be a finite non-negative number")]
+    fn negative_peak_rss_budget_is_rejected() {
+        let _ = run_peak_rss_spec(-1.0);
     }
 
     #[test]
