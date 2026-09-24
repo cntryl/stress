@@ -375,6 +375,108 @@ struct StressArgs {
 enum StressCommand {
     /// Explain a diagnostic code, or list every code with --list
     Explain(ExplainArgs),
+    /// Compare two saved run artifacts with the --baseline engine.
+    ///
+    /// Exit codes: 0 no gating regression; 1 a gating row regressed;
+    /// 2 incompatible environment, invalid input, or no row could be
+    /// validly compared.
+    Compare(CompareArgs),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum CompareFormat {
+    Text,
+    Md,
+    Json,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct CompareArgs {
+    /// Baseline artifact, or a directory containing latest.json
+    baseline: PathBuf,
+
+    /// Candidate artifact, or a directory containing latest.json
+    candidate: PathBuf,
+
+    /// Output format
+    #[arg(long, value_enum, default_value = "text")]
+    format: CompareFormat,
+
+    /// Compare even when the environments are incompatible (adds a banner)
+    #[arg(long)]
+    ignore_env: bool,
+
+    /// Regression threshold as a fraction (0.05 means 5%)
+    #[arg(long, value_parser = parse_compare_fraction, conflicts_with = "threshold_percent")]
+    threshold: Option<f64>,
+
+    /// Regression threshold in percent (5 means 5%)
+    #[arg(long, value_parser = parse_compare_percent)]
+    threshold_percent: Option<f64>,
+}
+
+fn parse_compare_fraction(value: &str) -> std::result::Result<f64, String> {
+    match value.parse::<f64>() {
+        Ok(parsed) if parsed.is_finite() && (0.0..=1.0).contains(&parsed) => Ok(parsed),
+        _ => Err("expected a number between 0 and 1".to_string()),
+    }
+}
+
+fn parse_compare_percent(value: &str) -> std::result::Result<f64, String> {
+    match value.parse::<f64>() {
+        Ok(parsed) if parsed.is_finite() && (0.0..=100.0).contains(&parsed) => Ok(parsed),
+        _ => Err("expected a number between 0 and 100".to_string()),
+    }
+}
+
+/// Run `cargo stress compare`, returning (exit code, stdout, stderr).
+fn compare_output(args: &CompareArgs) -> (i32, String, String) {
+    use cntryl_stress::compare::{
+        compare_runs, render_json, render_markdown, render_text, resolve_artifact_path,
+        CompareOptions, CompareOutcome,
+    };
+
+    let load = |label: &str, path: &Path| {
+        let resolved = resolve_artifact_path(path);
+        cntryl_stress::artifact::StressRun::load(&resolved)
+            .map_err(|error| format!("cannot load {label} {}: {error}", resolved.display()))
+    };
+    let runs = load("baseline", &args.baseline)
+        .and_then(|baseline| load("candidate", &args.candidate).map(|c| (baseline, c)));
+    let mut options = CompareOptions::new().ignore_environment(args.ignore_env);
+    if let Some(threshold) = args
+        .threshold
+        .or_else(|| args.threshold_percent.map(|percent| percent / 100.0))
+    {
+        options = options.threshold(threshold);
+    }
+    let comparison = match runs
+        .and_then(|(baseline, candidate)| compare_runs(&baseline, &candidate, &options))
+    {
+        Ok(comparison) => comparison,
+        Err(error) => return (2, String::new(), format!("error: {error}\n")),
+    };
+    let stdout = match args.format {
+        CompareFormat::Text => render_text(&comparison),
+        CompareFormat::Md => render_markdown(&comparison),
+        CompareFormat::Json => render_json(&comparison),
+    };
+    let stderr = match (&comparison.environment_mismatch, comparison.outcome) {
+        (Some(reason), CompareOutcome::IncompatibleEnvironment) => {
+            format!("error: {reason}\nhint: pass --ignore-env to compare anyway\n")
+        }
+        _ => String::new(),
+    };
+    (comparison.outcome.exit_code(), stdout, stderr)
+}
+
+fn run_compare(args: &CompareArgs) -> ! {
+    use std::io::Write as _;
+    let (code, stdout, stderr) = compare_output(args);
+    print!("{stdout}");
+    eprint!("{stderr}");
+    let _ = std::io::stdout().flush();
+    std::process::exit(code);
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -603,6 +705,7 @@ fn main() -> Result<()> {
                 run_explain(explain);
                 Ok(())
             }
+            Some(StressCommand::Compare(compare)) => run_compare(compare),
             None => run_stress(&args),
         },
     }
@@ -4453,5 +4556,143 @@ mod tests {
                 .contains("must be a path to a Cargo.toml file"),
             "{error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod compare_tests {
+    use super::*;
+    use cntryl_stress::artifact::{RunProfile, StressRun};
+    use cntryl_stress::{runner::StressRunner, StressRunnerConfig};
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    fn run_with(id: &str, millis: u64) -> StressRun {
+        let config = StressRunnerConfig::for_profile(RunProfile::Default)
+            .samples(10)
+            .warmup_samples(0)
+            .cooldown_samples(0);
+        let mut runner = StressRunner::with_config("suite", config);
+        runner.reporters(Vec::new());
+        runner.run(id, |ctx| {
+            ctx.record_external("work", Duration::from_millis(millis), 500);
+        });
+        runner.finish()
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cargo-stress-compare-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    fn write(path: &Path, run: &StressRun) -> String {
+        std::fs::write(path, serde_json::to_string(run).expect("json")).expect("write");
+        path.display().to_string()
+    }
+
+    fn compare(args: &[&str]) -> (i32, String, String) {
+        let mut command_line = vec!["cargo", "stress", "compare"];
+        command_line.extend_from_slice(args);
+        let cli = Cli::try_parse_from(command_line).expect("compare parses");
+        let Commands::Stress(args) = cli.cmd;
+        let Some(StressCommand::Compare(compare)) = args.command else {
+            panic!("expected compare subcommand");
+        };
+        compare_output(&compare)
+    }
+
+    #[test]
+    fn exit_codes_cover_each_outcome() {
+        let dir = scratch("exit");
+        let base = write(&dir.join("base.json"), &run_with("bench", 10));
+        let same = write(&dir.join("same.json"), &run_with("bench", 10));
+        let slow = write(&dir.join("slow.json"), &run_with("bench", 20));
+        let other = write(&dir.join("other.json"), &run_with("renamed", 10));
+
+        assert_eq!(compare(&[&base, &same]).0, 0);
+        let (code, stdout, _) = compare(&[&base, &slow]);
+        assert_eq!(code, 1, "{stdout}");
+        assert!(stdout.contains("regression"), "{stdout}");
+        assert_eq!(compare(&[&base, &slow, "--threshold-percent", "90"]).0, 0);
+        assert_eq!(compare(&[&base, &slow, "--threshold", "0.9"]).0, 0);
+        assert_eq!(compare(&[&base, &other]).0, 2);
+
+        let missing = dir.join("missing.json").display().to_string();
+        let (code, _, stderr) = compare(&[&base, &missing]);
+        assert_eq!(code, 2);
+        assert!(stderr.contains("error:"), "{stderr}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn threshold_flags_conflict_and_validate() {
+        assert!(Cli::try_parse_from([
+            "cargo",
+            "stress",
+            "compare",
+            "a",
+            "b",
+            "--threshold",
+            "0.1",
+            "--threshold-percent",
+            "5"
+        ])
+        .is_err());
+        assert!(
+            Cli::try_parse_from(["cargo", "stress", "compare", "a", "b", "--threshold", "2"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["cargo", "stress", "compare", "a"]).is_err());
+    }
+
+    #[test]
+    fn environment_mismatch_exits_two_unless_ignored() {
+        let dir = scratch("env");
+        let base = write(&dir.join("base.json"), &run_with("bench", 10));
+        let mut other = run_with("bench", 20);
+        other.environment.cpu_model = "Other CPU".to_string();
+        for sample in &mut other.samples {
+            sample.environment.cpu_model = "Other CPU".to_string();
+        }
+        let cand = write(&dir.join("cand.json"), &other);
+
+        let (code, _, stderr) = compare(&[&base, &cand]);
+        assert_eq!(code, 2);
+        assert!(
+            stderr.contains("baseline environment is incompatible"),
+            "{stderr}"
+        );
+
+        let (code, stdout, _) = compare(&[&base, &cand, "--ignore-env", "--format", "md"]);
+        assert_eq!(code, 1);
+        assert!(stdout.contains("Environment mismatch ignored"), "{stdout}");
+
+        let (code, stdout, _) = compare(&[&base, &cand, "--ignore-env", "--format", "json"]);
+        assert_eq!(code, 1);
+        let json: serde_json::Value = serde_json::from_str(&stdout).expect("json stdout");
+        assert_eq!(json["environment"]["ignored"], true);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn directories_use_latest_json() {
+        let dir = scratch("dir");
+        let base_dir = dir.join("base");
+        let cand_dir = dir.join("cand");
+        std::fs::create_dir_all(&base_dir).expect("dir");
+        std::fs::create_dir_all(&cand_dir).expect("dir");
+        write(&base_dir.join("latest.json"), &run_with("bench", 10));
+        write(&cand_dir.join("latest.json"), &run_with("bench", 20));
+        let (code, stdout, stderr) = compare(&[
+            &base_dir.display().to_string(),
+            &cand_dir.display().to_string(),
+        ]);
+        assert_eq!(code, 1, "{stdout}{stderr}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -623,6 +623,68 @@ the markdown report is appended to the job summary. Set `STRESS_GITHUB=0` (or
 Like other `STRESS_*` booleans, an unparseable value is rejected at startup.
 When the gate fails, a run-level `::error` states the verdict.
 
+### Comparing saved artifacts
+
+`cargo stress compare` compares two saved JSON artifacts offline, with the same
+engine as `--baseline`: both artifacts are validated and their summaries
+recomputed from raw samples (older artifacts use their legacy summary
+semantics), and rows are classified with the same threshold,
+confidence-interval overlap, and trust rules. The baseline must be a passed run.
+
+```bash
+cargo stress compare base/latest.json pr/latest.json
+cargo stress compare target/stress/baselines/my-suite target/stress/my-suite  # directories use latest.json
+cargo stress compare base.json pr.json --format md | gh pr comment <pr> --body-file -
+cargo stress compare base.json pr.json --format json --threshold-percent 10
+```
+
+- `--format text|md|json` (default `text`). `md` prints a table of row
+  (with `file:line` when known), baseline, candidate, change %, and class.
+- `--threshold <FRACTION>` or `--threshold-percent <P>` overrides the
+  candidate profile's threshold. Per-row `max_regression_pct` still wins.
+- `--ignore-env` compares incompatible environments anyway and prints a
+  prominent banner (text/md) or sets `environment.ignored` (json).
+
+Exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | At least one row was validly compared and no gating row regressed. |
+| 1 | At least one gating row (intended gate with gate trust) regressed. |
+| 2 | Incompatible environment without `--ignore-env` (the reason is printed on stderr); invalid input (unreadable or invalid artifact, ineligible baseline, bad flags); or no row could be validly compared (every row is missing from the baseline or was rejected with a reason). |
+
+A row that is `inconclusive` without a reason (within threshold, or
+overlapping confidence intervals) counts as validly compared.
+
+The json output (`schema: "cntryl-stress-compare/1"`) has this shape; fields
+may be added but will not be removed or renamed within the same schema tag:
+
+```json
+{
+  "schema": "cntryl-stress-compare/1",
+  "outcome": "no_regression | regression | incompatible_environment | inconclusive",
+  "exit_code": 0,
+  "baseline_suite": "my-suite",
+  "candidate_suite": "my-suite",
+  "environment": { "mismatch": null, "ignored": false },
+  "rows": [
+    {
+      "benchmark_id": "my-suite/bench/work",
+      "primary_metric": "throughput",
+      "baseline_value": 50000.0,
+      "candidate_value": 25000.0,
+      "change_percent": -50.0,
+      "threshold": 0.05,
+      "confidence_intervals_overlap": false,
+      "classification": "regression | improvement | inconclusive | missing_baseline",
+      "gating": true,
+      "reason": null,
+      "source": { "file": "benches/my_suite.rs", "line": 12 }
+    }
+  ]
+}
+```
+
 ## Artifacts
 
 Artifact paths are relative to the bench package root, because Cargo runs bench
