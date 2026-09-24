@@ -26,8 +26,8 @@ pub enum CompareOutcome {
     Regression,
     /// Environments are incompatible and `--ignore-env` was not given. Exit 2.
     IncompatibleEnvironment,
-    /// No row could be validly compared (every row is missing from the
-    /// baseline or was rejected with a reason). Exit 2.
+    /// An intended-gate or budgeted row, or every row, could not be validly
+    /// compared (missing from the baseline or rejected with a reason). Exit 2.
     Inconclusive,
 }
 
@@ -166,6 +166,11 @@ pub fn compare_runs(
         threshold,
     );
 
+    // Gate semantics mirror `--baseline`: the stored candidate summaries carry
+    // the trust class and budgets the live run would have used, so evaluate
+    // the public gate predicates on the candidate with these comparisons.
+    let mut gate_view = candidate.clone();
+    gate_view.comparisons.clone_from(&comparisons);
     let rows = comparisons
         .into_iter()
         .map(|comparison| {
@@ -174,8 +179,10 @@ pub fn compare_runs(
                 .iter()
                 .find(|summary| summary.benchmark_id == comparison.benchmark_id);
             CompareRow {
-                gating: stored
-                    .is_some_and(|summary| summary.is_intended_gate() && summary.is_gate()),
+                gating: stored.is_some_and(|summary| {
+                    (summary.is_intended_gate() && summary.is_gate())
+                        || summary.budgets.max_regression_pct.is_some()
+                }),
                 source: stored.and_then(|summary| summary.source.clone()),
                 comparison,
             }
@@ -189,10 +196,13 @@ pub fn compare_runs(
         .any(|row| row.gating && row.comparison.classification == ComparisonClass::Regression)
     {
         CompareOutcome::Regression
-    } else if rows.iter().all(|row| {
-        row.comparison.classification == ComparisonClass::MissingBaseline
-            || row.comparison.reason.is_some()
-    }) {
+    } else if !gate_view.regression_budgets_passed()
+        || !gate_view.rejected_gate_comparisons().is_empty()
+        || rows.iter().all(|row| {
+            row.comparison.classification == ComparisonClass::MissingBaseline
+                || row.comparison.reason.is_some()
+        })
+    {
         CompareOutcome::Inconclusive
     } else {
         CompareOutcome::NoRegression
@@ -253,7 +263,7 @@ pub fn render_text(comparison: &RunComparison) -> String {
             let _ = writeln!(out, "!!! {reason}");
             let _ = writeln!(out);
         } else {
-            let _ = writeln!(out, "error: {reason}");
+            let _ = writeln!(out, "incompatible environment: {reason}");
         }
     }
     let _ = writeln!(
@@ -285,11 +295,34 @@ pub fn render_text(comparison: &RunComparison) -> String {
     out
 }
 
+/// Escape artifact-controlled text for GitHub-flavored markdown: HTML is
+/// entity-escaped, markdown punctuation (including `|`, links, and
+/// `@mentions`) is backslash-escaped, and newlines are flattened, so the text
+/// is safe inside a table cell or blockquote of a PR comment.
+fn escape_untrusted_markdown(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '&' => escaped.push_str("&amp;"),
+            '\r' | '\n' => escaped.push(' '),
+            '\\' | '`' | '*' | '_' | '{' | '}' | '[' | ']' | '(' | ')' | '#' | '!' | '|' | '@'
+            | '~' => {
+                escaped.push('\\');
+                escaped.push(character);
+            }
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
 /// Markdown rendering suitable for `gh pr comment --body-file -`.
 #[must_use]
 pub fn render_markdown(comparison: &RunComparison) -> String {
-    use crate::reporting::escape_markdown_cell as esc;
     use std::fmt::Write as _;
+    let esc = escape_untrusted_markdown;
     let mut out = String::new();
     let _ = writeln!(
         out,
@@ -299,9 +332,9 @@ pub fn render_markdown(comparison: &RunComparison) -> String {
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "Baseline `{}` vs candidate `{}`.",
-        comparison.baseline_suite.replace('`', "'"),
-        comparison.candidate_suite.replace('`', "'")
+        "Baseline {} vs candidate {}.",
+        esc(&comparison.baseline_suite),
+        esc(&comparison.candidate_suite)
     );
     let _ = writeln!(out);
     if let Some(reason) = &comparison.environment_mismatch {
@@ -312,7 +345,7 @@ pub fn render_markdown(comparison: &RunComparison) -> String {
         };
         let _ = writeln!(out, "> [!WARNING]");
         let _ = writeln!(out, "> **{heading}.**");
-        let _ = writeln!(out, "> {}", reason.replace(['\r', '\n'], " "));
+        let _ = writeln!(out, "> {}", esc(reason));
         let _ = writeln!(out);
     }
     let _ = writeln!(out, "| Row | Baseline | Candidate | Change | Class |");
@@ -427,6 +460,65 @@ mod tests {
         let run = runner.finish();
         assert!(run.meets_min_quality(QualityClass::Acceptable));
         run
+    }
+
+    fn run_two(suite: &str, first: &str, second: &str) -> StressRun {
+        let config = StressRunnerConfig::for_profile(RunProfile::Default)
+            .samples(10)
+            .warmup_samples(0)
+            .cooldown_samples(0);
+        let mut runner = StressRunner::with_config(suite, config);
+        runner.reporters(Vec::new());
+        for id in [first, second] {
+            runner.run(id, |ctx| {
+                ctx.record_external("work", Duration::from_millis(10), 500);
+            });
+        }
+        runner.finish()
+    }
+
+    #[test]
+    fn uncompared_intended_gate_row_is_not_a_pass() {
+        let base = run_with("s", "a", 10);
+        let cand = run_two("s", "a", "b");
+        let result = compare_runs(&base, &cand, &CompareOptions::new()).expect("compare");
+        assert_eq!(result.outcome, CompareOutcome::Inconclusive);
+    }
+
+    #[test]
+    fn regression_budget_rows_gate_regardless_of_trust() {
+        let base = run_with("s", "bench", 10);
+        let mut cand = run_with("s", "bench", 20);
+        cand.summaries[0].trust_class = crate::artifact::TrustClass::Diagnostic;
+        cand.summaries[0].budgets.max_regression_pct = Some(5.0);
+        cand.summaries[0]
+            .metadata
+            .insert("trust_class".to_string(), "diagnostic".to_string());
+        for spec in &mut cand.benchmark_specs {
+            spec.budgets.max_regression_pct = Some(5.0);
+            spec.metadata
+                .insert("trust_class".to_string(), "diagnostic".to_string());
+        }
+        let result = compare_runs(&base, &cand, &CompareOptions::new()).expect("compare");
+        assert_eq!(result.outcome, CompareOutcome::Regression);
+    }
+
+    #[test]
+    fn markdown_neutralizes_untrusted_html_and_links() {
+        let base = run_with("s", "bench", 10);
+        let mut cand = run_with("s", "bench", 20);
+        let evil = "<!-- [x](http://e) @team";
+        cand.environment.cpu_model = evil.to_string();
+        for sample in &mut cand.samples {
+            sample.environment.cpu_model = evil.to_string();
+        }
+        cand.summaries[0].source = Some(SourceLocation::new("<b>x</b>.rs", 1));
+        let result = compare_runs(&base, &cand, &CompareOptions::new()).expect("compare");
+        let md = render_markdown(&result);
+        assert!(!md.contains('<'), "{md}");
+        assert!(!md.contains("[x]("), "{md}");
+        assert!(!md.contains(" @team"), "{md}");
+        assert!(!render_text(&result).contains("error:"));
     }
 
     fn change_cpu(run: &mut StressRun) {

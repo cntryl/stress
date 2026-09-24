@@ -649,9 +649,9 @@ Exit codes:
 
 | Code | Meaning |
 | --- | --- |
-| 0 | At least one row was validly compared and no gating row regressed. |
-| 1 | At least one gating row (intended gate with gate trust) regressed. |
-| 2 | Incompatible environment without `--ignore-env` (the reason is printed on stderr); invalid input (unreadable or invalid artifact, ineligible baseline, bad flags); or no row could be validly compared (every row is missing from the baseline or was rejected with a reason). |
+| 0 | At least one row was validly compared, no gating row regressed, and every intended-gate or `max_regression_pct` row was validly compared. |
+| 1 | A gating row regressed. Gating rows are intended gates with gate trust, plus any row with `max_regression_pct` regardless of trust. |
+| 2 | Incompatible environment without `--ignore-env` (the reason is printed on stderr); invalid input (unreadable or invalid artifact, ineligible baseline, bad flags); or incomplete coverage: an intended-gate or `max_regression_pct` row is missing from the baseline or was rejected with a reason, or no row at all could be validly compared. These are the cases where `--baseline` would also fail the gate. |
 
 A row that is `inconclusive` without a reason (within threshold, or
 overlapping confidence intervals) counts as validly compared.

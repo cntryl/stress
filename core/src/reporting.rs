@@ -871,7 +871,7 @@ fn artifact_suite_directory_name(suite: &str) -> std::io::Result<String> {
 }
 
 /// Escape text for a single Markdown table cell.
-pub(crate) fn escape_markdown_cell(value: &str) -> String {
+fn escape_markdown_cell(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     let mut characters = value.chars().peekable();
     while let Some(character) = characters.next() {
