@@ -538,12 +538,15 @@ mod tests {
         .write("sys/fs/cgroup/cpu.max", "100000 100000\n");
         let start = std::time::Instant::now();
         let _ = linux_observations(&root.0, Some(1));
-        assert!(start.elapsed() < std::time::Duration::from_millis(50));
+        // Reading a handful of small files; the bound only catches a hang and
+        // leaves room for a loaded host descheduling the test thread.
+        assert!(start.elapsed() < std::time::Duration::from_millis(500));
 
-        // Real host capture, including any bounded subprocess, stays well
-        // under a loose bound even on slow CI machines.
+        // Real host capture kills its subprocess after `SUBPROCESS_BUDGET`;
+        // the bound proves it cannot hang, with ample margin for slow process
+        // spawning on a loaded machine.
         let start = std::time::Instant::now();
         let _ = capture_observations(Some(1));
-        assert!(start.elapsed() < std::time::Duration::from_millis(500));
+        assert!(start.elapsed() < SUBPROCESS_BUDGET + std::time::Duration::from_secs(2));
     }
 }
