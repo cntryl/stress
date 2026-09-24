@@ -2724,7 +2724,7 @@ pub(crate) fn compare_summaries_with_specs(
     comparisons
 }
 
-fn incompatible_environment_reason(
+pub(crate) fn incompatible_environment_reason(
     current: &EnvironmentInfo,
     baseline: &EnvironmentInfo,
 ) -> Option<String> {

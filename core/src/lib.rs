@@ -51,6 +51,7 @@
 
 mod allocation;
 pub mod artifact;
+pub mod compare;
 mod config;
 pub mod context;
 pub mod diagnostics;
