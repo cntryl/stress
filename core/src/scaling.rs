@@ -415,6 +415,7 @@ mod tests {
             allocs_per_op: None,
             bytes_per_op: None,
             observations: Vec::new(),
+            peak_rss_bytes: None,
             quality: QualityClass::Acceptable,
             trust_class: TrustClass::Gate,
             budgets: BenchmarkBudgets::default(),
