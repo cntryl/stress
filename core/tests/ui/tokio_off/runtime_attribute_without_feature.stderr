@@ -1,0 +1,7 @@
+error: #[stress(runtime = "tokio")] requires the `tokio` feature of cntryl-stress; add `features = ["tokio"]` to the cntryl-stress dependency
+ --> tests/ui/tokio_off/runtime_attribute_without_feature.rs:3:1
+  |
+3 | #[stress(tier = 2, runtime = "tokio")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `::cntryl_stress::__stress_tokio_block_on` which comes from the expansion of the attribute macro `stress` (in Nightly builds, run with -Z macro-backtrace for more info)

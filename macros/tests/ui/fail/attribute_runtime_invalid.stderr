@@ -1,0 +1,19 @@
+error: stress runtime must be "tokio" or "tokio-multi"
+ --> tests/ui/fail/attribute_runtime_invalid.rs:3:30
+  |
+3 | #[stress(tier = 2, runtime = "async-std")]
+  |                              ^^^^^^^^^^^
+
+error: #[stress(runtime = ...)] applies only to async benchmark functions
+ --> tests/ui/fail/attribute_runtime_invalid.rs:9:4
+  |
+9 | fn sync_with_runtime(ctx: &mut StressContext) {
+  |    ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `StressContext`
+ --> tests/ui/fail/attribute_runtime_invalid.rs:1:28
+  |
+1 | use stress_alias::{stress, StressContext};
+  |                            ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
