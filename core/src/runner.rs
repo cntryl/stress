@@ -1330,11 +1330,12 @@ fn count_per_op(count: u64, operations: u64) -> Option<f64> {
 }
 
 fn capture_environment(config: &StressRunnerConfig) -> EnvironmentInfo {
+    let core_count = std::thread::available_parallelism()
+        .ok()
+        .map(std::num::NonZeroUsize::get);
     EnvironmentInfo {
         cpu_model: detect_cpu_model(),
-        core_count: std::thread::available_parallelism()
-            .ok()
-            .map(std::num::NonZeroUsize::get),
+        core_count,
         os: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
         rustc_version: command_stdout("rustc", &["--version"])
             .unwrap_or_else(|| "unknown".to_string()),
@@ -1354,6 +1355,7 @@ fn capture_environment(config: &StressRunnerConfig) -> EnvironmentInfo {
         command_line: std::env::args().collect(),
         profile_config: config.profile_config(),
         timer_resolution_ns: measure_timer_resolution_ns(),
+        observations: crate::environment::capture_observations(core_count),
     }
 }
 
@@ -1511,6 +1513,8 @@ pub enum RunGate {
     BudgetFailed,
     /// Canonical result publication failed.
     ArtifactFailed,
+    /// `require_quiet_env` is set and an environment observation is adverse.
+    EnvironmentFailed,
 }
 
 /// Evaluate a run against its profile policy.
@@ -1521,6 +1525,11 @@ pub fn evaluate_run_gate(run: &StressRun) -> RunGate {
     }
     if !run.correctness_passed() {
         return RunGate::CorrectnessFailed;
+    }
+    if run.environment.profile_config.require_quiet_env
+        && run.environment.adverse_observations().next().is_some()
+    {
+        return RunGate::EnvironmentFailed;
     }
     if !run.budgets_passed() {
         return RunGate::BudgetFailed;
@@ -2542,6 +2551,50 @@ mod tests {
             ctx.measure("work", || std::thread::sleep(Duration::from_micros(1)));
         });
         runner.finish()
+    }
+
+    #[test]
+    fn adverse_observations_fail_the_gate_only_when_quiet_env_is_required() {
+        let mut run = warning_diagnostic_run(None);
+        run.environment.observations = vec![crate::artifact::EnvironmentObservation::new(
+            "load_average",
+            "0.1",
+            false,
+            "",
+        )];
+        run.environment.profile_config.require_quiet_env = true;
+        assert_eq!(evaluate_run_gate(&run), RunGate::Passed);
+
+        run.environment
+            .observations
+            .push(crate::artifact::EnvironmentObservation::new(
+                "power_source",
+                "battery",
+                true,
+                "on battery",
+            ));
+        assert_eq!(evaluate_run_gate(&run), RunGate::EnvironmentFailed);
+
+        run.environment.profile_config.require_quiet_env = false;
+        assert_eq!(evaluate_run_gate(&run), RunGate::Passed);
+    }
+
+    #[test]
+    fn captured_environment_records_observations_from_the_host_probe() {
+        let environment = capture_environment(&StressRunnerConfig::new());
+        assert!(environment.observations.iter().all(|observation| [
+            "cpu_governor",
+            "cpu_boost",
+            "load_average",
+            "cpu_quota",
+            "power_source"
+        ]
+        .contains(&observation.key.as_str())));
+        #[cfg(target_os = "linux")]
+        assert!(environment
+            .observations
+            .iter()
+            .any(|observation| observation.key == "load_average"));
     }
 
     #[test]

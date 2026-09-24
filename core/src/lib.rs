@@ -55,6 +55,7 @@ pub mod compare;
 mod config;
 pub mod context;
 pub mod diagnostics;
+mod environment;
 mod error;
 mod harness;
 pub mod reporting;

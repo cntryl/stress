@@ -1353,6 +1353,27 @@ fn write_markdown_attention(output: &mut String, run: &StressRun) {
     }
 }
 
+fn write_markdown_environment(output: &mut String, run: &StressRun) {
+    if !run.environment.observations.is_empty() {
+        let _ = writeln!(output, "## Environment");
+        let _ = writeln!(output);
+        for observation in &run.environment.observations {
+            let value = escape_markdown_cell(&observation.value);
+            if observation.adverse {
+                let detail = if observation.detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", escape_markdown_cell(&observation.detail))
+                };
+                let _ = writeln!(output, "- `{}`: {value} (adverse{detail})", observation.key);
+            } else {
+                let _ = writeln!(output, "- `{}`: {value}", observation.key);
+            }
+        }
+        let _ = writeln!(output);
+    }
+}
+
 pub(crate) fn format_markdown_report(run: &StressRun) -> String {
     let mut output = String::new();
     let _ = writeln!(output, "# {}", run.suite);
@@ -1381,6 +1402,7 @@ pub(crate) fn format_markdown_report(run: &StressRun) -> String {
         }
         let _ = writeln!(output);
     }
+    write_markdown_environment(&mut output, run);
     let _ = writeln!(output, "## Needs attention");
     let _ = writeln!(output);
     write_markdown_attention(&mut output, run);
@@ -1488,6 +1510,40 @@ fn write_run_header(output: &mut String, runs: &[StressRun]) {
     let _ = writeln!(output, "@cntryl/stress v{}", first.tool_version);
 }
 
+/// Human lines describing captured environment observations. Empty when
+/// nothing was observed.
+pub(crate) fn environment_lines(run: &StressRun) -> Vec<String> {
+    let observations = &run.environment.observations;
+    if observations.is_empty() {
+        return Vec::new();
+    }
+    let facts = observations
+        .iter()
+        .map(|observation| {
+            let marker = if observation.adverse {
+                " (adverse)"
+            } else {
+                ""
+            };
+            format!("{}={}{marker}", observation.key, observation.value)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut lines = vec![format!("environment: {facts}")];
+    lines.extend(
+        run.environment
+            .adverse_observations()
+            .filter(|observation| !observation.detail.is_empty())
+            .map(|observation| {
+                format!(
+                    "environment warning: {}: {}",
+                    observation.key, observation.detail
+                )
+            }),
+    );
+    lines
+}
+
 /// Human lines describing baseline pooling and confirm-on-regression
 /// attempts. Empty for runs that used neither.
 pub(crate) fn noise_gating_lines(run: &StressRun) -> Vec<String> {
@@ -1534,6 +1590,9 @@ pub(crate) fn noise_gating_lines(run: &StressRun) -> Vec<String> {
 
 fn write_suite_block(output: &mut String, run: &StressRun) {
     let _ = writeln!(output, "{}", run.suite);
+    for line in environment_lines(run) {
+        let _ = writeln!(output, "{line}");
+    }
     for line in noise_gating_lines(run) {
         let _ = writeln!(output, "{line}");
     }
@@ -4238,6 +4297,50 @@ mod tests {
         assert!(
             markdown.contains("at `benches/queue.rs:42`"),
             "missing location in:\n{markdown}"
+        );
+    }
+
+    #[test]
+    fn environment_observations_render_in_console_and_markdown() {
+        let mut run = run_with_summaries(vec![located_micro_summary()]);
+        assert!(!format_console_output(&run).contains("environment:"));
+        assert!(!format_markdown_report(&run).contains("## Environment"));
+
+        run.environment.observations = vec![
+            crate::artifact::EnvironmentObservation::new(
+                "cpu_governor",
+                "powersave",
+                true,
+                "clocks may ramp",
+            ),
+            crate::artifact::EnvironmentObservation::new(
+                "load_average",
+                "0.10 (4 cores)",
+                false,
+                "",
+            ),
+        ];
+        let console = format_console_output(&run);
+        assert!(
+            console.contains(
+                "environment: cpu_governor=powersave (adverse), load_average=0.10 (4 cores)"
+            ),
+            "{console}"
+        );
+        assert!(
+            console.contains("environment warning: cpu_governor: clocks may ramp"),
+            "{console}"
+        );
+
+        let markdown = format_markdown_report(&run);
+        assert!(markdown.contains("## Environment"), "{markdown}");
+        assert!(
+            markdown.contains("- `cpu_governor`: powersave (adverse: clocks may ramp)"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("- `load_average`: 0.10 (4 cores)\n"),
+            "{markdown}"
         );
     }
 

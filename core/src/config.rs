@@ -92,6 +92,8 @@ pub struct StressRunnerConfig {
     pub console_names: ConsoleNameMode,
     /// Whether human runs emit stderr progress.
     pub progress: bool,
+    /// Fail the run when any environment observation is adverse.
+    pub require_quiet_env: bool,
 }
 
 impl Default for StressRunnerConfig {
@@ -122,6 +124,7 @@ impl StressRunnerConfig {
                 deny_diagnostics: None,
                 deny_codes: Vec::new(),
                 allow_codes: Vec::new(),
+                require_quiet_env: false,
                 regression_threshold: 0.05,
                 sample_duration: Duration::from_millis(500),
                 operations_per_sample: 1,
@@ -141,6 +144,7 @@ impl StressRunnerConfig {
                 deny_diagnostics: None,
                 deny_codes: Vec::new(),
                 allow_codes: Vec::new(),
+                require_quiet_env: false,
                 regression_threshold: 0.05,
                 sample_duration: Duration::from_millis(10),
                 operations_per_sample: 1,
@@ -160,6 +164,7 @@ impl StressRunnerConfig {
                 deny_diagnostics: None,
                 deny_codes: Vec::new(),
                 allow_codes: Vec::new(),
+                require_quiet_env: false,
                 regression_threshold: 0.05,
                 sample_duration: Duration::from_secs(1),
                 operations_per_sample: 1,
@@ -179,6 +184,7 @@ impl StressRunnerConfig {
                 deny_diagnostics: None,
                 deny_codes: Vec::new(),
                 allow_codes: Vec::new(),
+                require_quiet_env: false,
                 regression_threshold: 0.05,
                 sample_duration: Duration::from_secs(5),
                 operations_per_sample: 1,
@@ -216,6 +222,7 @@ impl StressRunnerConfig {
             report_depth: profile_config.report_depth,
             console_names: profile_config.console_names,
             progress: profile_config.progress,
+            require_quiet_env: profile_config.require_quiet_env,
         }
     }
 
@@ -339,6 +346,7 @@ impl StressRunnerConfig {
             report_depth: self.report_depth.clone(),
             console_names: self.console_names,
             progress: self.progress,
+            require_quiet_env: self.require_quiet_env,
         }
     }
 
@@ -379,6 +387,7 @@ impl StressRunnerConfig {
         next.allow_codes = self.allow_codes;
         next.console_names = self.console_names;
         next.progress = self.progress;
+        next.require_quiet_env = self.require_quiet_env;
         next
     }
 
@@ -514,6 +523,13 @@ impl StressRunnerConfig {
     #[must_use]
     pub const fn deny_diagnostics(mut self, threshold: DiagnosticSeverity) -> Self {
         self.deny_diagnostics = Some(threshold);
+        self
+    }
+
+    /// Fail the run when any captured environment observation is adverse.
+    #[must_use]
+    pub const fn require_quiet_env(mut self, value: bool) -> Self {
+        self.require_quiet_env = value;
         self
     }
 
@@ -892,6 +908,14 @@ where
         parse_quality_env,
         |config, value| config.min_quality = value,
     );
+    parse_env(
+        &get_var,
+        resolution,
+        "STRESS_REQUIRE_QUIET_ENV",
+        "require_quiet_env",
+        parse_bool_env,
+        |config, value| config.require_quiet_env = value,
+    );
 }
 
 fn parse_quality_env(value: &str) -> Option<QualityClass> {
@@ -958,6 +982,7 @@ fn apply_default_sources(metadata: &mut HashMap<String, String>) {
         "threshold_src",
         "fail_on_regression_src",
         "fail_on_quality_src",
+        "require_quiet_env_src",
         "min_quality_src",
     ] {
         metadata
@@ -1303,6 +1328,29 @@ mod tests {
         let errors = cfg.validation_errors();
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("did you mean 'too_fast'"), "{errors:?}");
+    }
+
+    #[test]
+    fn require_quiet_env_flows_from_builder_and_env_and_survives_profile_changes() {
+        assert!(!StressRunnerConfig::new().require_quiet_env);
+        let cfg = StressRunnerConfig::new()
+            .require_quiet_env(true)
+            .profile(RunProfile::Release);
+        assert!(cfg.require_quiet_env);
+        assert!(cfg.profile_config().require_quiet_env);
+
+        let resolution = resolve(&[("STRESS_REQUIRE_QUIET_ENV", "1")]);
+        assert!(resolution.warnings.is_empty(), "{:?}", resolution.warnings);
+        assert!(resolution.config.require_quiet_env);
+        assert_eq!(
+            resolution
+                .metadata
+                .get("require_quiet_env_src")
+                .map(String::as_str),
+            Some("env STRESS_REQUIRE_QUIET_ENV")
+        );
+        let resolution = resolve(&[("STRESS_REQUIRE_QUIET_ENV", "maybe")]);
+        assert_eq!(resolution.warnings.len(), 1);
     }
 
     #[test]

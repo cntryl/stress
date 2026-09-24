@@ -1171,9 +1171,58 @@ pub struct EnvironmentInfo {
     /// Informational only: it never affects baseline compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timer_resolution_ns: Option<u64>,
+    /// Best-effort host facts (CPU governor, boost, load, CPU quota, power
+    /// source) captured read-only at run start.
+    ///
+    /// Informational only: they never affect baseline compatibility. They fail
+    /// the run only when `require_quiet_env` is set and one is adverse.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observations: Vec<EnvironmentObservation>,
+}
+
+/// One best-effort host fact captured with the environment.
+///
+/// Fields may be added in minor releases; use [`EnvironmentObservation::new`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct EnvironmentObservation {
+    /// Stable machine-readable key, such as `cpu_governor`.
+    pub key: String,
+    /// Observed value, such as `powersave`.
+    pub value: String,
+    /// Whether the fact is likely to add measurement noise.
+    pub adverse: bool,
+    /// Human explanation of why the fact matters.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+}
+
+impl EnvironmentObservation {
+    /// Construct an observation.
+    #[must_use]
+    pub fn new(
+        key: impl Into<String>,
+        value: impl Into<String>,
+        adverse: bool,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            value: value.into(),
+            adverse,
+            detail: detail.into(),
+        }
+    }
 }
 
 impl EnvironmentInfo {
+    /// Observations flagged as likely to add measurement noise.
+    pub fn adverse_observations(&self) -> impl Iterator<Item = &EnvironmentObservation> {
+        self.observations
+            .iter()
+            .filter(|observation| observation.adverse)
+    }
+
     /// Construct an explicit unknown environment for fallback paths and tests.
     #[must_use]
     pub fn unknown(profile_config: ProfileConfig) -> Self {
@@ -1189,6 +1238,7 @@ impl EnvironmentInfo {
             command_line: Vec::new(),
             profile_config,
             timer_resolution_ns: None,
+            observations: Vec::new(),
         }
     }
 }
@@ -1198,6 +1248,7 @@ impl EnvironmentInfo {
 /// Fields may be added in minor releases, so struct-literal construction is
 /// not supported outside this crate; use the constructor and assign fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 #[non_exhaustive]
 pub struct ProfileConfig {
     /// Selected run profile.
@@ -1242,6 +1293,9 @@ pub struct ProfileConfig {
     /// Whether human runs emit stderr progress.
     #[serde(default = "default_progress")]
     pub progress: bool,
+    /// Fail the run when any environment observation is adverse.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_quiet_env: bool,
 }
 
 impl Default for ProfileConfig {
@@ -1264,6 +1318,7 @@ impl Default for ProfileConfig {
             report_depth: "default".to_string(),
             console_names: ConsoleNameMode::Compact,
             progress: true,
+            require_quiet_env: false,
         }
     }
 }
@@ -4461,6 +4516,7 @@ mod tests {
             command_line: Vec::new(),
             profile_config: ProfileConfig::default(),
             timer_resolution_ns: None,
+            observations: Vec::new(),
         }
     }
 
@@ -5668,6 +5724,36 @@ mod tests {
             .expect("required")
             .iter()
             .any(|field| field == "timer_resolution_ns"));
+    }
+
+    #[test]
+    fn environment_observations_are_additive_and_never_break_compatibility() {
+        let mut current = test_env();
+        current.observations = vec![EnvironmentObservation::new(
+            "cpu_governor",
+            "powersave",
+            true,
+            "not performance",
+        )];
+        let baseline = test_env();
+        assert_eq!(incompatible_environment_reason(&current, &baseline), None);
+        assert_eq!(incompatible_environment_reason(&baseline, &current), None);
+        assert_eq!(current.adverse_observations().count(), 1);
+        assert_eq!(baseline.adverse_observations().count(), 0);
+
+        let json = serde_json::to_value(&baseline).expect("serialize");
+        assert!(json.get("observations").is_none());
+        let json = serde_json::to_value(&current).expect("serialize");
+        assert_eq!(json["observations"][0]["key"], "cpu_governor");
+        assert_eq!(json["observations"][0]["adverse"], true);
+        let parsed: EnvironmentInfo = serde_json::from_value(json).expect("round trip");
+        assert_eq!(parsed.observations, current.observations);
+
+        let schema =
+            serde_json::from_str::<serde_json::Value>(ARTIFACT_JSON_SCHEMA).expect("schema");
+        assert!(schema["$defs"]["environment"]["properties"]["observations"].is_object());
+        assert!(schema["$defs"]["environmentObservation"].is_object());
+        assert!(schema["$defs"]["profileConfig"]["properties"]["require_quiet_env"].is_object());
     }
 
     #[test]
