@@ -1845,6 +1845,9 @@ fn apply_stress_env(
     cmd.env("STRESS_SUITE", target.suite_name());
     cmd.env("STRESS_ARTIFACT_NAMESPACE", target.artifact_namespace());
     cmd.env("STRESS_BUILD_INPUT_IDENTITY", build_identity);
+    // Keep test-spawned bench children from annotating the real CI job.
+    #[cfg(test)]
+    cmd.env("STRESS_GITHUB", "0");
     if let Some(timeout) = args.timeout_secs {
         cmd.env("STRESS_TIMEOUT_SECS", timeout.get().to_string());
     }
@@ -2643,6 +2646,7 @@ mod tests {
             .env_remove("STRESS_ARTIFACT_NAMESPACE")
             .env_remove("STRESS_BASELINE")
             .env_remove("STRESS_SAVE_BASELINE")
+            .env("STRESS_GITHUB", "0")
             .env("STRESS_BUILD_INPUT_IDENTITY", build_identity)
             .args([
                 "bench",

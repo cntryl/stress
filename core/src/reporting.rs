@@ -2,8 +2,8 @@
 
 use crate::artifact::{
     BenchmarkDiagnostic, BenchmarkSpec, BenchmarkSummary, ComparisonClass, ComparisonResult,
-    ConsoleNameMode, CorrectnessSummary, PrimaryMetric, QualityClass, RunProfile, SamplePhase,
-    StressRun, SummaryStats, TrustClass,
+    ConsoleNameMode, CorrectnessSummary, DiagnosticSeverity, PrimaryMetric, QualityClass,
+    RunProfile, SamplePhase, StressRun, SummaryStats, TrustClass,
 };
 use crate::config::StressRunnerConfig;
 use crate::diagnostics::catalog_fix;
@@ -939,20 +939,77 @@ impl Reporter for JsonReporter {
     }
 }
 
-/// GitHub Actions reporter that emits annotations when running in Actions.
-#[allow(dead_code)]
-pub struct GitHubActionsReporter;
+/// GitHub Actions reporter.
+///
+/// Emits workflow-command annotations (`::error`, `::warning`, `::notice`) on
+/// stderr, never stdout, so `--json` output stays machine readable. When a step
+/// summary path is configured (by default from `GITHUB_STEP_SUMMARY`), the
+/// markdown report is appended to it.
+pub struct GitHubActionsReporter {
+    step_summary: Option<PathBuf>,
+    sink: AnnotationSink,
+}
 
-#[allow(dead_code)]
+enum AnnotationSink {
+    Stderr,
+    #[cfg(test)]
+    Buffer(std::sync::Arc<Mutex<Vec<u8>>>),
+}
+
 impl GitHubActionsReporter {
-    /// Create a new GitHub Actions reporter.
+    /// Create a reporter that appends to `$GITHUB_STEP_SUMMARY` when set.
     #[must_use]
-    pub const fn new() -> Self {
-        Self
+    pub fn new() -> Self {
+        Self {
+            step_summary: std::env::var_os("GITHUB_STEP_SUMMARY")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+            sink: AnnotationSink::Stderr,
+        }
     }
 
-    fn is_github_actions() -> bool {
-        std::env::var("GITHUB_ACTIONS").is_ok()
+    /// Override the step summary file; `None` disables the step summary.
+    #[must_use]
+    pub fn with_step_summary_path(mut self, path: Option<PathBuf>) -> Self {
+        self.step_summary = path;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_annotation_buffer(mut self, buffer: std::sync::Arc<Mutex<Vec<u8>>>) -> Self {
+        self.sink = AnnotationSink::Buffer(buffer);
+        self
+    }
+
+    fn write_annotations(&self, text: &str) -> std::io::Result<()> {
+        match &self.sink {
+            AnnotationSink::Stderr => {
+                let mut stderr = std::io::stderr().lock();
+                stderr.write_all(text.as_bytes())?;
+                stderr.flush()
+            }
+            #[cfg(test)]
+            AnnotationSink::Buffer(buffer) => {
+                buffer
+                    .lock()
+                    .map_err(|_| std::io::Error::other("annotation buffer poisoned"))?
+                    .extend_from_slice(text.as_bytes());
+                Ok(())
+            }
+        }
+    }
+
+    fn append_step_summary(path: &Path, run: &StressRun) -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let mut markdown = format_markdown_report(run);
+        if !markdown.ends_with('\n') {
+            markdown.push('\n');
+        }
+        file.write_all(markdown.as_bytes())?;
+        file.flush()
     }
 }
 
@@ -964,35 +1021,199 @@ impl Default for GitHubActionsReporter {
 
 impl Reporter for GitHubActionsReporter {
     fn suite_end(&self, run: &StressRun) -> std::io::Result<()> {
-        if !Self::is_github_actions() {
-            return Ok(());
-        }
-
-        for comparison in &run.comparisons {
-            if comparison.classification == ComparisonClass::Regression {
-                println!(
-                    "::warning title=Performance Regression in {}::Benchmark '{}' regressed by {:.1}%",
-                    run.suite,
-                    comparison.benchmark_id,
-                    comparison.change_percent.unwrap_or_default().abs()
-                );
+        self.write_annotations(&format_github_annotations(run))?;
+        if let Some(path) = &self.step_summary {
+            // The step summary is presentation only; failing to append it
+            // must not fail the benchmark gate.
+            if let Err(error) = Self::append_step_summary(path, run) {
+                self.write_annotations(&format!(
+                    "::warning title={}::{}\n",
+                    escape_workflow_property("stress: step summary"),
+                    escape_workflow_data(&format!(
+                        "could not append to {}: {error}",
+                        path.display()
+                    ))
+                ))?;
             }
         }
-
-        println!("::group::Stress Results - {}", run.suite);
-        for summary in &run.summaries {
-            println!(
-                "  {}: {} ({})",
-                summary.name,
-                summary
-                    .primary_value()
-                    .map_or_else(|| "n/a".to_string(), |value| format_metric(value, summary)),
-                summary.quality
-            );
-        }
-        println!("::endgroup::");
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnnotationLevel {
+    Error,
+    Warning,
+    Notice,
+}
+
+impl AnnotationLevel {
+    const fn command(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warning => "warning",
+            Self::Notice => "notice",
+        }
+    }
+}
+
+fn format_github_annotations(run: &StressRun) -> String {
+    let denied = run
+        .diagnostic_gate_failures()
+        .into_iter()
+        .map(|diagnostic| (diagnostic.benchmark_id.as_str(), diagnostic.code.as_str()))
+        .collect::<BTreeSet<_>>();
+    let quality_failures = quality_gate_failures(run)
+        .into_iter()
+        .map(|summary| summary.benchmark_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let comparisons = comparison_by_benchmark(run);
+    let gating_regressions = if run.environment.profile_config.fail_on_regression {
+        run.regressions()
+            .into_iter()
+            .map(|comparison| comparison.benchmark_id.as_str())
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
+    let mut output = String::new();
+    for summary in &run.summaries {
+        if !summary.correctness.passed {
+            push_annotation(
+                &mut output,
+                AnnotationLevel::Error,
+                summary,
+                "correctness failed",
+                &correctness_note(&summary.correctness),
+            );
+        }
+        if summary.budget_results.iter().any(|result| !result.passed) {
+            push_annotation(
+                &mut output,
+                AnnotationLevel::Error,
+                summary,
+                "budget failed",
+                &budget_note(summary),
+            );
+        }
+        if quality_failures.contains(summary.benchmark_id.as_str()) {
+            push_annotation(
+                &mut output,
+                AnnotationLevel::Error,
+                summary,
+                "quality gate failed",
+                &if summary.is_gate() {
+                    format!(
+                        "quality={} below min={}",
+                        summary.quality, run.environment.profile_config.min_quality
+                    )
+                } else {
+                    format!("trust={} is not gate-eligible", summary.trust_class)
+                },
+            );
+        }
+        if let Some(comparison) = comparisons
+            .get(summary.benchmark_id.as_str())
+            .filter(|comparison| comparison.classification == ComparisonClass::Regression)
+        {
+            let level = if gating_regressions.contains(summary.benchmark_id.as_str()) {
+                AnnotationLevel::Error
+            } else {
+                AnnotationLevel::Warning
+            };
+            push_annotation(
+                &mut output,
+                level,
+                summary,
+                "regression",
+                &format!(
+                    "regressed against baseline ({})",
+                    format_delta_cell(comparison)
+                ),
+            );
+        }
+        for diagnostic in &summary.diagnostics {
+            let level =
+                if denied.contains(&(summary.benchmark_id.as_str(), diagnostic.code.as_str())) {
+                    AnnotationLevel::Error
+                } else {
+                    match diagnostic.severity {
+                        DiagnosticSeverity::Error => AnnotationLevel::Error,
+                        DiagnosticSeverity::Warning => AnnotationLevel::Warning,
+                        _ => AnnotationLevel::Notice,
+                    }
+                };
+            push_annotation(
+                &mut output,
+                level,
+                summary,
+                &diagnostic.code,
+                &diagnostic.reason,
+            );
+        }
+    }
+    push_run_gate_annotation(&mut output, run);
+    output
+}
+
+/// Some gate failures (missing baselines, regression budgets, invalid rows,
+/// empty runs, artifact errors) have no single row annotation, so always
+/// state the run verdict.
+fn push_run_gate_annotation(output: &mut String, run: &StressRun) {
+    let gate = crate::runner::evaluate_run_gate(run);
+    if gate != crate::runner::RunGate::Passed {
+        let _ = writeln!(
+            output,
+            "::error title={}::{}",
+            escape_workflow_property("stress: gate failed"),
+            escape_workflow_data(&format!("{}: {gate:?}", run.suite))
+        );
+    }
+}
+
+fn push_annotation(
+    output: &mut String,
+    level: AnnotationLevel,
+    summary: &BenchmarkSummary,
+    title: &str,
+    detail: &str,
+) {
+    let mut properties = Vec::new();
+    if let Some(source) = &summary.source {
+        properties.push(format!("file={}", escape_workflow_property(&source.file)));
+        properties.push(format!("line={}", source.line));
+    }
+    properties.push(format!(
+        "title={}",
+        escape_workflow_property(&format!("stress: {title}"))
+    ));
+    let message = if detail.is_empty() {
+        summary.name.clone()
+    } else {
+        format!("{}: {detail}", summary.name)
+    };
+    let _ = writeln!(
+        output,
+        "::{} {}::{}",
+        level.command(),
+        properties.join(","),
+        escape_workflow_data(&message)
+    );
+}
+
+/// Escape a workflow-command message (`%`, `\r`, `\n`).
+fn escape_workflow_data(value: &str) -> String {
+    value
+        .replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+}
+
+/// Escape a workflow-command property value (data rules plus `:` and `,`).
+fn escape_workflow_property(value: &str) -> String {
+    escape_workflow_data(value)
+        .replace(':', "%3A")
+        .replace(',', "%2C")
 }
 
 /// Combines multiple reporters.
@@ -1684,6 +1905,12 @@ fn push_shape_issues(groups: &mut Vec<IssueGroup>, summaries: &[&BenchmarkSummar
             )
         },
     );
+    push_diagnostic_group(groups, "Async", summaries, "async_misuse", |summary| {
+        format!(
+            "{} showed no observable async scheduling or await overhead.",
+            summary.name
+        )
+    });
     push_diagnostic_group(
         groups,
         "Capped throughput",
@@ -3197,6 +3424,7 @@ mod tests {
         ConsoleNameMode, CorrectnessCounters, CorrectnessSummary, DiagnosticSeverity,
         EnvironmentInfo, MeasurementIntent, Sample, SamplePhase, SummaryStats, SCHEMA_VERSION,
     };
+    use std::sync::Arc;
 
     fn summary(name: &str, value: f64, quality: QualityClass) -> BenchmarkSummary {
         BenchmarkSummary {
@@ -3952,6 +4180,190 @@ mod tests {
             !report.contains(" at "),
             "unexpected location in:\n{report}"
         );
+    }
+
+    #[test]
+    fn console_reports_async_misuse_issue_group() {
+        let mut row = summary("queue::async_row", 1_000.0, QualityClass::Acceptable);
+        row.diagnostics.push(BenchmarkDiagnostic::new(
+            "async_misuse",
+            DiagnosticSeverity::Info,
+            "no await overhead",
+        ));
+        let run = run_with_summaries(vec![row]);
+
+        let report = format_console_output(&run);
+
+        assert!(
+            report.contains("Async"),
+            "missing async group in:\n{report}"
+        );
+        assert!(report.contains("queue::async_row"));
+        assert!(report.contains(catalog_fix("async_misuse")));
+    }
+
+    #[test]
+    fn github_workflow_command_data_and_properties_are_escaped() {
+        assert_eq!(escape_workflow_data("50% a\r\nb"), "50%25 a%0D%0Ab");
+        assert_eq!(
+            escape_workflow_property("C:\\a,b:c%\n"),
+            "C%3A\\a%2Cb%3Ac%25%0A"
+        );
+    }
+
+    fn github_reporter_for_test(
+        step_summary: Option<PathBuf>,
+    ) -> (GitHubActionsReporter, Arc<Mutex<Vec<u8>>>) {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let reporter = GitHubActionsReporter::new()
+            .with_step_summary_path(step_summary)
+            .with_annotation_buffer(Arc::clone(&buffer));
+        (reporter, buffer)
+    }
+
+    fn annotations(buffer: &Arc<Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(buffer.lock().expect("buffer").clone()).expect("utf8")
+    }
+
+    #[test]
+    fn github_reporter_annotates_gate_failures_and_diagnostics() {
+        let mut failing = summary("queue::broken", 1_000.0, QualityClass::Acceptable);
+        failing.source = Some(crate::artifact::SourceLocation::new("benches/q,1.rs", 12));
+        failing.correctness.passed = false;
+        let mut warned = summary("queue::tiny", 1_000.0, QualityClass::Acceptable);
+        warned.source = Some(crate::artifact::SourceLocation::new("benches/q.rs", 30));
+        warned.diagnostics.push(BenchmarkDiagnostic::new(
+            "likely_optimized_away",
+            DiagnosticSeverity::Warning,
+            "50% too\nfast",
+        ));
+        let mut informed = summary("queue::info", 1_000.0, QualityClass::Acceptable);
+        informed.diagnostics.push(BenchmarkDiagnostic::new(
+            "async_misuse",
+            DiagnosticSeverity::Info,
+            "no await",
+        ));
+        let mut errored = summary("queue::err", 1_000.0, QualityClass::Acceptable);
+        errored.diagnostics.push(BenchmarkDiagnostic::new(
+            "invalid_timing",
+            DiagnosticSeverity::Error,
+            "bad clock",
+        ));
+        let run = run_with_summaries(vec![failing, warned, informed, errored]);
+        let (reporter, buffer) = github_reporter_for_test(None);
+
+        reporter.suite_end(&run).expect("github reporter");
+
+        let output = annotations(&buffer);
+        assert!(
+            output.contains("::error file=benches/q%2C1.rs,line=12,title=stress%3A correctness failed::queue::broken"),
+            "{output}"
+        );
+        assert!(
+            output.contains("::warning file=benches/q.rs,line=30,title=stress%3A likely_optimized_away::queue::tiny: 50%25 too%0Afast"),
+            "{output}"
+        );
+        assert!(
+            output.contains("::notice title=stress%3A async_misuse::queue::info: no await"),
+            "{output}"
+        );
+        assert!(
+            output.contains("::error title=stress%3A invalid_timing::queue::err: bad clock"),
+            "{output}"
+        );
+        assert!(
+            output.lines().all(|line| line.starts_with("::")),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn github_reporter_step_summary_failure_warns_without_failing() {
+        let run = run_with_summaries(vec![summary(
+            "queue::fast",
+            1_000.0,
+            QualityClass::Acceptable,
+        )]);
+        let (reporter, buffer) = github_reporter_for_test(Some(std::env::temp_dir()));
+
+        reporter
+            .suite_end(&run)
+            .expect("step summary errors are not reporter failures");
+
+        assert!(annotations(&buffer).contains("::warning title=stress%3A step summary::"));
+    }
+
+    #[test]
+    fn github_reporter_emits_a_run_level_error_when_the_gate_fails() {
+        let run = run_with_summaries(Vec::new());
+        assert_ne!(
+            crate::runner::evaluate_run_gate(&run),
+            crate::runner::RunGate::Passed
+        );
+        let (reporter, buffer) = github_reporter_for_test(None);
+
+        reporter.suite_end(&run).expect("github reporter");
+
+        assert!(
+            annotations(&buffer).contains("::error title=stress%3A gate failed::suite"),
+            "{}",
+            annotations(&buffer)
+        );
+    }
+
+    #[test]
+    fn github_reporter_only_errors_on_regressions_that_fail_the_gate() {
+        let mut row = summary("queue::row", 1_000.0, QualityClass::Acceptable);
+        row.trust_class = TrustClass::Diagnostic;
+        row.metadata
+            .insert("trust_class".to_string(), "gate".to_string());
+        let mut run = run_with_summaries(vec![row]);
+        run.environment.profile_config.fail_on_regression = true;
+        let mut comparison = ComparisonResult::new(
+            "queue::row",
+            PrimaryMetric::Throughput,
+            QualityClass::Acceptable,
+            ComparisonClass::Regression,
+            5.0,
+        );
+        comparison.change_percent = Some(-20.0);
+        run.comparisons.push(comparison);
+        assert!(run.regressions().is_empty());
+        let (reporter, buffer) = github_reporter_for_test(None);
+
+        reporter.suite_end(&run).expect("github reporter");
+
+        let output = annotations(&buffer);
+        assert!(
+            output.contains("::warning title=stress%3A regression::"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn github_reporter_appends_markdown_to_the_step_summary() {
+        let path = std::env::temp_dir().join(format!(
+            "stress-step-summary-{}-{}.md",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, "previous step\n").expect("seed summary");
+        let run = run_with_summaries(vec![summary(
+            "queue::fast",
+            1_000.0,
+            QualityClass::Acceptable,
+        )]);
+        let (reporter, _buffer) = github_reporter_for_test(Some(path.clone()));
+
+        reporter.suite_end(&run).expect("first append");
+        reporter.suite_end(&run).expect("second append");
+
+        let contents = std::fs::read_to_string(&path).expect("read summary");
+        let _ = std::fs::remove_file(&path);
+        assert!(contents.starts_with("previous step\n"), "{contents}");
+        let markdown = format_markdown_report(&run);
+        assert_eq!(contents.matches(markdown.as_str()).count(), 2, "{contents}");
+        assert!(contents.contains("## Needs attention"));
     }
 
     #[test]

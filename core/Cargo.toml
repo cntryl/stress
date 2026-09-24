@@ -31,3 +31,8 @@ cntryl-stress-macros = { version = "=0.4.0", path = "../macros" }
 name = "cargo-stress"
 path = "src/bin/cargo-stress.rs"
 required-features = ["cli"]
+
+[[test]]
+name = "github_actions_json"
+path = "tests/github_actions_json.rs"
+harness = false

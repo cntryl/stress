@@ -606,6 +606,23 @@ cargo bench --bench storage_stress -- --json
 
 `cargo bench --bench ...` uses one console format: one simple benchmark table per suite with `benchmark`, `measurement`, `value`, `p50`, `p95`, `p99`, `rsd`, `trust`, and `mode` columns. Suite-local `issues` appear directly after a table only when a row needs attention, and the run ends with one `result:` line. Use `--json` only for machine-readable stdout.
 
+### GitHub Actions
+
+When `GITHUB_ACTIONS=true`, benchmark binaries also emit GitHub workflow
+annotations on **stderr** (stdout stays clean for `--json`):
+
+- `::error` for gate failures (correctness, budgets, quality gate, gating
+  regressions, denied diagnostic codes) and `Error` diagnostics.
+- `::warning` for `Warning` diagnostics and non-gating regressions.
+- `::notice` for `Info` diagnostics.
+
+Annotations carry `file=` and `line=` when the row's source location is known,
+so they appear inline on the pull request diff. If `GITHUB_STEP_SUMMARY` is set,
+the markdown report is appended to the job summary. Set `STRESS_GITHUB=0` (or
+`false`) to opt out, or `STRESS_GITHUB=1` to force the output outside Actions.
+Like other `STRESS_*` booleans, an unparseable value is rejected at startup.
+When the gate fails, a run-level `::error` states the verdict.
+
 ## Artifacts
 
 Artifact paths are relative to the bench package root, because Cargo runs bench

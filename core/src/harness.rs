@@ -5,7 +5,7 @@ use crate::artifact::{
     QualityClass, RunProfile, StressRun,
 };
 use crate::config::{parse_bool_env, StressRunnerConfig};
-use crate::reporting::{atomic_write, Reporter};
+use crate::reporting::{atomic_write, GitHubActionsReporter, Reporter};
 use crate::runner::{evaluate_run_gate, RunGate, StressRunner};
 use crate::{StressContext, StressError, StressResult};
 use std::collections::{BTreeMap, BTreeSet};
@@ -91,6 +91,41 @@ struct ResolvedStressConfig {
     baseline_dir: PathBuf,
     save_baseline: bool,
     print_config: bool,
+    github_actions: Option<GitHubActionsSettings>,
+}
+
+/// Resolved GitHub Actions output settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitHubActionsSettings {
+    step_summary: Option<PathBuf>,
+}
+
+/// Enable GitHub Actions output inside Actions (`GITHUB_ACTIONS=true`) unless
+/// `STRESS_GITHUB` opts out; `STRESS_GITHUB=true` forces it on elsewhere.
+fn resolve_github_actions<F>(
+    get_var: F,
+    warnings: &mut Vec<String>,
+) -> Option<GitHubActionsSettings>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let in_actions = get_var("GITHUB_ACTIONS")
+        .and_then(|value| parse_bool_env(&value))
+        .unwrap_or(false);
+    let explicit = get_var("STRESS_GITHUB").and_then(|value| {
+        let parsed = parse_bool_env(&value);
+        if parsed.is_none() {
+            warnings.push("invalid STRESS_GITHUB; expected true or false".to_string());
+        }
+        parsed
+    });
+    explicit
+        .unwrap_or(in_actions)
+        .then(|| GitHubActionsSettings {
+            step_summary: get_var("GITHUB_STEP_SUMMARY")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+        })
 }
 
 impl StressBinaryArgs {
@@ -876,7 +911,9 @@ where
     }
 
     let workload = config.filter.take();
+    let github_actions = resolve_github_actions(&get_var, &mut warnings);
     ResolvedStressConfig {
+        github_actions,
         workload,
         config,
         metadata,
@@ -1116,6 +1153,22 @@ fn sanitize_thread_name(benchmark_id: &str) -> String {
         .collect()
 }
 
+fn harness_reporters(resolved: &ResolvedStressConfig) -> Vec<Box<dyn Reporter>> {
+    let mut reporters: Vec<Box<dyn Reporter>> = Vec::new();
+    if resolved.save_baseline {
+        reporters.push(Box::new(BaselineReporter::new(
+            &resolved.baseline_dir,
+            resolved.artifact_namespace.as_deref(),
+        )));
+    }
+    if let Some(settings) = &resolved.github_actions {
+        reporters.push(Box::new(
+            GitHubActionsReporter::new().with_step_summary_path(settings.step_summary.clone()),
+        ));
+    }
+    reporters
+}
+
 fn run_with_resolved_config(resolved: ResolvedStressConfig) {
     exit_on_invalid_config(&resolved.config);
 
@@ -1152,13 +1205,11 @@ fn run_with_resolved_config(resolved: ResolvedStressConfig) {
         }
     }
     let config_for_specs = resolved.config.clone();
+    let extra_reporters = harness_reporters(&resolved);
     let mut runner =
         StressRunner::with_config_and_metadata(&suite_name, resolved.config, resolved.metadata);
-    if resolved.save_baseline {
-        runner.add_reporter(Box::new(BaselineReporter::new(
-            &resolved.baseline_dir,
-            resolved.artifact_namespace.as_deref(),
-        )));
+    for reporter in extra_reporters {
+        runner.add_reporter(reporter);
     }
 
     let mut aborted: Option<SpecRunError> = None;
@@ -2387,6 +2438,55 @@ mod tests {
             resolved.metadata.get("deny_diagnostics_src"),
             Some(&"env STRESS_FAIL_ON_ISSUES".to_string())
         );
+    }
+
+    fn resolve_github(env: &[(&'static str, &str)]) -> ResolvedStressConfig {
+        let env = env
+            .iter()
+            .map(|(key, value)| (*key, (*value).to_string()))
+            .collect::<BTreeMap<_, _>>();
+        resolve_from_binary_args_with(&StressBinaryArgs::default(), |key| env.get(key).cloned())
+    }
+
+    #[test]
+    fn github_actions_reporter_auto_enables_inside_actions() {
+        let resolved = resolve_github(&[
+            ("GITHUB_ACTIONS", "true"),
+            ("GITHUB_STEP_SUMMARY", "/tmp/step-summary.md"),
+        ]);
+        assert_eq!(
+            resolved.github_actions,
+            Some(GitHubActionsSettings {
+                step_summary: Some(PathBuf::from("/tmp/step-summary.md")),
+            })
+        );
+
+        let resolved = resolve_github(&[("GITHUB_ACTIONS", "1")]);
+        assert_eq!(
+            resolved.github_actions,
+            Some(GitHubActionsSettings { step_summary: None })
+        );
+    }
+
+    #[test]
+    fn github_actions_reporter_is_off_outside_actions_and_when_opted_out() {
+        assert_eq!(resolve_github(&[]).github_actions, None);
+        assert_eq!(
+            resolve_github(&[("GITHUB_ACTIONS", "false")]).github_actions,
+            None
+        );
+        for opt_out in ["0", "false"] {
+            let resolved =
+                resolve_github(&[("GITHUB_ACTIONS", "true"), ("STRESS_GITHUB", opt_out)]);
+            assert_eq!(resolved.github_actions, None, "STRESS_GITHUB={opt_out}");
+        }
+        let forced = resolve_github(&[("STRESS_GITHUB", "1")]);
+        assert!(forced.github_actions.is_some());
+        let invalid = resolve_github(&[("GITHUB_ACTIONS", "true"), ("STRESS_GITHUB", "maybe")]);
+        assert!(invalid
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("STRESS_GITHUB")));
     }
 
     #[test]
