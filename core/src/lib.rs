@@ -60,6 +60,7 @@ mod environment;
 mod error;
 mod harness;
 mod histogram;
+pub mod history;
 mod memory;
 pub mod reporting;
 pub mod runner;

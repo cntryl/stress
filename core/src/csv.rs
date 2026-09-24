@@ -104,7 +104,7 @@ fn serde_name<T: serde::Serialize>(value: &T) -> String {
 }
 
 /// Unit of the primary value, e.g. `op/s` or `ns/op`.
-fn primary_unit(summary: &BenchmarkSummary) -> String {
+pub(crate) fn primary_unit(summary: &BenchmarkSummary) -> String {
     let unit = crate::reporting::display_unit(summary);
     match summary.primary_metric {
         PrimaryMetric::Throughput => format!("{unit}/s"),

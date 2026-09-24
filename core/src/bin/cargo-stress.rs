@@ -401,6 +401,176 @@ enum StressCommand {
     Compare(CompareArgs),
     /// Scaffold benches/stress.rs and register it in Cargo.toml
     Init(InitArgs),
+    /// Show per-benchmark history from timestamped artifacts, or prune them
+    History(HistoryArgs),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum HistoryFormat {
+    Text,
+    Md,
+    Csv,
+    Json,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+#[allow(clippy::struct_excessive_bools)]
+struct HistoryArgs {
+    /// Only this suite
+    #[arg(long)]
+    suite: Option<String>,
+
+    /// Only benchmark ids containing this substring
+    #[arg(long, value_name = "ID")]
+    bench: Option<String>,
+
+    /// Only the most recent N compatible runs per suite
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+    last: Option<u64>,
+
+    /// Output format
+    #[arg(long, value_enum, default_value = "text")]
+    format: HistoryFormat,
+
+    /// Artifact root or suite directory (default: the nearest `target/stress`)
+    #[arg(long, value_name = "PATH")]
+    dir: Option<PathBuf>,
+
+    /// Delete the oldest timestamped artifact sets beyond --keep (dry run
+    /// unless --yes); never touches latest.* or baselines
+    #[arg(long, requires = "keep")]
+    prune: bool,
+
+    /// Number of newest artifact sets per suite to keep when pruning
+    #[arg(long, value_name = "N", requires = "prune", value_parser = clap::value_parser!(u64).range(1..))]
+    keep: Option<u64>,
+
+    /// Actually delete when pruning
+    #[arg(long, requires = "prune")]
+    yes: bool,
+}
+
+/// The artifact root `history` reads: `--dir`, else the nearest ancestor's
+/// `target/stress`.
+fn history_root(args: &HistoryArgs, cwd: &Path) -> Result<PathBuf> {
+    if let Some(dir) = &args.dir {
+        let dir = cwd.join(dir);
+        if !dir.is_dir() {
+            bail!("artifact directory does not exist: {}", dir.display());
+        }
+        return Ok(dir);
+    }
+    cwd.ancestors()
+        .map(|ancestor| ancestor.join("target").join("stress"))
+        .find(|candidate| candidate.is_dir())
+        .with_context(|| {
+            format!(
+                "no target/stress directory found from {}; pass --dir",
+                cwd.display()
+            )
+        })
+}
+
+/// Prune output for `cargo stress history --prune`.
+fn prune_output(
+    root: &Path,
+    options: &cntryl_stress::history::HistoryOptions,
+    keep: usize,
+    delete: bool,
+) -> (i32, String, String) {
+    use cntryl_stress::history::{
+        apply_prune, discover_suite_directories, load_suite_history, plan_prune,
+    };
+    let directories = match discover_suite_directories(root) {
+        Ok(directories) => directories,
+        Err(error) => return (2, String::new(), format!("error: {error}\n")),
+    };
+    let mut stdout = String::new();
+    let verb = if delete { "deleted" } else { "would delete" };
+    for directory in directories {
+        if !matches!(load_suite_history(&directory, options), Ok(Some(_))) {
+            continue;
+        }
+        let plan = if delete {
+            apply_prune(&directory, keep)
+        } else {
+            plan_prune(&directory, keep)
+        };
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(error) => {
+                return (
+                    2,
+                    stdout,
+                    format!("error: {}: {error}\n", directory.display()),
+                )
+            }
+        };
+        let _ = writeln!(
+            stdout,
+            "{}: keeping {} artifact sets, {verb} {} files",
+            directory.display(),
+            plan.kept.len(),
+            plan.delete.len()
+        );
+        for path in &plan.delete {
+            let _ = writeln!(stdout, "  {verb} {}", path.display());
+        }
+    }
+    let stderr = if delete {
+        String::new()
+    } else {
+        "dry run: pass --yes to delete\n".to_string()
+    };
+    (0, stdout, stderr)
+}
+
+/// Run `cargo stress history`, returning (exit code, stdout, stderr).
+fn history_output(args: &HistoryArgs, cwd: &Path) -> (i32, String, String) {
+    use cntryl_stress::history::{
+        load_history, render_csv, render_json, render_markdown, render_text, HistoryOptions,
+    };
+    let root = match history_root(args, cwd) {
+        Ok(root) => root,
+        Err(error) => return (2, String::new(), format!("error: {error:#}\n")),
+    };
+    let mut options = HistoryOptions::new();
+    if let Some(suite) = &args.suite {
+        options = options.suite(suite.clone());
+    }
+    if let (true, Some(keep)) = (args.prune, args.keep) {
+        let keep = usize::try_from(keep).unwrap_or(usize::MAX);
+        return prune_output(&root, &options, keep, args.yes);
+    }
+    if let Some(bench) = &args.bench {
+        options = options.bench(bench.clone());
+    }
+    if let Some(last) = args.last {
+        options = options.last(usize::try_from(last).unwrap_or(usize::MAX));
+    }
+    let histories = match load_history(&root, &options) {
+        Ok(histories) => histories,
+        Err(error) => return (2, String::new(), format!("error: {error}\n")),
+    };
+    let stdout = match args.format {
+        HistoryFormat::Text => render_text(&histories),
+        HistoryFormat::Md => render_markdown(&histories),
+        HistoryFormat::Csv => render_csv(&histories),
+        HistoryFormat::Json => render_json(&histories),
+    };
+    (0, stdout, String::new())
+}
+
+fn run_history(args: &HistoryArgs) -> ! {
+    use std::io::Write as _;
+    let (code, stdout, stderr) = match std::env::current_dir() {
+        Ok(cwd) => history_output(args, &cwd),
+        Err(error) => (2, String::new(), format!("error: {error}\n")),
+    };
+    print!("{stdout}");
+    eprint!("{stderr}");
+    let _ = std::io::stdout().flush();
+    std::process::exit(code);
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -840,6 +1010,7 @@ fn main() -> Result<()> {
             }
             Some(StressCommand::Compare(compare)) => run_compare(compare),
             Some(StressCommand::Init(init)) => run_init(init),
+            Some(StressCommand::History(history)) => run_history(history),
             None => run_stress(&args),
         },
     }
@@ -5066,6 +5237,142 @@ mod init_tests {
             assert!(last.is_empty(), "scaffold never ran clean: {last:?}");
         } else if !last.is_empty() {
             eprintln!("note: scaffold only showed host-noise diagnostics: {last:?}");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    use cntryl_stress::artifact::{RunProfile, StressRun};
+    use cntryl_stress::reporting::{JsonReporter, Reporter};
+    use cntryl_stress::{runner::StressRunner, StressRunnerConfig};
+
+    fn temp_dir(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "cargo-stress-history-cli-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    fn publish(output_dir: &Path, stem: &str, sha: &str) {
+        let config = StressRunnerConfig::for_profile(RunProfile::Default)
+            .samples(10)
+            .warmup_samples(0)
+            .cooldown_samples(0);
+        let mut runner = StressRunner::with_config("suite", config);
+        runner.reporters(Vec::new());
+        runner.run("queue::push", |ctx| {
+            ctx.record_external("work", Duration::from_millis(10), 500);
+        });
+        let mut run: StressRun = runner.finish();
+        run.started_at = stem.to_string();
+        run.environment.git_commit = Some(sha.to_string());
+        JsonReporter::new(output_dir)
+            .announce(false)
+            .suite_end(&run)
+            .expect("publish artifact set");
+    }
+
+    fn parse_history(argv: &[&str]) -> HistoryArgs {
+        let cli = Cli::try_parse_from(argv).expect("parse");
+        let Commands::Stress(stress) = cli.cmd;
+        let Some(StressCommand::History(history)) = stress.command else {
+            panic!("expected history");
+        };
+        history
+    }
+
+    const STEMS: [&str; 3] = [
+        "01790000000000000000-0000000001-00000000000000000000",
+        "01790000100000000000-0000000001-00000000000000000000",
+        "01790000200000000000-0000000001-00000000000000000000",
+    ];
+
+    #[test]
+    fn history_flags_parse_and_prune_flags_require_prune() {
+        let history = parse_history(&[
+            "cargo", "stress", "history", "--suite", "s", "--bench", "queue", "--last", "3",
+            "--format", "md", "--dir", "out",
+        ]);
+        assert_eq!(history.suite.as_deref(), Some("s"));
+        assert_eq!(history.bench.as_deref(), Some("queue"));
+        assert_eq!(history.last, Some(3));
+        assert_eq!(history.format, HistoryFormat::Md);
+        assert_eq!(history.dir, Some(PathBuf::from("out")));
+        for argv in [
+            &["cargo", "stress", "history", "--keep", "2"][..],
+            &["cargo", "stress", "history", "--prune"][..],
+            &["cargo", "stress", "history", "--yes"][..],
+            &["cargo", "stress", "history", "--last", "0"][..],
+            &["cargo", "stress", "history", "--prune", "--keep", "0"][..],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn history_reads_the_wrapper_layout_under_target_stress() {
+        let root = temp_dir("read");
+        let output = root.join("target/stress/pkg");
+        for (index, stem) in STEMS.iter().enumerate() {
+            publish(&output, stem, &format!("sha{index}"));
+        }
+        let nested = root.join("src/deep");
+        fs::create_dir_all(&nested).unwrap();
+        let args = parse_history(&[
+            "cargo", "stress", "history", "--format", "csv", "--last", "2",
+        ]);
+        let (code, stdout, stderr) = history_output(&args, &nested);
+        assert_eq!(code, 0, "{stderr}");
+        assert_eq!(stdout.matches("\r\n").count(), 3, "{stdout}");
+        assert!(stdout.contains("sha1") && stdout.contains("sha2") && !stdout.contains("sha0"));
+
+        let missing = parse_history(&["cargo", "stress", "history", "--dir", "nope"]);
+        assert_eq!(history_output(&missing, &root).0, 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prune_is_a_dry_run_until_yes_and_spares_latest_and_baselines() {
+        let root = temp_dir("prune");
+        let stress = root.join("target/stress");
+        for (index, stem) in STEMS.iter().enumerate() {
+            publish(&stress.join("pkg"), stem, &format!("sha{index}"));
+        }
+        publish(&stress.join("baselines"), STEMS[0], "base");
+        let suite = stress.join("pkg/suite");
+        let count = |dir: &Path| fs::read_dir(dir).unwrap().count();
+        let before = count(&suite);
+
+        let dry = parse_history(&["cargo", "stress", "history", "--prune", "--keep", "1"]);
+        let (code, stdout, stderr) = history_output(&dry, &root);
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stdout.contains("would delete 8 files"), "{stdout}");
+        assert!(stderr.contains("--yes"));
+        assert_eq!(count(&suite), before, "dry run deletes nothing");
+
+        let real = parse_history(&[
+            "cargo", "stress", "history", "--prune", "--keep", "1", "--yes",
+        ]);
+        let (code, stdout, _) = history_output(&real, &root);
+        assert_eq!(code, 0);
+        assert!(stdout.contains("deleted 8 files"), "{stdout}");
+        assert_eq!(count(&suite), before - 8);
+        for extension in ["json", "txt", "md", "csv"] {
+            assert!(suite.join(format!("latest.{extension}")).exists());
+            assert!(suite.join(format!("{}.{extension}", STEMS[2])).exists());
+            assert!(!suite.join(format!("{}.{extension}", STEMS[0])).exists());
+            assert!(stress
+                .join("baselines/suite")
+                .join(format!("{}.{extension}", STEMS[0]))
+                .exists());
         }
         let _ = fs::remove_dir_all(root);
     }

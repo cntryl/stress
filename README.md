@@ -861,6 +861,42 @@ may be added but will not be removed or renamed within the same schema tag:
 }
 ```
 
+### Run history
+
+`cargo stress history` is a read-only view over the immutable timestamped
+artifacts (`{timestamp}.json`) in each suite directory:
+
+```sh
+cargo stress history                                  # every suite under the nearest target/stress
+cargo stress history --suite my_suite --bench insert --last 10
+cargo stress history --format md                      # text (default), md, csv, or json
+cargo stress history --dir member/target/stress
+```
+
+For each benchmark row it shows timestamp (UTC), git SHA, the gated primary
+value with its unit, the matching 95% CI, and quality, with runs grouped by git
+SHA (the current SHA last). Only runs whose environment is compatible with the
+most recent run are included, using the same rules as `--baseline` (CPU, core
+count, OS/architecture, allocator, build identity, rustc, and cntryl-stress
+version); incompatible or unreadable runs are listed as skipped with the
+reason. `--last N` keeps the most recent N compatible runs per suite.
+`latest.*` and the `baselines` directory are never read.
+
+To reclaim space, prune the oldest artifact sets:
+
+```sh
+cargo stress history --prune --keep 20          # dry run: lists what would be deleted
+cargo stress history --prune --keep 20 --yes    # delete
+```
+
+Pruning keeps the newest N (at least 1) timestamped sets per suite, counting
+runs from every environment (`--suite` limits it to one suite), and deletes every file of an older set together (`.json`, `.txt`,
+`.md`, `.csv`). Only sets whose `.json` is a run artifact with a matching
+`started_at` are candidates; `latest.*`, the `baselines` directory, hidden
+publication state, and unrelated files are never touched. Deletion happens
+under the suite's publication lock and is refused while an interrupted
+publication awaits recovery.
+
 ## Artifacts
 
 Artifact paths are relative to the bench package root, because Cargo runs bench
