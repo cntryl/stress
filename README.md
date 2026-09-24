@@ -153,6 +153,19 @@ cargo stress --bench storage_stress --profile release --save-baseline
 cargo stress --bench storage_stress --baseline latest
 ```
 
+## Guides
+
+- [Benchmark recipes](https://github.com/cntryl/stress/blob/main/docs/bench-recipes.md):
+  tiers, parameter sweeps, anti-DCE, a fast local loop, allocation budgets,
+  and profiling one benchmark.
+- [Diagnostic cookbook](https://github.com/cntryl/stress/tree/main/docs/diagnostics):
+  one page per diagnostic code with causes, fixes, and how to allow it.
+  `cargo stress explain <code>` links to the matching page.
+- [CI template](https://github.com/cntryl/stress/blob/main/docs/ci.md):
+  a GitHub Actions workflow with cached baselines, confirmed regressions,
+  and a `cargo stress compare` PR comment.
+- [Migrating from Criterion](https://github.com/cntryl/stress/blob/main/docs/migrating-from-criterion.md).
+
 ## Selection
 
 `--workload` filters the registered benchmark set before execution. It matches
@@ -448,7 +461,7 @@ severity, causes, and the fix text used for `suggestions` and console `Fix:`
 lines. Look a code up from the command line:
 
 ```bash
-cargo stress explain too_fast   # summary, causes, and fix for one code
+cargo stress explain too_fast   # summary, causes, fix, and docs link for one code
 cargo stress explain --list     # every code with its default severity
 ```
 
@@ -680,7 +693,8 @@ confidence-interval overlap, and trust rules. The baseline must be a passed run.
 
 ```bash
 cargo stress compare base/latest.json pr/latest.json
-cargo stress compare target/stress/baselines/my-suite target/stress/my-suite  # directories use latest.json
+cargo stress compare base-run/ target/stress/my-pkg/my-suite/  # directories use latest.json
+cargo stress compare target/stress/baselines/my-pkg/latest/my-suite.json target/stress/my-pkg/my-suite/latest.json
 cargo stress compare base.json pr.json --format md | gh pr comment <pr> --body-file -
 cargo stress compare base.json pr.json --format json --threshold-percent 10
 ```

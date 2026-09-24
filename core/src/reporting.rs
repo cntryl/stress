@@ -5066,6 +5066,33 @@ mod tests {
         assert!(report.contains("benchmark: n_*_iter100"), "{report}");
     }
 
+    /// The `docs/bench-recipes.md` sweep recipe renders as one sweep table.
+    #[test]
+    fn builder_parameter_sweep_recipe_renders_a_sweep_table() {
+        let config = crate::StressRunnerConfig::new()
+            .samples(2)
+            .warmup_samples(0)
+            .cooldown_samples(0);
+        let mut runner = crate::StressRunner::with_config("sweep", config);
+        runner.reporters(Vec::new());
+        runner.run("sum", |ctx| {
+            for n in [64_u64, 256, 1024] {
+                ctx.benchmark(format!("sum/size={n}"))
+                    .parameter("size", n)
+                    .measure(|| (0..crate::black_box(n)).sum::<u64>());
+            }
+        });
+        let run = runner.finish();
+
+        let report = format_report(&run);
+
+        assert!(report.contains("Sweep Tables"), "{report}");
+        assert!(
+            report.contains("Parameter: size (benchmark: sum/size=*"),
+            "{report}"
+        );
+    }
+
     #[test]
     fn formats_sweep_table_and_plateau() {
         let mut s1 = summary("client-1", 100.0, QualityClass::Acceptable);
