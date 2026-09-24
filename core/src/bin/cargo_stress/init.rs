@@ -30,7 +30,7 @@ fn sum_squares(ctx: &mut StressContext) {
     ctx.parameter("len", input.len());
 
     ctx.benchmark("sum of squares")
-        .operations_per_sample(1_000)
+        .operations_per_sample(10_000)
         .measure(|| black_box(&input).iter().map(|value| value * value).sum::<u64>());
 }
 
@@ -75,32 +75,52 @@ pub(crate) struct ManifestEdit {
     pub crate_ident: String,
 }
 
+/// Find an unconditional, non-optional dependency on the stress crate that
+/// benches can use, returning its Rust identifier.
 fn find_stress_dependency(manifest: &toml::Table) -> Option<String> {
-    let mut tables: Vec<&toml::Table> = Vec::new();
-    for key in ["dependencies", "dev-dependencies"] {
-        if let Some(table) = manifest.get(key).and_then(toml::Value::as_table) {
-            tables.push(table);
-        }
-    }
-    if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
-        for target in targets.values().filter_map(toml::Value::as_table) {
-            for key in ["dependencies", "dev-dependencies"] {
-                if let Some(table) = target.get(key).and_then(toml::Value::as_table) {
-                    tables.push(table);
-                }
-            }
-        }
-    }
-    tables.into_iter().find_map(|table| {
-        table.iter().find_map(|(key, value)| {
-            let package = value
-                .as_table()
-                .and_then(|spec| spec.get("package"))
-                .and_then(toml::Value::as_str)
-                .unwrap_or(key);
-            (package == CRATE_NAME).then(|| key.replace('-', "_"))
+    ["dev-dependencies", "dependencies"]
+        .into_iter()
+        .filter_map(|key| manifest.get(key).and_then(toml::Value::as_table))
+        .find_map(|table| {
+            table.iter().find_map(|(key, value)| {
+                let spec = value.as_table();
+                let optional = spec
+                    .and_then(|spec| spec.get("optional"))
+                    .and_then(toml::Value::as_bool)
+                    .unwrap_or(false);
+                let package = spec
+                    .and_then(|spec| spec.get("package"))
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or(key);
+                (package == CRATE_NAME && !optional).then(|| key.replace('-', "_"))
+            })
         })
-    })
+}
+
+/// Name of an existing target (other than `bench`) whose source is `path`.
+fn target_using_path(manifest: &toml::Table, path: &str, bench: &str) -> Option<String> {
+    let normalize = |value: &str| {
+        value
+            .replace('\\', "/")
+            .trim_start_matches("./")
+            .to_string()
+    };
+    let wanted = normalize(path);
+    ["bench", "test", "example", "bin"]
+        .into_iter()
+        .find_map(|kind| {
+            manifest
+                .get(kind)
+                .and_then(toml::Value::as_array)?
+                .iter()
+                .filter_map(toml::Value::as_table)
+                .find_map(|entry| {
+                    let name = entry.get("name").and_then(toml::Value::as_str)?;
+                    let used = entry.get("path").and_then(toml::Value::as_str)?;
+                    (normalize(used) == wanted && !(kind == "bench" && name == bench))
+                        .then(|| format!("[[{kind}]] `{name}`"))
+                })
+        })
 }
 
 fn manual_instructions(bench: &str, dependency_spec: &str) -> String {
@@ -162,6 +182,11 @@ pub(crate) fn edit_manifest(
         None => default_path.clone(),
     };
     let added_bench = existing_bench.is_none();
+    if let Some(owner) = target_using_path(&original, &bench_path, bench) {
+        return Err(format!(
+            "{bench_path} is already the source of {owner}; choose another --name"
+        ));
+    }
 
     if added_dependency {
         let line = format!("{CRATE_NAME} = {dependency_spec}");
@@ -296,11 +321,26 @@ pub(crate) fn init_package(
         fs::create_dir_all(parent)
             .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
     }
+    let previous = if exists {
+        Some(
+            fs::read(&bench_file)
+                .map_err(|error| format!("cannot read {}: {error}", bench_file.display()))?,
+        )
+    } else {
+        None
+    };
     fs::write(&bench_file, contents)
         .map_err(|error| format!("cannot write {}: {error}", bench_file.display()))?;
     if edit.text != source {
-        fs::write(manifest_path, &edit.text)
-            .map_err(|error| format!("cannot write {}: {error}", manifest_path.display()))?;
+        if let Err(error) = fs::write(manifest_path, &edit.text) {
+            // Roll back so a failed init leaves the package as it was.
+            let _ = fs::write(manifest_path, &source);
+            let _ = match &previous {
+                Some(bytes) => fs::write(&bench_file, bytes),
+                None => fs::remove_file(&bench_file),
+            };
+            return Err(format!("cannot write {}: {error}", manifest_path.display()));
+        }
     }
     Ok(InitReport {
         bench_file,
@@ -398,6 +438,30 @@ mod tests {
     }
 
     #[test]
+    fn target_specific_or_optional_dependencies_do_not_count() {
+        for deps in [
+            "[target.'cfg(unix)'.dev-dependencies]\ncntryl-stress = \"0.4\"\n",
+            "[dependencies]\ncntryl-stress = { version = \"0.4\", optional = true }\n",
+        ] {
+            let source = format!("{PKG}\n{deps}");
+            let edit = edit_manifest(&source, "stress", "\"0.4\"").unwrap();
+            assert!(edit.added_dependency, "{deps}");
+            assert_eq!(edit.crate_ident, "cntryl_stress");
+        }
+    }
+
+    #[test]
+    fn new_bench_path_used_by_another_target_is_rejected() {
+        for kind in ["bench", "test", "example", "bin"] {
+            let source = format!(
+                "{PKG}\n[[{kind}]]\nname = \"other\"\npath = \"benches/stress.rs\"\nharness = false\n"
+            );
+            let error = edit_manifest(&source, "stress", "\"0.4\"").unwrap_err();
+            assert!(error.contains("other"), "{kind}: {error}");
+        }
+    }
+
+    #[test]
     fn bench_names_are_validated() {
         assert!(validate_bench_name("stress-io_2").is_ok());
         for bad in ["", "../x", "a b", "x.rs"] {
@@ -455,6 +519,42 @@ mod tests {
         assert!(fs::read_to_string(dir.0.join("benches/stress.rs"))
             .unwrap()
             .contains("stress_main!()"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_manifest_write_restores_the_bench_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Dir::new("rollback");
+        let manifest = dir.0.join("Cargo.toml");
+        fs::write(&manifest, PKG).unwrap();
+        fs::create_dir_all(dir.0.join("benches")).unwrap();
+        fs::write(dir.0.join("benches/stress.rs"), "mine").unwrap();
+        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(&manifest, fs::Permissions::from_mode(0o444)).unwrap();
+        if fs::OpenOptions::new().append(true).open(&manifest).is_ok() {
+            // Running as a privileged user: permissions cannot force a failure.
+            fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let result = init_package(&manifest, "stress", true, "\"0.4\"");
+        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(dir.0.join("benches/stress.rs")).unwrap(),
+            "mine"
+        );
+        assert_eq!(fs::read_to_string(&manifest).unwrap(), PKG);
+
+        fs::remove_file(dir.0.join("benches/stress.rs")).unwrap();
+        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o555)).unwrap();
+        let result = init_package(&manifest, "stress", false, "\"0.4\"");
+        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err());
+        assert!(
+            !dir.0.join("benches/stress.rs").exists(),
+            "new bench file removed"
+        );
     }
 
     #[test]
