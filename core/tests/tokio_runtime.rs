@@ -54,6 +54,26 @@ fn tokio_multi_thread_channel_benchmark_completes() {
 }
 
 #[test]
+fn nested_runtime_panics_with_actionable_message() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let payload = rt.block_on(async {
+        std::panic::catch_unwind(|| cntryl_stress::__private::block_on_tokio(async {}))
+            .expect_err("nested runtime must panic")
+    });
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(ToString::to_string))
+        .unwrap_or_default();
+    assert!(
+        message.contains("already inside a tokio runtime"),
+        "{message}"
+    );
+}
+
+#[test]
 fn caller_provided_runtime_drives_measure_async() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

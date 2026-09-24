@@ -134,9 +134,11 @@ pub mod __private {
     ///
     /// # Panics
     ///
-    /// Panics when tokio cannot build the runtime.
+    /// Panics when tokio cannot build the runtime, or when called from inside
+    /// an existing tokio runtime.
     #[cfg(feature = "tokio")]
     pub fn block_on_tokio<F: std::future::Future>(future: F) -> F::Output {
+        assert_outside_tokio_runtime();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -148,14 +150,25 @@ pub mod __private {
     ///
     /// # Panics
     ///
-    /// Panics when tokio cannot build the runtime.
+    /// Panics when tokio cannot build the runtime, or when called from inside
+    /// an existing tokio runtime.
     #[cfg(feature = "tokio")]
     pub fn block_on_tokio_multi_thread<F: std::future::Future>(future: F) -> F::Output {
+        assert_outside_tokio_runtime();
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("cntryl-stress could not build a multi-thread tokio runtime")
             .block_on(future)
+    }
+
+    #[cfg(feature = "tokio")]
+    fn assert_outside_tokio_runtime() {
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "#[stress(runtime = \"tokio\")] benchmark invoked while already inside a tokio runtime; \
+             run it from synchronous code (for example cargo stress or StressRunner::run outside #[tokio::test])"
+        );
     }
 
     /// Run a future to completion without requiring a runtime dependency.
