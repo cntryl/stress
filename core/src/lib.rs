@@ -84,6 +84,38 @@ pub use std::hint::black_box;
 pub use cntryl_stress_macros::{stress, stress_main};
 pub use harness::StressRunnerOptions;
 
+/// Re-export of the `tokio` crate used by `#[stress(runtime = "tokio")]`.
+///
+/// Available with the `tokio` cargo feature, so benchmarks can use
+/// `cntryl_stress::tokio::time::sleep` without a direct tokio dependency.
+#[cfg(feature = "tokio")]
+pub use tokio;
+
+/// Macro-internal dispatch for `#[stress(runtime = "tokio" | "tokio-multi")]`.
+#[cfg(feature = "tokio")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __stress_tokio_block_on {
+    (current_thread, $future:expr) => {
+        $crate::__private::block_on_tokio($future)
+    };
+    (multi_thread, $future:expr) => {
+        $crate::__private::block_on_tokio_multi_thread($future)
+    };
+}
+
+/// Macro-internal dispatch for `#[stress(runtime = "tokio" | "tokio-multi")]`.
+#[cfg(not(feature = "tokio"))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __stress_tokio_block_on {
+    ($($tokens:tt)*) => {
+        ::core::compile_error!(
+            "#[stress(runtime = \"tokio\")] requires the `tokio` feature of cntryl-stress; add `features = [\"tokio\"]` to the cntryl-stress dependency"
+        )
+    };
+}
+
 /// Private module for macro internals.
 #[doc(hidden)]
 pub mod __private {
@@ -94,6 +126,37 @@ pub mod __private {
     pub use crate::harness::{
         canonical_suite_name, linkme, stress_binary_main, BenchmarkEntry, STRESS_BENCHMARKS,
     };
+
+    /// Run a future on a fresh current-thread tokio runtime with timers enabled.
+    ///
+    /// The runtime is built on the calling thread, so it works on the isolated
+    /// worker thread used for `--timeout-secs` deadlines.
+    ///
+    /// # Panics
+    ///
+    /// Panics when tokio cannot build the runtime.
+    #[cfg(feature = "tokio")]
+    pub fn block_on_tokio<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("cntryl-stress could not build a current-thread tokio runtime")
+            .block_on(future)
+    }
+
+    /// Run a future on a fresh multi-thread tokio runtime with timers enabled.
+    ///
+    /// # Panics
+    ///
+    /// Panics when tokio cannot build the runtime.
+    #[cfg(feature = "tokio")]
+    pub fn block_on_tokio_multi_thread<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("cntryl-stress could not build a multi-thread tokio runtime")
+            .block_on(future)
+    }
 
     /// Run a future to completion without requiring a runtime dependency.
     pub fn block_on<F: std::future::Future>(future: F) -> F::Output {

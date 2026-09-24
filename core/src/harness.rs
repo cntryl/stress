@@ -2553,6 +2553,54 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "tokio")]
+    #[allow(clippy::unnecessary_wraps)]
+    fn tokio_slow_benchmark(ctx: &mut StressContext) -> StressResult {
+        crate::__private::block_on_tokio(async {
+            ctx.measure_async("tokio slow", || async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            })
+            .await;
+        });
+        Ok(())
+    }
+
+    #[cfg(feature = "tokio")]
+    #[allow(clippy::unnecessary_wraps)]
+    fn tokio_fast_benchmark(ctx: &mut StressContext) -> StressResult {
+        crate::__private::block_on_tokio_multi_thread(async {
+            ctx.measure_async("tokio fast", || async {
+                tokio::time::sleep(Duration::from_micros(10)).await;
+            })
+            .await;
+        });
+        Ok(())
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn tokio_benchmarks_run_on_the_isolated_worker_and_still_time_out() {
+        let mut runner = StressRunner::with_config("timeout-suite", deadline_config());
+        run_spec_with_timeout(
+            &mut runner,
+            &deadline_spec("tokio-fast"),
+            None,
+            tokio_fast_benchmark,
+            Duration::from_secs(30),
+        )
+        .expect("tokio benchmark completes on the worker thread");
+
+        let error = run_spec_with_timeout(
+            &mut runner,
+            &deadline_spec("tokio-slow"),
+            None,
+            tokio_slow_benchmark,
+            Duration::from_millis(50),
+        )
+        .expect_err("tokio sleep exceeds the deadline");
+        assert!(matches!(error, SpecRunError::Timeout { .. }));
+    }
+
     fn panicking_benchmark(_ctx: &mut StressContext) -> StressResult {
         panic!("benchmark exploded");
     }

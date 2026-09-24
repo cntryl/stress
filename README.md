@@ -358,6 +358,28 @@ async fn async_lookup(ctx: &mut StressContext) -> Result<(), &'static str> {
 }
 ```
 
+By default async benchmarks run on a tiny built-in executor with no timers or
+IO reactor. For tokio timers, channels, or IO, enable the `tokio` feature
+(`cntryl-stress = { version = "0.4", features = ["tokio"] }`) and pick a
+runtime per benchmark. The benchmark uses the `cntryl_stress::tokio`
+re-export, so no direct tokio dependency is needed:
+
+```rust
+#[stress(tier = 2, runtime = "tokio")] // or "tokio-multi" for a multi-thread runtime
+async fn tokio_sleep(ctx: &mut StressContext) {
+    ctx.measure_async("sleep", || async {
+        cntryl_stress::tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    })
+    .await;
+}
+```
+
+Each invocation builds a fresh runtime on the thread that runs the benchmark,
+including the isolated worker used by `--timeout-secs`, so deadlines still
+apply. Using `runtime = ...` without the feature is a compile error. To reuse
+your own runtime instead, write a synchronous benchmark and call
+`rt.block_on(async { ctx.measure_async(..).await })`.
+
 `measure_batch("name", n, ...)` is a legacy convenience that infers all `n`
 operations succeeded. It is unsuitable when partial failure, timeout, drop,
 duplicate, or validation failure is possible. The same caveat applies to

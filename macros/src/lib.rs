@@ -47,6 +47,9 @@ const MAX_TIER: u32 = 6;
 /// - `max_bytes_per_op = 0`
 /// - `max_regression_pct = 5`
 /// - `max_rsd_pct = 10`
+/// - `runtime = "tokio"` or `"tokio-multi"` (async functions only; needs the
+///   `tokio` feature of cntryl-stress) drives the benchmark on a fresh
+///   current-thread or multi-thread tokio runtime instead of the built-in executor
 /// - `metadata(owner = "storage", scenario = "fanout")`
 #[proc_macro_attribute]
 pub fn stress(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -105,12 +108,9 @@ pub fn stress(attr: TokenStream, item: TokenStream) -> TokenStream {
     let metadata_values = metadata.iter().map(|(_, value)| value);
     let submit_ident = syn::Ident::new(&format!("__stress_bench_{fn_name_str}"), fn_name.span());
     let wrapper_ident = syn::Ident::new(&format!("__stress_wrapper_{fn_name_str}"), fn_name.span());
-    let invocation = if is_async {
-        quote! {
-            #stress_crate::__private::block_on(#fn_name(ctx))
-        }
-    } else {
-        quote! { #fn_name(ctx) }
+    let invocation = match benchmark_invocation(fn_name, is_async, attrs.runtime, &stress_crate) {
+        Ok(tokens) => tokens,
+        Err(error) => return error.to_compile_error().into(),
     };
     let wrapper = quote! {
         #(#cfg_attrs)*
@@ -153,6 +153,13 @@ struct StressAttrs {
     role: Option<String>,
     budgets: StressBudgets,
     metadata: Vec<(String, String)>,
+    runtime: Option<RuntimeKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeKind {
+    TokioCurrentThread,
+    TokioMultiThread,
 }
 
 #[derive(Debug, Default)]
@@ -173,6 +180,7 @@ impl Default for StressAttrs {
             role: None,
             budgets: StressBudgets::default(),
             metadata: Vec::new(),
+            runtime: None,
         }
     }
 }
@@ -212,6 +220,10 @@ impl StressAttrs {
                 Meta::NameValue(name_value) if name_value.path.is_ident("role") => {
                     mark_singleton(&mut singleton_attributes, "role", &name_value)?;
                     attrs.role = Some(role_value(&name_value)?);
+                }
+                Meta::NameValue(name_value) if name_value.path.is_ident("runtime") => {
+                    mark_singleton(&mut singleton_attributes, "runtime", &name_value)?;
+                    attrs.runtime = Some(runtime_value(&name_value)?);
                 }
                 Meta::NameValue(name_value) if name_value.path.is_ident("mode") => {
                     return Err(syn::Error::new_spanned(
@@ -264,7 +276,7 @@ impl StressAttrs {
                 other => {
                     return Err(syn::Error::new_spanned(
                         other,
-                        "unsupported stress attribute; expected tier, name, ignore, role, a max_* budget, or metadata(...)"
+                        "unsupported stress attribute; expected tier, name, ignore, role, runtime, a max_* budget, or metadata(...)"
                     ));
                 }
             }
@@ -296,6 +308,43 @@ fn role_value(name_value: &MetaNameValue) -> syn::Result<String> {
         _ => Err(syn::Error::new_spanned(
             &name_value.value,
             "stress role must be \"gate\", \"diagnostic\", or \"experimental\"",
+        )),
+    }
+}
+
+fn benchmark_invocation(
+    fn_name: &syn::Ident,
+    is_async: bool,
+    runtime: Option<RuntimeKind>,
+    stress_crate: &TokenStream2,
+) -> syn::Result<TokenStream2> {
+    Ok(match (is_async, runtime) {
+        (false, Some(_)) => {
+            return Err(syn::Error::new_spanned(
+                fn_name,
+                "#[stress(runtime = ...)] applies only to async benchmark functions",
+            ));
+        }
+        (false, None) => quote! { #fn_name(ctx) },
+        (true, None) => quote! {
+            #stress_crate::__private::block_on(#fn_name(ctx))
+        },
+        (true, Some(RuntimeKind::TokioCurrentThread)) => quote! {
+            #stress_crate::__stress_tokio_block_on!(current_thread, #fn_name(ctx))
+        },
+        (true, Some(RuntimeKind::TokioMultiThread)) => quote! {
+            #stress_crate::__stress_tokio_block_on!(multi_thread, #fn_name(ctx))
+        },
+    })
+}
+
+fn runtime_value(name_value: &MetaNameValue) -> syn::Result<RuntimeKind> {
+    match string_value(name_value)?.as_str() {
+        "tokio" => Ok(RuntimeKind::TokioCurrentThread),
+        "tokio-multi" => Ok(RuntimeKind::TokioMultiThread),
+        _ => Err(syn::Error::new_spanned(
+            &name_value.value,
+            "stress runtime must be \"tokio\" or \"tokio-multi\"",
         )),
     }
 }
