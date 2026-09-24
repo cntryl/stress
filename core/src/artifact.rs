@@ -1779,8 +1779,9 @@ pub struct ConfirmationRun {
     /// Raw samples (all phases) this attempt appended to the artifact.
     #[serde(default)]
     pub samples_added: usize,
-    /// Why the attempt could not complete, when it failed. A failed attempt
-    /// never clears a regression.
+    /// Why the attempt could not complete, when it failed. A benchmark whose
+    /// re-run failed adds no samples, so its regression is never cleared by
+    /// that attempt, and no later attempt runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }

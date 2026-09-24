@@ -1468,9 +1468,8 @@ fn baseline_pool_candidates(resolved: &ResolvedStressConfig, suite: &str) -> Vec
         resolved.artifact_namespace.as_deref(),
         suite,
     )
-    .into_iter()
-    .take(resolved.baseline_runs)
-    .collect()
+    // Every saved run is a candidate: the pool stops at `baseline_runs`
+    // accepted runs, so a skipped run is backfilled by an older one.
 }
 
 fn empty_selection_error(resolved: &ResolvedStressConfig) -> String {
@@ -1965,7 +1964,7 @@ fn timestamped_baseline_runs(
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|bucket| bucket != "latest")
+        .filter(|bucket| is_run_timestamp_stem(bucket))
         .filter(|bucket| root.join(bucket).join(&file_name).is_file())
         .collect::<Vec<_>>();
     // Run timestamp stems are fixed-width and lexically sortable.
@@ -1974,6 +1973,16 @@ fn timestamped_baseline_runs(
         .into_iter()
         .map(|bucket| root.join(bucket).join(&file_name))
         .collect()
+}
+
+/// Whether `bucket` is a run timestamp stem (`{epoch_ns:020}-{pid:010}-{seq:020}`),
+/// so hand-kept directories are never pooled or pruned.
+fn is_run_timestamp_stem(bucket: &str) -> bool {
+    let parts = bucket.split('-').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts.iter().zip([20, 10, 20]).all(|(part, width)| {
+            part.len() == width && part.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 /// Remove this suite's timestamped runs beyond the `retain_runs` newest.
@@ -2973,6 +2982,52 @@ mod tests {
             1,
             "pruning one suite never touches another"
         );
+
+        let _ = std::fs::remove_dir_all(&baseline_dir);
+    }
+
+    #[test]
+    fn only_run_timestamp_buckets_are_pooled_or_pruned() {
+        let baseline_dir = unique_temp_dir("stress-baseline-buckets");
+        for bucket in ["main", "0-manual"] {
+            let path = baseline_dir.join(bucket).join("suite-name.json");
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, b"hand-kept").expect("write");
+        }
+        let runs = (0..3)
+            .map(|_| eligible_baseline_run("suite-name"))
+            .collect::<Vec<_>>();
+        for run in &runs {
+            save_baseline_artifacts(run, &baseline_dir, None, 2).expect("save baseline");
+        }
+
+        assert_eq!(
+            timestamped_baseline_runs(&baseline_dir, None, "suite-name"),
+            vec![
+                baseline_path(&baseline_dir, None, &runs[2].started_at, "suite-name"),
+                baseline_path(&baseline_dir, None, &runs[1].started_at, "suite-name"),
+            ]
+        );
+        for bucket in ["main", "0-manual"] {
+            assert!(baseline_dir.join(bucket).join("suite-name.json").exists());
+        }
+
+        let _ = std::fs::remove_dir_all(&baseline_dir);
+    }
+
+    #[test]
+    fn pool_candidates_list_every_saved_run_so_skips_can_backfill() {
+        let baseline_dir = unique_temp_dir("stress-baseline-backfill");
+        for _ in 0..3 {
+            let run = eligible_baseline_run("suite-name");
+            save_baseline_artifacts(&run, &baseline_dir, None, 1).expect("save baseline");
+        }
+        let mut resolved = resolve_from_binary_args_with(&StressBinaryArgs::default(), |_| None);
+        resolved.baseline = Some(PathBuf::from("latest"));
+        resolved.baseline_dir.clone_from(&baseline_dir);
+        resolved.baseline_runs = 2;
+
+        assert_eq!(baseline_pool_candidates(&resolved, "suite-name").len(), 3);
 
         let _ = std::fs::remove_dir_all(&baseline_dir);
     }

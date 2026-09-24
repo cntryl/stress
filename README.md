@@ -637,8 +637,10 @@ classified as a regression, up to `K` times, with the same config and the same
 timeout path. Each attempt appends its raw samples to the run, the affected
 summaries are recomputed from the samples pooled across the original run and
 every attempt, and the rows are re-classified. The gate fails only if the
-regression persists in the pooled evidence; an attempt that errors never
-clears a regression. Nothing is hidden: every attempt is recorded in the
+regression persists in the pooled evidence; a benchmark whose re-run errors
+keeps its regression. Confirmation is skipped (and says so) when the run
+already failed a benchmark budget, since pooling must not clear it. Only
+directories named like run timestamps are pooled or pruned. Nothing is hidden: every attempt is recorded in the
 artifact's `confirmation_runs` (benchmarks re-run, regressions before/after,
 samples added, and any error), and the console, markdown report, and GitHub
 `::notice` state the outcome.

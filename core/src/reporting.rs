@@ -1513,6 +1513,9 @@ pub(crate) fn noise_gating_lines(run: &StressRun) -> Vec<String> {
         }
         lines.push(line);
     }
+    if let Some(reason) = run.metadata.get("confirmation_skipped") {
+        lines.push(format!("confirmation: skipped ({reason})"));
+    }
     if let Some(last) = run.confirmation_runs.last() {
         let attempts = run.confirmation_runs.len();
         if last.error.is_none() && last.regressions_after.is_empty() {
@@ -4465,6 +4468,16 @@ mod tests {
             QualityClass::Acceptable,
         )]);
         assert!(noise_gating_lines(&plain).is_empty());
+
+        let mut skipped = plain;
+        skipped.metadata.insert(
+            "confirmation_skipped".to_string(),
+            "budget failed".to_string(),
+        );
+        assert_eq!(
+            noise_gating_lines(&skipped),
+            vec!["confirmation: skipped (budget failed)".to_string()]
+        );
     }
 
     #[test]

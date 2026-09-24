@@ -517,6 +517,23 @@ impl StressRunner {
     ) where
         R: FnMut(&mut Self, &str) -> Result<(), String>,
     {
+        if max_attempts > 0
+            && self.summaries.iter().any(|summary| {
+                summary
+                    .budget_results
+                    .iter()
+                    .any(|budget_result| !budget_result.passed)
+            })
+        {
+            // Pooling re-evaluates every budget of a re-run benchmark, so it
+            // could clear an absolute budget failure; those are final.
+            self.metadata.insert(
+                "confirmation_skipped".to_string(),
+                "the run already failed a benchmark budget, which confirmation cannot clear"
+                    .to_string(),
+            );
+            return;
+        }
         for attempt in 1..=max_attempts {
             let before = self.regressed_rows(pool);
             if before.is_empty() {
@@ -3143,6 +3160,44 @@ mod tests {
         assert_eq!(run.confirmation_runs[0].samples_added, 0);
         assert_eq!(run.samples.len(), 10);
         assert_eq!(evaluate_run_gate(&run), RunGate::RegressionFailed);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn confirmation_never_re_pools_a_run_that_already_failed_a_budget() {
+        let baseline = timed_runner(0, Duration::ZERO).0.finish();
+        let path = write_baseline("stress-confirm-budget.json", &baseline);
+        let slow = Duration::from_micros(10_600);
+
+        let (mut runner, _) = timed_runner(10, slow);
+        runner.summaries[0]
+            .budget_results
+            .push(crate::artifact::BudgetResult {
+                metric: "ns_per_op".to_string(),
+                limit: 1.0,
+                actual: Some(2.0),
+                passed: false,
+                reason: None,
+            });
+        let pool = runner.load_baseline_pool(&path, &[], 1).expect("pool");
+        let mut reruns = 0;
+        runner.confirm_regressions(&pool, 3, |_, _| {
+            reruns += 1;
+            Ok(())
+        });
+        let run = runner.finish_with_baseline_pool(&pool);
+
+        assert_eq!(
+            reruns, 0,
+            "pooling must not clear an absolute budget failure"
+        );
+        assert!(run.confirmation_runs.is_empty());
+        assert!(run
+            .metadata
+            .get("confirmation_skipped")
+            .is_some_and(|reason| reason.contains("budget")));
+        assert_eq!(evaluate_run_gate(&run), RunGate::BudgetFailed);
 
         let _ = std::fs::remove_file(&path);
     }
