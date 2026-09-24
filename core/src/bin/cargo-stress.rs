@@ -286,6 +286,16 @@ struct StressArgs {
     #[arg(long)]
     save_baseline: bool,
 
+    /// Retain and pool the N most recent saved baseline runs per suite
+    /// (falls back to `STRESS_BASELINE_RUNS`; default 1)
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+    baseline_runs: Option<u64>,
+
+    /// Re-run benchmarks with regression rows up to K times and fail only if
+    /// the regression persists (falls back to `STRESS_CONFIRM_REGRESSIONS`)
+    #[arg(long, value_name = "K")]
+    confirm_regressions: Option<usize>,
+
     /// Regression threshold in percentage points (5 means 5%)
     #[arg(long, value_name = "PERCENT", conflicts_with = "threshold")]
     threshold_percent: Option<ThresholdPercent>,
@@ -2461,6 +2471,14 @@ fn build_passthrough_args(cmd: &mut Command, args: &StressArgs, passthrough_json
         cmd.arg("--save-baseline");
     }
 
+    if let Some(runs) = args.baseline_runs {
+        cmd.arg("--baseline-runs").arg(runs.to_string());
+    }
+
+    if let Some(attempts) = args.confirm_regressions {
+        cmd.arg("--confirm-regressions").arg(attempts.to_string());
+    }
+
     // The child harness accepts a fraction, while the canonical cargo-stress
     // surface accepts explicit percentage points.
     if let Some(threshold) = args
@@ -2862,6 +2880,8 @@ mod tests {
             baseline: None,
             baseline_dir: None,
             save_baseline: false,
+            baseline_runs: None,
+            confirm_regressions: None,
             threshold_percent: None,
             threshold: None,
             fail_on_issues: false,
@@ -3546,6 +3566,39 @@ mod tests {
         assert!(error.contains("did you mean 'too_fast'"), "{error}");
 
         assert!(Cli::try_parse_from(["cargo", "stress", "explain"]).is_err());
+    }
+
+    #[test]
+    fn cargo_stress_forwards_noise_aware_gating_flags() {
+        let cli = Cli::try_parse_from([
+            "cargo",
+            "stress",
+            "--baseline-runs",
+            "3",
+            "--confirm-regressions",
+            "2",
+        ])
+        .expect("parse");
+        let Commands::Stress(args) = cli.cmd;
+        let mut cmd = Command::new("stress-child");
+        build_passthrough_args(&mut cmd, &args, true);
+        let child_args = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(child_args
+            .windows(2)
+            .any(|window| window[0] == "--baseline-runs" && window[1] == "3"));
+        assert!(child_args
+            .windows(2)
+            .any(|window| window[0] == "--confirm-regressions" && window[1] == "2"));
+        assert!(Cli::try_parse_from(["cargo", "stress", "--baseline-runs", "0"]).is_err());
+
+        let mut cmd = Command::new("stress-child");
+        build_passthrough_args(&mut cmd, &stress_args(), true);
+        assert!(!cmd
+            .get_args()
+            .any(|arg| arg == "--baseline-runs" || arg == "--confirm-regressions"));
     }
 
     #[test]

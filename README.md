@@ -491,6 +491,8 @@ Command-line arguments override `STRESS_*` environment variables, which override
 | `STRESS_BASELINE` | Baseline stress artifact |
 | `STRESS_BASELINE_DIR` | Baseline directory for `latest` and `--save-baseline` conventions |
 | `STRESS_SAVE_BASELINE` | Save a passed run under the baseline directory |
+| `STRESS_BASELINE_RUNS` | Positive count of recent saved baseline runs to retain and pool (default `1`) |
+| `STRESS_CONFIRM_REGRESSIONS` | Re-run benchmarks with regression rows up to this many times before gating (default `0`) |
 | `STRESS_THRESHOLD` | Regression threshold as a fraction (`0.05` means 5%) |
 | `STRESS_GIT_SHA` | Git SHA override; an empty value is treated as unset (with a warning) and the SHA is auto-detected |
 | `STRESS_SAMPLE_DURATION_MS` | Fixed-duration sample budget |
@@ -605,6 +607,51 @@ cargo bench --bench storage_stress -- --json
 ```
 
 `cargo bench --bench ...` uses one console format: one simple benchmark table per suite with `benchmark`, `measurement`, `value`, `p50`, `p95`, `p99`, `rsd`, `trust`, and `mode` columns. Suite-local `issues` appear directly after a table only when a row needs attention, and the run ends with one `result:` line. Use `--json` only for machine-readable stdout.
+
+### Noise-aware gating
+
+Two opt-in controls reduce false regression failures on noisy CI hosts. Both
+default to off, so existing baselines and gates behave exactly as before.
+
+**Multi-run baselines.** `--baseline-runs <N>` (or `STRESS_BASELINE_RUNS`)
+makes `--save-baseline` keep the `N` most recent timestamped runs per suite
+(older ones for that suite are pruned; `latest` is unchanged). With
+`--baseline latest`, the comparison then pools the raw samples of up to `N`
+saved runs and recomputes the baseline summaries from them. A saved run joins
+the pool only when it is itself an eligible baseline, shares the anchor
+baseline's profile, and its environment passes the same compatibility check as
+any baseline; rows whose benchmark spec changed are left out. Everything left
+out is printed and recorded in `metadata.baseline_runs_skipped`, and
+`metadata.baseline_runs_pooled` records the pool size. With `N = 1` (the
+default) the math is identical to a single baseline. Pooling applies to
+`--baseline latest` only; an explicit baseline file is compared alone.
+
+```bash
+cargo stress --profile release --save-baseline --baseline-runs 5
+cargo stress --baseline latest --baseline-runs 5
+```
+
+**Confirm on regression.** `--confirm-regressions <K>` (or
+`STRESS_CONFIRM_REGRESSIONS`) re-runs only the benchmarks that have a row
+classified as a regression, up to `K` times, with the same config and the same
+timeout path. Each attempt appends its raw samples to the run, the affected
+summaries are recomputed from the samples pooled across the original run and
+every attempt, and the rows are re-classified. The gate fails only if the
+regression persists in the pooled evidence; a benchmark whose re-run errors
+keeps its regression. Confirmation is skipped (and says so) when the run
+already failed a benchmark budget, since pooling must not clear it. Only
+directories named like run timestamps are pooled or pruned. Nothing is hidden: every attempt is recorded in the
+artifact's `confirmation_runs` (benchmarks re-run, regressions before/after,
+samples added, and any error), and the console, markdown report, and GitHub
+`::notice` state the outcome.
+
+```bash
+cargo stress --baseline latest --baseline-runs 5 --confirm-regressions 2
+```
+
+Because the original (possibly slow) samples stay in the pool, confirmation
+clears transient slowdowns near the threshold but not large, reproducible
+ones.
 
 ### GitHub Actions
 

@@ -1152,8 +1152,24 @@ fn format_github_annotations(run: &StressRun) -> String {
             );
         }
     }
+    push_confirmation_annotation(&mut output, run);
     push_run_gate_annotation(&mut output, run);
     output
+}
+
+/// State the confirm-on-regression outcome when confirmation ran.
+fn push_confirmation_annotation(output: &mut String, run: &StressRun) {
+    if let Some(outcome) = noise_gating_lines(run)
+        .into_iter()
+        .rfind(|line| line.starts_with("confirmation: "))
+    {
+        let _ = writeln!(
+            output,
+            "::notice title={}::{}",
+            escape_workflow_property("stress: confirmation"),
+            escape_workflow_data(&format!("{}: {outcome}", run.suite))
+        );
+    }
 }
 
 /// Some gate failures (missing baselines, regression budgets, invalid rows,
@@ -1356,6 +1372,15 @@ pub(crate) fn format_markdown_report(run: &StressRun) -> String {
     output.push_str(&format_summary_blocks(run));
     let _ = writeln!(output, "```");
     let _ = writeln!(output);
+    let noise_lines = noise_gating_lines(run);
+    if !noise_lines.is_empty() {
+        let _ = writeln!(output, "## Noise-aware gating");
+        let _ = writeln!(output);
+        for line in noise_lines {
+            let _ = writeln!(output, "- {}", escape_markdown_cell(&line));
+        }
+        let _ = writeln!(output);
+    }
     let _ = writeln!(output, "## Needs attention");
     let _ = writeln!(output);
     write_markdown_attention(&mut output, run);
@@ -1463,8 +1488,55 @@ fn write_run_header(output: &mut String, runs: &[StressRun]) {
     let _ = writeln!(output, "@cntryl/stress v{}", first.tool_version);
 }
 
+/// Human lines describing baseline pooling and confirm-on-regression
+/// attempts. Empty for runs that used neither.
+pub(crate) fn noise_gating_lines(run: &StressRun) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(pooled) = run.metadata.get("baseline_runs_pooled") {
+        let mut line = format!("baseline: pooled {pooled} saved runs");
+        if let Some(skipped) = run.metadata.get("baseline_runs_skipped") {
+            let _ = write!(line, " (skipped: {skipped})");
+        }
+        lines.push(line);
+    }
+    for attempt in &run.confirmation_runs {
+        let mut line = format!(
+            "confirmation attempt {}: re-ran {} benchmark(s), +{} samples; regressions {} -> {}",
+            attempt.attempt,
+            attempt.benchmark_ids.len(),
+            attempt.samples_added,
+            attempt.regressions_before.len(),
+            attempt.regressions_after.len()
+        );
+        if let Some(error) = &attempt.error {
+            let _ = write!(line, " (failed: {error})");
+        }
+        lines.push(line);
+    }
+    if let Some(reason) = run.metadata.get("confirmation_skipped") {
+        lines.push(format!("confirmation: skipped ({reason})"));
+    }
+    if let Some(last) = run.confirmation_runs.last() {
+        let attempts = run.confirmation_runs.len();
+        if last.error.is_none() && last.regressions_after.is_empty() {
+            lines.push(format!(
+                "confirmation: regressions cleared after {attempts} attempt(s); samples pooled across attempts"
+            ));
+        } else {
+            lines.push(format!(
+                "confirmation: regressions persisted after {attempts} attempt(s): {}",
+                last.regressions_after.join(", ")
+            ));
+        }
+    }
+    lines
+}
+
 fn write_suite_block(output: &mut String, run: &StressRun) {
     let _ = writeln!(output, "{}", run.suite);
+    for line in noise_gating_lines(run) {
+        let _ = writeln!(output, "{line}");
+    }
 
     let rows = rows_for_human_console(run);
     if rows.is_empty() {
@@ -3522,6 +3594,7 @@ mod tests {
             summaries,
             comparisons: Vec::new(),
             diagnostics_summary: Vec::new(),
+            confirmation_runs: Vec::new(),
             started_at: "123".to_string(),
             total_elapsed_ns: 1_000,
             metadata: BTreeMap::new(),
@@ -4337,6 +4410,73 @@ mod tests {
         assert!(
             output.contains("::warning title=stress%3A regression::"),
             "{output}"
+        );
+    }
+
+    fn noise_gating_run(cleared: bool) -> StressRun {
+        let mut run = run_with_summaries(vec![summary(
+            "queue::fast",
+            1_000.0,
+            QualityClass::Acceptable,
+        )]);
+        run.metadata
+            .insert("baseline_runs_pooled".to_string(), "3".to_string());
+        run.metadata.insert(
+            "baseline_runs_skipped".to_string(),
+            "old.json: CPU model differs".to_string(),
+        );
+        let mut attempt = crate::artifact::ConfirmationRun::new(1);
+        attempt.benchmark_ids = vec!["suite/queue".to_string()];
+        attempt.regressions_before = vec!["suite/queue/fast".to_string()];
+        if !cleared {
+            attempt.regressions_after = attempt.regressions_before.clone();
+        }
+        attempt.samples_added = 10;
+        run.confirmation_runs.push(attempt);
+        run
+    }
+
+    #[test]
+    fn noise_gating_outcome_is_reported_everywhere() {
+        let cleared = noise_gating_run(true);
+        let lines = noise_gating_lines(&cleared);
+        assert_eq!(
+            lines,
+            vec![
+                "baseline: pooled 3 saved runs (skipped: old.json: CPU model differs)".to_string(),
+                "confirmation attempt 1: re-ran 1 benchmark(s), +10 samples; regressions 1 -> 0"
+                    .to_string(),
+                "confirmation: regressions cleared after 1 attempt(s); samples pooled across attempts"
+                    .to_string(),
+            ]
+        );
+        assert!(format_console_run(&cleared).contains("confirmation: regressions cleared"));
+        assert!(format_markdown_report(&cleared).contains("confirmation: regressions cleared"));
+        assert!(
+            format_github_annotations(&cleared).contains("::notice title=stress%3A confirmation::")
+        );
+
+        let persisted = noise_gating_run(false);
+        let lines = noise_gating_lines(&persisted);
+        assert!(lines
+            .last()
+            .is_some_and(|line| line.contains("regressions persisted after 1 attempt(s)")));
+
+        let plain = run_with_summaries(vec![summary(
+            "queue::fast",
+            1_000.0,
+            QualityClass::Acceptable,
+        )]);
+        assert!(noise_gating_lines(&plain).is_empty());
+
+        let mut skipped = plain;
+        skipped.metadata.insert(
+            "confirmation_skipped".to_string(),
+            "budget failed".to_string(),
+        );
+        assert_eq!(
+            noise_gating_lines(&skipped),
+            vec!["confirmation: skipped (budget failed)".to_string()]
         );
     }
 

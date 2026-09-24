@@ -4,9 +4,11 @@ use crate::allocation;
 use crate::artifact::{
     attach_measurement_mode_mismatch_diagnostics, attach_regression_diagnostics,
     attach_timer_resolution_evidence, compare_summaries_with_specs, diagnostic_summary_for_run,
-    summarize_benchmark, BenchmarkModeKind, BenchmarkSpec, EnvironmentInfo, MeasurementIntent,
-    RunProfile, Sample, SamplePhase, SourceLocation, StressRun, MAX_TIER, SCHEMA_VERSION,
-    SUMMARY_SEMANTICS_CURRENT, SUMMARY_SEMANTICS_METADATA_KEY,
+    incompatible_environment_reason, pooled_baseline_summaries, summarize_benchmark,
+    BenchmarkModeKind, BenchmarkSpec, BenchmarkSummary, ComparisonClass, ComparisonResult,
+    ConfirmationRun, EnvironmentInfo, MeasurementIntent, RunProfile, Sample, SamplePhase,
+    SourceLocation, StressRun, MAX_TIER, SCHEMA_VERSION, SUMMARY_SEMANTICS_CURRENT,
+    SUMMARY_SEMANTICS_METADATA_KEY,
 };
 use crate::config::StressRunnerConfig;
 use crate::context::{MeasurementRecord, StressContext};
@@ -36,6 +38,48 @@ pub struct StressRunner {
     deferred_reporters: Vec<Box<dyn Reporter>>,
     metadata: BTreeMap<String, String>,
     environment: EnvironmentInfo,
+    base_specs: BTreeMap<String, BenchmarkSpec>,
+    measurement_bases: BTreeMap<String, String>,
+    confirmation_runs: Vec<ConfirmationRun>,
+}
+
+/// Baseline evidence pooled from one or more environment-compatible runs.
+///
+/// The anchor run (the configured baseline) supplies the specs and
+/// environment; extra runs contribute raw samples for rows whose spec is
+/// identical, and summaries are recomputed from the pooled raw samples.
+#[derive(Debug, Clone)]
+pub(crate) struct BaselinePool {
+    pub(crate) summaries: Vec<BenchmarkSummary>,
+    pub(crate) specs: Vec<BenchmarkSpec>,
+    pub(crate) environment: EnvironmentInfo,
+    /// `started_at` of every pooled run, anchor first.
+    pub(crate) pooled_runs: Vec<String>,
+    /// Why candidate runs (or rows of them) were left out of the pool.
+    pub(crate) skipped: Vec<String>,
+    /// Whether any extra run was considered, so single-run artifacts stay
+    /// byte-for-byte unchanged.
+    pub(crate) considered_extras: bool,
+}
+
+/// Load a baseline run that may anchor or join a pool: it must parse, carry a
+/// passed recorded gate, and have serialized summaries matching its raw
+/// samples.
+fn load_eligible_baseline(path: &Path) -> std::io::Result<(StressRun, Vec<BenchmarkSummary>)> {
+    let baseline = StressRun::load(path)?;
+    let baseline_gate = evaluate_run_gate(&baseline);
+    if baseline_gate != RunGate::Passed {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "baseline run is not eligible because its recorded gate evaluates to {baseline_gate:?}; use a passed run saved with --save-baseline"
+            ),
+        ));
+    }
+    let summaries = baseline
+        .canonical_baseline_summaries()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    Ok((baseline, summaries))
 }
 
 impl StressRunner {
@@ -135,6 +179,9 @@ impl StressRunner {
             deferred_reporters,
             metadata,
             environment,
+            base_specs: BTreeMap::new(),
+            measurement_bases: BTreeMap::new(),
+            confirmation_runs: Vec::new(),
         };
 
         for reporter in runner.reporters.iter().chain(&runner.deferred_reporters) {
@@ -250,6 +297,7 @@ impl StressRunner {
             "Benchmark id {:?} was registered more than once; every benchmark function must have a unique suite-qualified id",
             spec.id
         );
+        self.base_specs.insert(spec.id.clone(), spec.clone());
 
         for reporter in &self.reporters {
             reporter.bench_start(spec);
@@ -297,6 +345,7 @@ impl StressRunner {
             mut sources,
             ..
         } = topology;
+        let base_id = spec.id.clone();
         for spec_id in spec_order {
             let spec = specs
                 .remove(&spec_id)
@@ -306,6 +355,8 @@ impl StressRunner {
             for reporter in &self.reporters {
                 reporter.bench_end(&summary);
             }
+            self.measurement_bases
+                .insert(spec.id.clone(), base_id.clone());
             self.benchmark_specs.push(spec);
             self.summaries.push(summary);
         }
@@ -327,29 +378,280 @@ impl StressRunner {
         self,
         baseline_path: impl AsRef<Path>,
     ) -> std::io::Result<StressRun> {
-        let baseline = StressRun::load(baseline_path)?;
-        let baseline_gate = evaluate_run_gate(&baseline);
-        if baseline_gate != RunGate::Passed {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "baseline run is not eligible because its recorded gate evaluates to {baseline_gate:?}; use a passed run saved with --save-baseline"
-                ),
-            ));
+        let pool = self.load_baseline_pool(baseline_path.as_ref(), &[], 1)?;
+        Ok(self.finish_with_baseline_pool(&pool))
+    }
+
+    /// Load `anchor` plus up to `max_runs - 1` distinct extra baseline runs.
+    ///
+    /// The anchor must be eligible exactly as for [`Self::finish_with_baseline`].
+    /// An extra run joins the pool only when it is eligible, has a different
+    /// `started_at` than every pooled run, shares the anchor's run profile, and
+    /// its environment is compatible with this run; rows whose spec differs
+    /// from the anchor's are left out. Everything left out is noted in
+    /// `skipped` instead of failing the run.
+    pub(crate) fn load_baseline_pool(
+        &self,
+        anchor: &Path,
+        extras: &[std::path::PathBuf],
+        max_runs: usize,
+    ) -> std::io::Result<BaselinePool> {
+        let (anchor_run, anchor_summaries) = load_eligible_baseline(anchor)?;
+        let mut pool = BaselinePool {
+            summaries: anchor_summaries,
+            specs: anchor_run.benchmark_specs.clone(),
+            environment: anchor_run.environment.clone(),
+            pooled_runs: vec![anchor_run.started_at.clone()],
+            skipped: Vec::new(),
+            considered_extras: !extras.is_empty(),
+        };
+        let mut pooled = anchor_run;
+        for path in extras {
+            if pool.pooled_runs.len() >= max_runs.max(1) {
+                break;
+            }
+            let run = match load_eligible_baseline(path) {
+                Ok((run, _)) => run,
+                Err(error) => {
+                    pool.skipped.push(format!("{}: {error}", path.display()));
+                    continue;
+                }
+            };
+            if pool.pooled_runs.contains(&run.started_at) {
+                // `latest` is a copy of the newest timestamped run.
+                continue;
+            }
+            if let Some(reason) =
+                incompatible_environment_reason(&self.environment, &run.environment)
+            {
+                pool.skipped.push(format!("{}: {reason}", path.display()));
+                continue;
+            }
+            if run.run_profile != pooled.run_profile {
+                pool.skipped.push(format!(
+                    "{}: run profile {:?} differs from the baseline's {:?}",
+                    path.display(),
+                    run.run_profile,
+                    pooled.run_profile
+                ));
+                continue;
+            }
+            let mut matching_ids = BTreeSet::new();
+            for spec in &run.benchmark_specs {
+                if pooled.benchmark_specs.contains(spec) {
+                    matching_ids.insert(spec.id.as_str());
+                } else if pooled
+                    .benchmark_specs
+                    .iter()
+                    .any(|candidate| candidate.id == spec.id)
+                {
+                    pool.skipped.push(format!(
+                        "{}: row {:?} has a different benchmark spec",
+                        path.display(),
+                        spec.id
+                    ));
+                }
+            }
+            pooled.samples.extend(
+                run.samples
+                    .iter()
+                    .filter(|sample| matching_ids.contains(sample.benchmark_id.as_str()))
+                    .cloned(),
+            );
+            pool.pooled_runs.push(run.started_at.clone());
         }
-        let baseline_summaries = baseline
-            .canonical_baseline_summaries()
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let comparisons = compare_summaries_with_specs(
+        if pool.pooled_runs.len() > 1 {
+            pool.summaries = pooled_baseline_summaries(&pooled);
+        }
+        Ok(pool)
+    }
+
+    /// Finish the run compared against a pooled baseline.
+    pub(crate) fn finish_with_baseline_pool(mut self, pool: &BaselinePool) -> StressRun {
+        if pool.considered_extras {
+            self.metadata.insert(
+                "baseline_runs_pooled".to_string(),
+                pool.pooled_runs.len().to_string(),
+            );
+            if !pool.skipped.is_empty() {
+                self.metadata
+                    .insert("baseline_runs_skipped".to_string(), pool.skipped.join("; "));
+            }
+        }
+        let comparisons = self.baseline_comparisons(pool);
+        self.finish_inner(comparisons)
+    }
+
+    fn baseline_comparisons(&self, pool: &BaselinePool) -> Vec<ComparisonResult> {
+        compare_summaries_with_specs(
             &self.summaries,
             &self.benchmark_specs,
             &self.environment,
-            &baseline_summaries,
-            &baseline.benchmark_specs,
-            &baseline.environment,
+            &pool.summaries,
+            &pool.specs,
+            &pool.environment,
             self.config.threshold,
+        )
+    }
+
+    /// Row ids currently classified as regressions against `pool`.
+    pub(crate) fn regressed_rows(&self, pool: &BaselinePool) -> Vec<String> {
+        self.baseline_comparisons(pool)
+            .into_iter()
+            .filter(|comparison| comparison.classification == ComparisonClass::Regression)
+            .map(|comparison| comparison.benchmark_id)
+            .collect()
+    }
+
+    /// Re-run benchmarks with regression rows up to `max_attempts` times.
+    ///
+    /// Each attempt calls `rerun` once per benchmark (function-level) id that
+    /// still has a regression row, then re-classifies against the samples
+    /// pooled across the original run and every attempt. Attempts stop once
+    /// nothing regresses or an attempt fails; every attempt is recorded.
+    pub(crate) fn confirm_regressions<R>(
+        &mut self,
+        pool: &BaselinePool,
+        max_attempts: usize,
+        mut rerun: R,
+    ) where
+        R: FnMut(&mut Self, &str) -> Result<(), String>,
+    {
+        if max_attempts > 0
+            && self.summaries.iter().any(|summary| {
+                summary
+                    .budget_results
+                    .iter()
+                    .any(|budget_result| !budget_result.passed)
+            })
+        {
+            // Pooling re-evaluates every budget of a re-run benchmark, so it
+            // could clear an absolute budget failure; those are final.
+            self.metadata.insert(
+                "confirmation_skipped".to_string(),
+                "the run already failed a benchmark budget, which confirmation cannot clear"
+                    .to_string(),
+            );
+            return;
+        }
+        for attempt in 1..=max_attempts {
+            let before = self.regressed_rows(pool);
+            if before.is_empty() {
+                break;
+            }
+            let base_ids = before
+                .iter()
+                .filter_map(|row| self.measurement_bases.get(row).cloned())
+                .collect::<BTreeSet<_>>();
+            let start = self.samples.len();
+            let mut errors = Vec::new();
+            for base_id in &base_ids {
+                if let Err(error) = rerun(self, base_id) {
+                    errors.push(format!("{base_id}: {error}"));
+                }
+            }
+            let mut record = ConfirmationRun::new(attempt);
+            record.benchmark_ids = base_ids.into_iter().collect();
+            record.regressions_before = before;
+            record.regressions_after = self.regressed_rows(pool);
+            record.samples_added = self.samples.len() - start;
+            let failed = !errors.is_empty();
+            if failed {
+                record.error = Some(errors.join("; "));
+            }
+            self.confirmation_runs.push(record);
+            if failed {
+                break;
+            }
+        }
+    }
+
+    /// Re-run an already-run benchmark with the same config and pool its new
+    /// raw samples into the existing rows, recomputing their summaries.
+    ///
+    /// Returns the number of raw samples added. On failure nothing is added.
+    pub(crate) fn confirm_spec<F, O>(&mut self, base_id: &str, f: F) -> Result<usize, String>
+    where
+        F: Fn(&mut StressContext) -> O,
+        O: IntoStressResult,
+    {
+        let spec = self
+            .base_specs
+            .get(base_id)
+            .cloned()
+            .ok_or_else(|| format!("benchmark {base_id:?} was not run"))?;
+        let last_error = std::cell::RefCell::new(None::<String>);
+        let body = |ctx: &mut StressContext| {
+            let result = f(ctx).into_stress_result();
+            if let Err(error) = &result {
+                *last_error.borrow_mut() = Some(error.message().to_string());
+            }
+            result
+        };
+        let start = self.samples.len();
+        let mut topology = MeasurementTopology::default();
+        let failed = self.record_phase_samples(
+            &spec,
+            SamplePhase::Warmup,
+            self.config.warmup_samples,
+            &body,
+            &mut topology,
+            start,
+        ) || self.record_phase_samples(
+            &spec,
+            SamplePhase::Measured,
+            self.config.samples,
+            &body,
+            &mut topology,
+            start,
+        ) || self.record_phase_samples(
+            &spec,
+            SamplePhase::Cooldown,
+            self.config.cooldown_samples,
+            &body,
+            &mut topology,
+            start,
         );
-        Ok(self.finish_inner(comparisons))
+        if failed {
+            self.samples.truncate(start);
+            let error = last_error
+                .into_inner()
+                .unwrap_or_else(|| "the benchmark returned an error".to_string());
+            return Err(format!("confirmation run failed: {error}"));
+        }
+        let expected = self
+            .benchmark_specs
+            .iter()
+            .filter(|candidate| {
+                self.measurement_bases
+                    .get(&candidate.id)
+                    .map(String::as_str)
+                    == Some(base_id)
+            })
+            .collect::<Vec<_>>();
+        let topology_matches = expected.len() == topology.spec_order.len()
+            && expected
+                .iter()
+                .all(|candidate| topology.specs.get(&candidate.id) == Some(*candidate));
+        if !topology_matches {
+            self.samples.truncate(start);
+            return Err(
+                "confirmation run recorded different measurement rows than the original run"
+                    .to_string(),
+            );
+        }
+        for spec in expected {
+            if let Some(summary) = self
+                .summaries
+                .iter_mut()
+                .find(|summary| summary.benchmark_id == spec.id)
+            {
+                let source = summary.source.take();
+                *summary = summarize_benchmark(spec, &self.samples);
+                summary.source = source;
+            }
+        }
+        Ok(self.samples.len() - start)
     }
 
     fn finish_inner(mut self, comparisons: Vec<crate::artifact::ComparisonResult>) -> StressRun {
@@ -368,6 +670,7 @@ impl StressRunner {
             summaries: self.summaries,
             comparisons,
             diagnostics_summary,
+            confirmation_runs: self.confirmation_runs,
             started_at: run_timestamp_stem(),
             total_elapsed_ns: self.suite_start.elapsed().as_nanos(),
             metadata: self.metadata,
@@ -2616,6 +2919,309 @@ mod tests {
                 && diagnostic.severity == DiagnosticSeverity::Error));
 
         let _ = std::fs::remove_file(&baseline_path);
+    }
+
+    fn write_baseline(name: &str, run: &StressRun) -> std::path::PathBuf {
+        let path = unique_temp_path(name);
+        std::fs::write(
+            &path,
+            serde_json::to_string(run).expect("serialize baseline"),
+        )
+        .expect("write baseline");
+        path
+    }
+
+    /// A runner whose first `slow_invocations` invocations take `slow`, and
+    /// every later invocation takes 10ms, each completing 1000 operations.
+    fn timed_runner(slow_invocations: usize, slow: Duration) -> (StressRunner, Arc<Mutex<usize>>) {
+        let config = StressRunnerConfig::new()
+            .samples(10)
+            .warmup_samples(0)
+            .cooldown_samples(0);
+        let mut runner = StressRunner::with_config("suite", config);
+        runner.reporters(Vec::new());
+        runner.environment.cpu_model = "fixture test cpu".to_string();
+        let invocations = Arc::new(Mutex::new(0usize));
+        let counter = Arc::clone(&invocations);
+        runner.run("bench", move |ctx| {
+            let mut count = counter.lock().expect("counter");
+            let duration = if *count < slow_invocations {
+                slow
+            } else {
+                Duration::from_millis(10)
+            };
+            *count += 1;
+            ctx.record_external("work", duration, 1_000);
+        });
+        (runner, invocations)
+    }
+
+    fn timed_body(
+        invocations: Arc<Mutex<usize>>,
+        slow_invocations: usize,
+        slow: Duration,
+    ) -> impl Fn(&mut StressContext) {
+        move |ctx| {
+            let mut count = invocations.lock().expect("counter");
+            let duration = if *count < slow_invocations {
+                slow
+            } else {
+                Duration::from_millis(10)
+            };
+            *count += 1;
+            ctx.record_external("work", duration, 1_000);
+        }
+    }
+
+    #[test]
+    fn pooled_baseline_of_one_run_matches_single_run_comparison() {
+        let baseline = external_throughput_runner(1_000).finish();
+        let path = write_baseline("stress-pool-one.json", &baseline);
+
+        let single = external_throughput_runner(900)
+            .finish_with_baseline(&path)
+            .expect("single");
+        let runner = external_throughput_runner(900);
+        // The anchor duplicated among the extras is pooled once.
+        let pool = runner
+            .load_baseline_pool(&path, std::slice::from_ref(&path), 5)
+            .expect("pool");
+        assert_eq!(pool.pooled_runs.len(), 1);
+        assert_eq!(
+            pool.summaries,
+            baseline.canonical_baseline_summaries().expect("canonical")
+        );
+        let pooled = runner.finish_with_baseline_pool(&pool);
+        assert_eq!(pooled.comparisons, single.comparisons);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn compatible_baseline_runs_pool_raw_samples_and_incompatible_ones_are_skipped() {
+        let anchor = external_throughput_runner(1_000).finish();
+        let older = external_throughput_runner(1_000).finish();
+        let mut foreign = external_throughput_runner(1_000).finish();
+        foreign.environment.cpu_model = "other cpu".to_string();
+        for sample in &mut foreign.samples {
+            sample.environment.cpu_model = "other cpu".to_string();
+        }
+        let anchor_path = write_baseline("stress-pool-anchor.json", &anchor);
+        let older_path = write_baseline("stress-pool-older.json", &older);
+        let foreign_path = write_baseline("stress-pool-foreign.json", &foreign);
+        let missing_path = unique_temp_path("stress-pool-missing.json");
+
+        let runner = external_throughput_runner(1_000);
+        let pool = runner
+            .load_baseline_pool(
+                &anchor_path,
+                &[foreign_path.clone(), missing_path, older_path.clone()],
+                5,
+            )
+            .expect("pool");
+        assert_eq!(
+            pool.pooled_runs,
+            vec![anchor.started_at.clone(), older.started_at.clone()]
+        );
+        assert_eq!(pool.skipped.len(), 2, "{:?}", pool.skipped);
+        assert!(pool.skipped.iter().any(|note| note.contains("CPU model")));
+        assert_eq!(pool.summaries[0].measured_samples, 20);
+
+        let run = runner.finish_with_baseline_pool(&pool);
+        assert_eq!(
+            run.metadata.get("baseline_runs_pooled"),
+            Some(&"2".to_string())
+        );
+        assert!(run
+            .metadata
+            .get("baseline_runs_skipped")
+            .is_some_and(|note| note.contains("CPU model")));
+        assert_eq!(
+            run.comparisons[0].classification,
+            ComparisonClass::Inconclusive
+        );
+
+        // max_runs caps the pool including the anchor.
+        let capped = external_throughput_runner(1_000)
+            .load_baseline_pool(&anchor_path, std::slice::from_ref(&older_path), 1)
+            .expect("capped pool");
+        assert_eq!(capped.pooled_runs.len(), 1);
+
+        for path in [anchor_path, older_path, foreign_path] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn flaky_regression_clears_after_confirmation() {
+        let baseline = timed_runner(0, Duration::ZERO).0.finish();
+        let path = write_baseline("stress-confirm-flaky.json", &baseline);
+        let slow = Duration::from_micros(10_600);
+
+        let (unconfirmed, _) = timed_runner(10, slow);
+        let pool = unconfirmed.load_baseline_pool(&path, &[], 1).expect("pool");
+        let mut run = unconfirmed.finish_with_baseline_pool(&pool);
+        run.environment.profile_config.fail_on_regression = true;
+        assert_eq!(evaluate_run_gate(&run), RunGate::RegressionFailed);
+
+        let (mut runner, invocations) = timed_runner(10, slow);
+        let body = timed_body(invocations, 10, slow);
+        runner.confirm_regressions(&pool, 3, |runner, base_id| {
+            runner.confirm_spec(base_id, &body).map(|_| ())
+        });
+        let mut run = runner.finish_with_baseline_pool(&pool);
+        run.environment.profile_config.fail_on_regression = true;
+
+        assert_eq!(
+            run.confirmation_runs.len(),
+            1,
+            "{:?}",
+            run.confirmation_runs
+        );
+        let attempt = &run.confirmation_runs[0];
+        assert_eq!(attempt.attempt, 1);
+        assert_eq!(attempt.benchmark_ids, vec!["suite/bench".to_string()]);
+        assert_eq!(
+            attempt.regressions_before,
+            vec!["suite/bench/work".to_string()]
+        );
+        assert!(attempt.regressions_after.is_empty());
+        assert_eq!(attempt.samples_added, 10);
+        assert_eq!(run.samples.len(), 20);
+        assert_eq!(run.summaries[0].measured_samples, 20);
+        assert!(
+            run.summaries[0].source.is_some(),
+            "confirmation keeps the source"
+        );
+        run.canonical_baseline_summaries()
+            .expect("a confirmed run is internally consistent");
+        assert_eq!(
+            evaluate_run_gate(&run),
+            RunGate::Passed,
+            "{:?}",
+            run.comparisons
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persistent_regression_still_fails_after_every_confirmation_attempt() {
+        let baseline = timed_runner(0, Duration::ZERO).0.finish();
+        let path = write_baseline("stress-confirm-true.json", &baseline);
+        let slow = Duration::from_micros(10_600);
+
+        let (mut runner, invocations) = timed_runner(usize::MAX, slow);
+        let pool = runner.load_baseline_pool(&path, &[], 1).expect("pool");
+        let body = timed_body(invocations, usize::MAX, slow);
+        runner.confirm_regressions(&pool, 2, |runner, base_id| {
+            runner.confirm_spec(base_id, &body).map(|_| ())
+        });
+        let mut run = runner.finish_with_baseline_pool(&pool);
+        run.environment.profile_config.fail_on_regression = true;
+
+        assert_eq!(run.confirmation_runs.len(), 2);
+        assert!(run
+            .confirmation_runs
+            .iter()
+            .all(|attempt| attempt.regressions_after == vec!["suite/bench/work".to_string()]));
+        assert_eq!(run.samples.len(), 30);
+        assert_eq!(evaluate_run_gate(&run), RunGate::RegressionFailed);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn failed_confirmation_attempt_never_clears_a_regression() {
+        let baseline = timed_runner(0, Duration::ZERO).0.finish();
+        let path = write_baseline("stress-confirm-failed.json", &baseline);
+        let slow = Duration::from_micros(10_600);
+
+        let (mut runner, _) = timed_runner(10, slow);
+        let pool = runner.load_baseline_pool(&path, &[], 1).expect("pool");
+        runner.confirm_regressions(&pool, 3, |runner, _| {
+            runner
+                .confirm_spec(
+                    "suite/bench",
+                    |_ctx: &mut StressContext| -> crate::error::StressResult {
+                        Err(crate::error::StressError::new("boom"))
+                    },
+                )
+                .map(|_| ())
+        });
+        let mut run = runner.finish_with_baseline_pool(&pool);
+        run.environment.profile_config.fail_on_regression = true;
+
+        assert_eq!(run.confirmation_runs.len(), 1);
+        assert!(run.confirmation_runs[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("boom")));
+        assert_eq!(run.confirmation_runs[0].samples_added, 0);
+        assert_eq!(run.samples.len(), 10);
+        assert_eq!(evaluate_run_gate(&run), RunGate::RegressionFailed);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn confirmation_never_re_pools_a_run_that_already_failed_a_budget() {
+        let baseline = timed_runner(0, Duration::ZERO).0.finish();
+        let path = write_baseline("stress-confirm-budget.json", &baseline);
+        let slow = Duration::from_micros(10_600);
+
+        let (mut runner, _) = timed_runner(10, slow);
+        runner.summaries[0]
+            .budget_results
+            .push(crate::artifact::BudgetResult {
+                metric: "ns_per_op".to_string(),
+                limit: 1.0,
+                actual: Some(2.0),
+                passed: false,
+                reason: None,
+            });
+        let pool = runner.load_baseline_pool(&path, &[], 1).expect("pool");
+        let mut reruns = 0;
+        runner.confirm_regressions(&pool, 3, |_, _| {
+            reruns += 1;
+            Ok(())
+        });
+        let run = runner.finish_with_baseline_pool(&pool);
+
+        assert_eq!(
+            reruns, 0,
+            "pooling must not clear an absolute budget failure"
+        );
+        assert!(run.confirmation_runs.is_empty());
+        assert!(run
+            .metadata
+            .get("confirmation_skipped")
+            .is_some_and(|reason| reason.contains("budget")));
+        assert_eq!(evaluate_run_gate(&run), RunGate::BudgetFailed);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn confirmation_is_a_no_op_without_regressions() {
+        let baseline = timed_runner(0, Duration::ZERO).0.finish();
+        let path = write_baseline("stress-confirm-noop.json", &baseline);
+        let (mut runner, _) = timed_runner(0, Duration::ZERO);
+        let pool = runner.load_baseline_pool(&path, &[], 1).expect("pool");
+        let mut reruns = 0;
+        runner.confirm_regressions(&pool, 3, |_, _| {
+            reruns += 1;
+            Ok(())
+        });
+        let run = runner.finish_with_baseline_pool(&pool);
+        assert_eq!(reruns, 0);
+        assert!(run.confirmation_runs.is_empty());
+        assert!(serde_json::to_value(&run)
+            .expect("json")
+            .get("confirmation_runs")
+            .is_none());
+
+        let _ = std::fs::remove_file(&path);
     }
 
     fn unique_temp_path(name: &str) -> std::path::PathBuf {
