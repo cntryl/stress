@@ -373,3 +373,118 @@ STRESS_RUN_ID=ci-run-20260706-001 cargo bench --bench storage_stress
   allocations from workload-owned threads are intentionally part of the row.
 - Reusing stale `latest.json` artifacts from different runs: group multi-suite
   reports by `STRESS_RUN_ID` or refresh the full suite before comparing.
+
+## Parameter Sweeps
+
+Emit one row per point on the axis from a single `#[stress]` function. Put the
+value in the row name and attach it as a builder parameter scoped to that row:
+
+```rust
+use cntryl_stress::{black_box, stress, StressContext};
+
+#[stress(tier = 2)]
+fn sum_sweep(ctx: &mut StressContext) {
+    for size in [64_u64, 256, 1024, 4096] {
+        let input = (0..size).collect::<Vec<_>>();
+        ctx.benchmark(format!("sum/size={size}"))
+            .parameter("size", size)
+            .measure(|| black_box(input.iter().sum::<u64>()));
+    }
+}
+```
+
+The text report (`latest.txt`) groups rows that share a numeric parameter into
+a **Sweep Tables** section, one table per benchmark with the swept value
+replaced by `*` (here `sum/size=*`), showing speedup and efficiency relative to
+the smallest value and the first plateau. Rows only join one table when every
+other parameter and the measurement unit match, so keep other parameters fixed
+across the sweep. Every row from one function must use the same `samples`,
+`warmup`, and `cooldown` overrides.
+
+## Anti-DCE with `black_box`
+
+`likely_optimized_away` (Tier 1 below 5 ns/op) and `tiny_micro_timing` (below
+15 ns/op) usually mean the compiler saw through the benchmark. Route inputs
+through `cntryl_stress::black_box` (a re-export of `std::hint::black_box`),
+vary them across calls, and return an observable output:
+
+```rust
+use cntryl_stress::{black_box, stress, StressContext};
+
+#[stress(tier = 1)]
+fn checksum(ctx: &mut StressContext) {
+    let inputs = [0x1234_u32, 0xbeef, 0xcafe, 0x0f0f];
+    let mut next = 0;
+    ctx.measure("checksum", || {
+        next = (next + 1) % inputs.len();
+        black_box(black_box(inputs[next]).rotate_left(5) ^ 0x9e37_79b9)
+    });
+}
+```
+
+Only after reviewing the optimized code, opt in with
+`#[stress(tier = 1, metadata(validated_micro = "true"))]`. See
+[`likely_optimized_away`](diagnostics/likely_optimized_away.md).
+
+## Local Fast Loop
+
+Iterate on one benchmark with the `smoke` profile (one measured sample, no
+warmup) and a `--workload` glob. Smoke never fails on quality or regressions,
+so it answers "does it run and what does it roughly cost" in seconds:
+
+```bash
+cargo stress --profile smoke --workload 'sum_sweep'
+cargo bench --bench storage_stress -- --profile smoke --workload 'storage::cache::*'
+```
+
+Expect `too_few_samples` in this loop. Switch to `--profile default` or
+`release` before trusting a number.
+
+## Allocation Budgets
+
+Install the counting allocator once per bench crate, then state the budget on
+the row. `max_allocs_per_op` and `max_bytes_per_op` fail the run when
+exceeded:
+
+```rust
+use cntryl_stress::{black_box, stress, stress_main, StressContext};
+
+cntryl_stress::stress_allocator!();
+
+#[stress(tier = 1, max_allocs_per_op = 0, max_bytes_per_op = 0)]
+fn encode_reused_buffer(ctx: &mut StressContext) {
+    let mut buf = Vec::with_capacity(64);
+    ctx.measure("encode", || {
+        buf.clear();
+        buf.extend_from_slice(black_box(b"payload"));
+        black_box(buf.len())
+    });
+}
+
+stress_main!();
+```
+
+Without the allocator, an allocation budget cannot be evaluated and reports
+[`budget_failure`](diagnostics/budget_failure.md). Unbudgeted allocations in
+measured work report [`high_allocations`](diagnostics/high_allocations.md).
+Counters are process-wide: keep unrelated background threads quiet.
+
+## Profiling One Benchmark
+
+Select a single row and raise its sample count so the profiler sees mostly
+measured work. `perf` and `samply` both follow the child processes Cargo and
+the harness start:
+
+```bash
+# Linux
+perf record -g -- cargo bench --bench storage_stress -- --workload 'parse_route_hot_path' --samples 200
+perf report
+
+# macOS or Linux
+samply record cargo bench --bench storage_stress -- --workload 'parse_route_hot_path' --samples 200
+```
+
+Bench builds use Cargo's `bench` profile, which inherits `release` and has no
+debug info by default; add `[profile.bench] debug = true` to your workspace
+`Cargo.toml` for readable stacks. Artifacts from profiling runs are ordinary
+runs; do not save them as baselines.

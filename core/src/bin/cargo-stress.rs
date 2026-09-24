@@ -541,6 +541,11 @@ fn explain_output(args: &ExplainArgs) -> std::result::Result<String, String> {
     let _ = writeln!(output);
     let _ = writeln!(output, "Causes: {}", info.causes);
     let _ = writeln!(output, "Fix: {}", info.fix);
+    let _ = writeln!(
+        output,
+        "Docs: https://github.com/cntryl/stress/blob/main/docs/{}",
+        info.docs_anchor
+    );
     Ok(output)
 }
 
@@ -3544,6 +3549,12 @@ mod tests {
         let output = explain_output(&explain).expect("known code");
         assert!(output.contains("too_fast (warning)"), "{output}");
         assert!(output.contains("Fix: Batch more logical work"), "{output}");
+        assert!(
+            output.contains(
+                "Docs: https://github.com/cntryl/stress/blob/main/docs/diagnostics/too_fast.md"
+            ),
+            "{output}"
+        );
 
         let cli = Cli::try_parse_from(["cargo", "stress", "explain", "--list"])
             .expect("explain --list parses");
