@@ -5445,7 +5445,7 @@ mod tests {
 
         let mut run = StressRun {
             schema_version: SCHEMA_VERSION.to_string(),
-            tool_version: "0.4.0".to_string(),
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
             suite: "suite".to_string(),
             run_profile: RunProfile::Default,
             environment: EnvironmentInfo::unknown(ProfileConfig::default()),
@@ -5898,7 +5898,7 @@ mod tests {
         let profile_config = ProfileConfig::default();
         let run = StressRun {
             schema_version: SCHEMA_VERSION.to_string(),
-            tool_version: "0.4.0".to_string(),
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
             suite: "suite".to_string(),
             run_profile: profile_config.profile,
             environment: EnvironmentInfo::unknown(profile_config),
@@ -6218,7 +6218,7 @@ mod tests {
             .retain(|diagnostic| diagnostic.code != "non_finite_samples_dropped");
         let run = StressRun {
             schema_version: SCHEMA_VERSION.to_string(),
-            tool_version: "0.4.0".to_string(),
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
             suite: "suite".to_string(),
             run_profile: RunProfile::Default,
             environment: test_env(),
@@ -6407,7 +6407,7 @@ mod tests {
         let profile_config = ProfileConfig::default();
         let run = StressRun {
             schema_version: SCHEMA_VERSION.to_string(),
-            tool_version: "0.4.0".to_string(),
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
             suite: "suite".to_string(),
             run_profile: profile_config.profile,
             environment: EnvironmentInfo::unknown(profile_config),
@@ -6437,7 +6437,7 @@ mod tests {
         let profile_config = ProfileConfig::default();
         let run = StressRun {
             schema_version: SCHEMA_VERSION.to_string(),
-            tool_version: "0.4.0".to_string(),
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
             suite: "suite".to_string(),
             run_profile: profile_config.profile,
             environment: EnvironmentInfo::unknown(profile_config),
@@ -6505,7 +6505,7 @@ mod tests {
             .is_some_and(|stats| stats.p95_confidence_interval_95.is_none()));
         let run = StressRun {
             schema_version: SCHEMA_VERSION.to_string(),
-            tool_version: "0.4.0".to_string(),
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
             suite: "suite".to_string(),
             run_profile: RunProfile::Default,
             environment: test_env(),
@@ -6564,7 +6564,7 @@ mod tests {
         assert_eq!(legacy_summary.primary_value(), Some(110.0));
         let run = StressRun {
             schema_version: SCHEMA_VERSION.to_string(),
-            tool_version: "0.4.0".to_string(),
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
             suite: "suite".to_string(),
             run_profile: RunProfile::Default,
             environment: test_env(),
@@ -6607,7 +6607,7 @@ mod tests {
         samples[2].environment.cpu_model = "different cpu".to_string();
         let run = StressRun {
             schema_version: SCHEMA_VERSION.to_string(),
-            tool_version: "0.4.0".to_string(),
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
             suite: "suite".to_string(),
             run_profile: RunProfile::Default,
             environment: test_env(),
@@ -6639,7 +6639,7 @@ mod tests {
         let summary = summarize_benchmark(&benchmark_spec, &samples);
         let run = StressRun {
             schema_version: SCHEMA_VERSION.to_string(),
-            tool_version: "0.4.0".to_string(),
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
             suite: "suite".to_string(),
             run_profile: RunProfile::Default,
             environment: test_env(),
@@ -6690,7 +6690,7 @@ mod tests {
             .insert("clients".to_string(), "16".to_string());
         let run = StressRun {
             schema_version: SCHEMA_VERSION.to_string(),
-            tool_version: "0.4.0".to_string(),
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
             suite: "suite".to_string(),
             run_profile: RunProfile::Default,
             environment: test_env(),
@@ -6722,7 +6722,7 @@ mod tests {
         let summary = summarize_benchmark(&spec, &samples);
         let run = StressRun {
             schema_version: SCHEMA_VERSION.to_string(),
-            tool_version: "0.4.0".to_string(),
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
             suite: "suite".to_string(),
             run_profile: RunProfile::Default,
             environment: EnvironmentInfo::unknown(ProfileConfig::default()),
@@ -6751,7 +6751,7 @@ mod tests {
     fn summary_and_diagnostic_trust_class_default_when_missing_from_json() {
         let run = StressRun {
             schema_version: SCHEMA_VERSION.to_string(),
-            tool_version: "0.4.0".to_string(),
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
             suite: "suite".to_string(),
             run_profile: RunProfile::Default,
             environment: EnvironmentInfo::unknown(ProfileConfig::default()),
@@ -6805,7 +6805,7 @@ mod tests {
         let profile_config = ProfileConfig::default();
         let run = StressRun {
             schema_version: "cntryl-stress.v999".to_string(),
-            tool_version: "0.4.0".to_string(),
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
             suite: "suite".to_string(),
             run_profile: profile_config.profile,
             environment: EnvironmentInfo::unknown(profile_config),
