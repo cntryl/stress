@@ -486,7 +486,8 @@ platforms. The value is process-wide and monotonic: it is the high-water mark
 of the whole benchmark process so far, not a per-row delta. That makes it
 meaningful for the whole suite and for the first row that grows it. The
 console and Markdown reports show the suite peak and the row with the largest
-growth. `#[stress(max_peak_rss_mb = 512)]` (or
+growth after the first row, which also carries the process baseline.
+`#[stress(max_peak_rss_mb = 512)]` (or
 `BenchmarkBudgets::with_max_peak_rss_mb`) emits a `peak_rss_exceeded`
 warning. It never fails the budget gate. Opt into gating with
 `--deny-code peak_rss_exceeded`. Baseline validation ignores peak RSS. Run

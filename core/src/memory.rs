@@ -59,9 +59,12 @@ mod tests {
         std::hint::black_box(&buffer);
 
         let after = peak_rss_bytes().expect("unix exposes peak RSS");
+        // An absolute bound stays robust even if an earlier test already
+        // raised the high-water mark and freed the memory.
+        assert!(after >= before);
         assert!(
-            after >= before + (BUFFER_BYTES / 4) as u64,
-            "peak RSS {after} did not grow from {before} for a {BUFFER_BYTES}-byte buffer"
+            after >= BUFFER_BYTES as u64,
+            "peak RSS {after} is below a touched {BUFFER_BYTES}-byte buffer"
         );
     }
 
