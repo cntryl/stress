@@ -385,7 +385,21 @@ fn publish_artifact_set(
     Ok(())
 }
 
-fn acquire_artifact_publication_lock(suite_dir: &Path) -> std::io::Result<std::fs::File> {
+/// Whether an interrupted or uncleaned artifact transaction exists.
+pub(crate) fn has_artifact_transaction_state(suite_dir: &Path) -> std::io::Result<bool> {
+    Ok(std::fs::read_dir(suite_dir)?
+        .filter_map(Result::ok)
+        .any(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(ARTIFACT_TRANSACTION_PREFIX)
+                || name.starts_with(ARTIFACT_COMMITTED_TRANSACTION_PREFIX)
+        }))
+}
+
+pub(crate) fn acquire_artifact_publication_lock(
+    suite_dir: &Path,
+) -> std::io::Result<std::fs::File> {
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
