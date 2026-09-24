@@ -2402,7 +2402,11 @@ fn normalized_summary_for_validation(
     normalized.diagnostics.retain(|diagnostic| {
         !matches!(
             diagnostic.code.as_str(),
-            "regression" | "baseline_semantics_changed" | "non_finite_samples_dropped"
+            "regression"
+                | "baseline_semantics_changed"
+                | "non_finite_samples_dropped"
+                | "insufficient_warmup"
+                | "measurement_drift"
         )
     });
     for diagnostic in &mut normalized.diagnostics {
@@ -2577,6 +2581,7 @@ fn primary_stats(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn summarize_benchmark_with_latency_estimator(
     spec: &BenchmarkSpec,
     samples: &[Sample],
@@ -2650,6 +2655,16 @@ fn summarize_benchmark_with_latency_estimator(
     );
 
     let metadata = summary_metadata(spec, primary_metric, latency_estimator);
+    // Appended after quality and trust are classified: these Info findings
+    // are advisory and must not change any derived result.
+    let mut diagnostics = diagnostics;
+    diagnostics.extend(stationarity_diagnostics(
+        spec,
+        samples,
+        primary_metric,
+        latency_estimator,
+        &values,
+    ));
 
     BenchmarkSummary {
         benchmark_id: spec.id.clone(),
@@ -3747,6 +3762,80 @@ fn diagnostic_with_evidence(
     }
 }
 
+#[allow(clippy::cast_precision_loss)]
+fn stationarity_diagnostics(
+    spec: &BenchmarkSpec,
+    samples: &[Sample],
+    primary_metric: PrimaryMetric,
+    latency_estimator: LatencyEstimator,
+    measured_values: &[f64],
+) -> Vec<BenchmarkDiagnostic> {
+    // The pooled legacy estimator flattens observations, so sample order is lost.
+    if latency_estimator == LatencyEstimator::LegacyPooledObservations {
+        return Vec::new();
+    }
+    let warmup = samples
+        .iter()
+        .filter(|sample| sample.benchmark_id == spec.id && sample.phase == SamplePhase::Warmup)
+        .collect::<Vec<_>>();
+    let warmup_values = primary_values(primary_metric, &warmup, latency_estimator);
+    let mut diagnostics = Vec::new();
+    if let Some(finding) = crate::stationarity::insufficient_warmup(&warmup_values, measured_values)
+    {
+        let mut result = diagnostic(
+            "insufficient_warmup",
+            DiagnosticSeverity::Info,
+            "The warmup tail and the first measured samples sit at different levels.",
+            [
+                ("warmup_samples", warmup_values.len().to_string()),
+                ("warmup_tail_median", format!("{:.6}", finding.tail_median)),
+                (
+                    "warmup_tail_ci",
+                    format!("[{:.6}, {:.6}]", finding.tail_ci.0, finding.tail_ci.1),
+                ),
+                (
+                    "measured_head_median",
+                    format!("{:.6}", finding.head_median),
+                ),
+                (
+                    "measured_head_ci",
+                    format!("[{:.6}, {:.6}]", finding.head_ci.0, finding.head_ci.1),
+                ),
+                ("shift_percent", format!("{:.2}", finding.shift_percent)),
+                (
+                    "suggested_warmup_samples",
+                    finding.suggested_warmup_samples.to_string(),
+                ),
+            ],
+        );
+        result.suggestions.insert(
+            0,
+            format!(
+                "Raise warmup to about {} samples (--warmup-samples {}).",
+                finding.suggested_warmup_samples, finding.suggested_warmup_samples
+            ),
+        );
+        diagnostics.push(result);
+    }
+    if let Some(finding) = crate::stationarity::measurement_drift(&warmup_values, measured_values) {
+        diagnostics.push(diagnostic(
+            "measurement_drift",
+            DiagnosticSeverity::Info,
+            "Measured samples trend steadily in one direction over the run.",
+            [
+                ("measured_samples", measured_values.len().to_string()),
+                ("slope", format!("{:.6}", finding.slope)),
+                (
+                    "slope_ci",
+                    format!("[{:.6}, {:.6}]", finding.slope_ci.0, finding.slope_ci.1),
+                ),
+                ("drift_percent", format!("{:.2}", finding.drift_percent)),
+            ],
+        ));
+    }
+    diagnostics
+}
+
 fn non_finite_samples_diagnostic(
     measured_samples: usize,
     stats: [Option<&SummaryStats>; 2],
@@ -4426,7 +4515,7 @@ const fn quality_rank(quality: QualityClass) -> u8 {
     clippy::cast_precision_loss,
     clippy::cast_sign_loss
 )]
-fn percentile_sorted(sorted: &[f64], quantile: f64) -> f64 {
+pub(crate) fn percentile_sorted(sorted: &[f64], quantile: f64) -> f64 {
     debug_assert!(!sorted.is_empty());
     if sorted.len() == 1 {
         return sorted[0];
@@ -4454,7 +4543,7 @@ fn percentile_sorted(sorted: &[f64], quantile: f64) -> f64 {
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
-fn quantile_confidence_interval_95(sorted: &[f64], quantile: f64) -> ConfidenceInterval {
+pub(crate) fn quantile_confidence_interval_95(sorted: &[f64], quantile: f64) -> ConfidenceInterval {
     debug_assert!(!sorted.is_empty());
     let n = sorted.len() as f64;
     let center = n * quantile;
@@ -5784,6 +5873,102 @@ mod tests {
             .iter()
             .filter(|diagnostic| diagnostic.code != "too_fast")
             .all(|diagnostic| !diagnostic.evidence.contains_key("timer_resolution_ns")));
+    }
+
+    fn phased_samples(warmup: &[u128], measured: &[u128]) -> Vec<Sample> {
+        let mut samples = Vec::new();
+        for (index, elapsed) in warmup.iter().enumerate() {
+            let mut sample = completed_sample("bench", index, *elapsed, 1_000);
+            sample.phase = SamplePhase::Warmup;
+            samples.push(sample);
+        }
+        for (index, elapsed) in measured.iter().enumerate() {
+            samples.push(completed_sample(
+                "bench",
+                warmup.len() + index,
+                *elapsed,
+                1_000,
+            ));
+        }
+        samples
+    }
+
+    fn find_code<'a>(summary: &'a BenchmarkSummary, code: &str) -> Option<&'a BenchmarkDiagnostic> {
+        summary
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == code)
+    }
+
+    #[test]
+    fn warmup_and_drift_diagnostics_are_info_with_evidence_and_leave_stats_alone() {
+        let spec = spec("bench");
+        let mut measured = vec![1_450_000_u128, 1_400_000, 1_350_000];
+        measured.extend((0..17).map(|index| 1_000_000 + (index % 3) * 1_000));
+        let samples = phased_samples(&[1_600_000, 1_500_000], &measured);
+        let summary = summarize_benchmark(&spec, &samples);
+        let warmup = find_code(&summary, "insufficient_warmup").expect("warmup diagnostic");
+        assert_eq!(warmup.severity, DiagnosticSeverity::Info);
+        for key in [
+            "warmup_tail_median",
+            "warmup_tail_ci",
+            "measured_head_median",
+            "measured_head_ci",
+            "shift_percent",
+            "suggested_warmup_samples",
+        ] {
+            assert!(
+                warmup.evidence.contains_key(key),
+                "missing {key}: {warmup:?}"
+            );
+        }
+        assert!(
+            warmup.suggestions[0].contains("--warmup-samples"),
+            "{warmup:?}"
+        );
+        // Diagnostics never alter data: stats match a run without warmup.
+        let without = summarize_benchmark(&spec, &phased_samples(&[], &measured));
+        assert_eq!(summary.stats, without.stats);
+        assert!(find_code(&without, "insufficient_warmup").is_none());
+
+        let ramp = (0..20_u128)
+            .map(|index| 1_000_000 + index * 20_000)
+            .collect::<Vec<_>>();
+        let summary = summarize_benchmark(&spec, &phased_samples(&[1_000_000, 1_000_000], &ramp));
+        let drift = find_code(&summary, "measurement_drift").expect("drift diagnostic");
+        assert_eq!(drift.severity, DiagnosticSeverity::Info);
+        for key in ["slope", "slope_ci", "drift_percent", "measured_samples"] {
+            assert!(drift.evidence.contains_key(key), "missing {key}: {drift:?}");
+        }
+
+        let flat = vec![1_000_000_u128; 20];
+        let summary = summarize_benchmark(&spec, &phased_samples(&[1_000_000, 1_000_000], &flat));
+        assert!(find_code(&summary, "measurement_drift").is_none());
+        assert!(find_code(&summary, "insufficient_warmup").is_none());
+    }
+
+    #[test]
+    fn baselines_without_warmup_or_drift_codes_stay_valid() {
+        let spec = spec("bench");
+        let ramp = (0..20_u128)
+            .map(|index| 1_000_000 + index * 20_000)
+            .collect::<Vec<_>>();
+        let samples = phased_samples(&[1_600_000, 1_500_000], &ramp);
+        let mut summary = summarize_benchmark(&spec, &samples);
+        assert!(find_code(&summary, "measurement_drift").is_some());
+        summary.diagnostics.retain(|diagnostic| {
+            diagnostic.code != "measurement_drift" && diagnostic.code != "insufficient_warmup"
+        });
+        let mut run = StressRun::new("suite", RunProfile::Default, test_env());
+        run.benchmark_specs = vec![spec];
+        run.samples = samples;
+        run.summaries = vec![summary];
+        run.metadata.insert(
+            SUMMARY_SEMANTICS_METADATA_KEY.to_string(),
+            SUMMARY_SEMANTICS_CURRENT.to_string(),
+        );
+        run.canonical_baseline_summaries()
+            .expect("older baselines lack the new codes");
     }
 
     #[test]

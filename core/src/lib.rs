@@ -60,6 +60,7 @@ mod error;
 mod harness;
 pub mod reporting;
 pub mod runner;
+mod stationarity;
 
 #[cfg(test)]
 #[global_allocator]

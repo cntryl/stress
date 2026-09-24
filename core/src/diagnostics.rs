@@ -102,6 +102,14 @@ pub const DIAGNOSTIC_CATALOG: &[DiagnosticInfo] = &[
         docs_anchor: "diagnostics/high_variance.md",
     },
     DiagnosticInfo {
+        code: "insufficient_warmup",
+        default_severity: DiagnosticSeverity::Info,
+        summary: "The warmup tail and the first measured samples sit at different levels.",
+        causes: "Caches, JIT-like lazy initialization, allocator growth, or CPU frequency ramp are still settling when measurement starts.",
+        fix: "Increase warmup samples until the first measured samples match the steady state.",
+        docs_anchor: "diagnostics/insufficient_warmup.md",
+    },
+    DiagnosticInfo {
         code: "invalid_timing",
         default_severity: DiagnosticSeverity::Error,
         summary: "At least one measured sample recorded zero or invalid timing.",
@@ -116,6 +124,14 @@ pub const DIAGNOSTIC_CATALOG: &[DiagnosticInfo] = &[
         causes: "The compiler removed the measured work because its inputs are constant or its output is unused.",
         fix: "Vary inputs, accumulate observable outputs, and use #[stress(metadata(validated_micro = \"true\"))] only after anti-DCE is explicit.",
         docs_anchor: "diagnostics/likely_optimized_away.md",
+    },
+    DiagnosticInfo {
+        code: "measurement_drift",
+        default_severity: DiagnosticSeverity::Info,
+        summary: "Measured samples trend steadily in one direction over the run.",
+        causes: "State accumulates across samples (growing collections, fragmentation, leaks), or thermal throttling and background load change during the run.",
+        fix: "Reset per-sample state in setup, or investigate thermal and background load before trusting the row.",
+        docs_anchor: "diagnostics/measurement_drift.md",
     },
     DiagnosticInfo {
         code: "measurement_mode_mismatch",
