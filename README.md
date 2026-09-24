@@ -859,8 +859,21 @@ collisions by writing under `target/stress/{package}/{suite}/`. Relative
 - `{timestamp}.json` and `latest.json`
 - `{timestamp}.txt` and `latest.txt`
 - `{timestamp}.md` and `latest.md`
+- `{timestamp}.csv` and `latest.csv`
 
-All six files are staged and synced before publication. A durable transaction
+The CSV is RFC 4180 (CRLF records) with a header and one row per benchmark
+summary: `suite, benchmark_id, name, parameters, primary_metric, value, unit,
+mean, p50, p95, ci_lower, ci_upper, samples, quality, trust, regression_class,
+change_percent`. `value` is the primary value used for gating, with `unit` such
+as `op/s` or `ns/op`, and the CI bounds match it. `regression_class` and
+`change_percent` are empty unless the run was compared with a baseline.
+Parameters share one column as `key=value` pairs sorted by key and joined by
+`;`, with `\`, `;`, and `=` backslash-escaped inside keys and values. Text
+cells that start with `=`, `+`, `-`, `@`, tab, or carriage return are prefixed
+with `'` so spreadsheets do not evaluate them; numeric cells are never
+prefixed. `cntryl_stress::csv` exposes the same renderer.
+
+All eight files are staged and synced before publication. A durable transaction
 manifest distinguishes a commit in progress from a fully committed generation.
 Detected failures roll back immediately, restoring the previous `latest` set
 and removing the new timestamp set. If the process stops mid-publication, the

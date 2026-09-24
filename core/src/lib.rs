@@ -54,6 +54,7 @@ pub mod artifact;
 pub mod compare;
 mod config;
 pub mod context;
+pub mod csv;
 pub mod diagnostics;
 mod environment;
 mod error;

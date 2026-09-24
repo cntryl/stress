@@ -254,13 +254,16 @@ impl JsonReporter {
         let json_path = suite_dir.join(format!("{timestamp}.json"));
         let txt_path = suite_dir.join(format!("{timestamp}.txt"));
         let md_path = suite_dir.join(format!("{timestamp}.md"));
+        let csv_path = suite_dir.join(format!("{timestamp}.csv"));
         let latest_json_path = suite_dir.join("latest.json");
         let latest_txt_path = suite_dir.join("latest.txt");
         let latest_md_path = suite_dir.join("latest.md");
+        let latest_csv_path = suite_dir.join("latest.csv");
 
         let json = serde_json::to_string_pretty(run).map_err(std::io::Error::other)?;
         let report = format_report(run);
         let markdown = format_markdown_report(run);
+        let csv = crate::csv::format_csv_report(run);
 
         // Keep JSON last so readers never observe a new canonical artifact
         // before its corresponding human reports. If any later operation
@@ -285,6 +288,16 @@ impl JsonReporter {
             PendingArtifact {
                 path: latest_md_path,
                 contents: markdown.as_bytes(),
+                replace_existing: true,
+            },
+            PendingArtifact {
+                path: csv_path,
+                contents: csv.as_bytes(),
+                replace_existing: false,
+            },
+            PendingArtifact {
+                path: latest_csv_path,
+                contents: csv.as_bytes(),
                 replace_existing: true,
             },
             PendingArtifact {
@@ -546,9 +559,9 @@ fn recovered_artifact_targets(
     manifest: &ArtifactTransactionManifest,
 ) -> std::io::Result<Vec<PathBuf>> {
     let names = manifest.targets.iter().collect::<BTreeSet<_>>();
-    if names.len() != 6 || names.len() != manifest.targets.len() {
+    if names.len() != manifest.targets.len() {
         return Err(invalid_transaction_data(
-            "artifact transaction manifest must contain six unique targets",
+            "artifact transaction manifest targets must be unique",
         ));
     }
     for name in &manifest.targets {
@@ -575,18 +588,31 @@ fn recovered_artifact_targets(
         ));
     }
     let stem = history_json[0];
-    let expected = [
-        format!("{stem}.txt"),
-        format!("{stem}.md"),
-        "latest.txt".to_string(),
-        "latest.md".to_string(),
-        format!("{stem}.json"),
-        "latest.json".to_string(),
+    // A generation is the timestamped history set, optionally with the
+    // matching latest.* set (omitted when a newer run already owns latest).
+    // Generations written before CSV output have no `.csv` pair.
+    let actual = manifest.targets.iter().cloned().collect::<BTreeSet<_>>();
+    let generation = |extensions: &[&str], with_latest: bool| {
+        extensions
+            .iter()
+            .flat_map(|extension| {
+                let mut names = vec![format!("{stem}.{extension}")];
+                if with_latest {
+                    names.push(format!("latest.{extension}"));
+                }
+                names
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    let complete = [
+        &["txt", "md", "csv", "json"][..],
+        &["txt", "md", "json"][..],
     ]
     .into_iter()
-    .collect::<BTreeSet<_>>();
-    let actual = manifest.targets.iter().cloned().collect::<BTreeSet<_>>();
-    if actual != expected {
+    .any(|extensions| {
+        actual == generation(extensions, true) || actual == generation(extensions, false)
+    });
+    if !complete {
         return Err(invalid_transaction_data(
             "artifact transaction manifest targets do not form one complete generation",
         ));
@@ -3446,7 +3472,7 @@ pub(crate) fn human_measurement_label(summary: &BenchmarkSummary) -> String {
     }
 }
 
-fn display_unit(summary: &BenchmarkSummary) -> String {
+pub(crate) fn display_unit(summary: &BenchmarkSummary) -> String {
     normalization_basis_unit(summary)
         .or_else(|| logical_unit(summary))
         .unwrap_or_else(|| "op".to_string())
@@ -3686,7 +3712,7 @@ mod tests {
     }
 
     #[test]
-    fn json_reporter_publishes_one_complete_six_file_transaction() {
+    fn json_reporter_publishes_one_complete_eight_file_transaction() {
         let output_dir = unique_test_path("reporter-transaction-success");
         let reporter = JsonReporter::new(&output_dir);
         let run = run_with_summaries(vec![summary(
@@ -3728,8 +3754,17 @@ mod tests {
                         .starts_with('.')
                 })
                 .count(),
-            6
+            8
         );
+        let timestamp_csv =
+            std::fs::read_to_string(suite_dir.join(format!("{}.csv", run.started_at)))
+                .expect("timestamp CSV");
+        assert_eq!(
+            std::fs::read_to_string(suite_dir.join("latest.csv")).expect("latest CSV"),
+            timestamp_csv
+        );
+        assert!(timestamp_csv.starts_with("suite,benchmark_id,name,parameters,"));
+        assert!(timestamp_csv.contains("\r\nsuite,queue::fast,queue::fast,"));
         assert!(suite_dir.join(ARTIFACT_PUBLICATION_LOCK_FILE).is_file());
         std::fs::remove_dir_all(output_dir).expect("cleanup reporter test directory");
     }
@@ -3916,7 +3951,7 @@ mod tests {
             .suite_end(&next)
             .expect("recover and publish next run");
 
-        for extension in ["json", "txt", "md"] {
+        for extension in ["json", "txt", "md", "csv"] {
             assert!(!suite_dir.join(format!("200.{extension}")).exists());
             assert!(suite_dir.join(format!("300.{extension}")).exists());
         }
@@ -3933,6 +3968,143 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".artifact-transaction.")));
         std::fs::remove_dir_all(output_dir).expect("cleanup reporter test directory");
+    }
+
+    #[test]
+    fn next_publisher_recovers_an_interrupted_history_only_generation() {
+        let output_dir = unique_test_path("reporter-history-only-recovery");
+        let reporter = JsonReporter::new(&output_dir).announce(false);
+        let mut newest = run_with_summaries(vec![summary(
+            "queue::newest",
+            1_000_000.0,
+            QualityClass::Authoritative,
+        )]);
+        newest.started_at = "300".to_string();
+        reporter.suite_end(&newest).expect("publish newest run");
+
+        // An older, slower run publishes only its history files; interrupt it.
+        let mut older = run_with_summaries(vec![summary(
+            "queue::older",
+            2_000_000.0,
+            QualityClass::Authoritative,
+        )]);
+        older.started_at = "200".to_string();
+        let publication = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut committed = 0;
+            reporter
+                .write_results_inner_with_hook(&older, |point| {
+                    if point == ArtifactPublicationPoint::BeforeCommit {
+                        assert!(committed != 2, "injected process interruption");
+                        committed += 1;
+                    }
+                    Ok(())
+                })
+                .expect("interrupted publication does not return");
+        }));
+        assert!(publication.is_err());
+
+        let mut next = run_with_summaries(vec![summary(
+            "queue::next",
+            3_000_000.0,
+            QualityClass::Authoritative,
+        )]);
+        next.started_at = "400".to_string();
+        reporter
+            .suite_end(&next)
+            .expect("recover the history-only generation and publish");
+        let suite_dir = output_dir.join("suite");
+        for extension in ["json", "txt", "md", "csv"] {
+            assert!(!suite_dir.join(format!("200.{extension}")).exists());
+            assert!(suite_dir.join(format!("300.{extension}")).exists());
+            assert!(suite_dir.join(format!("400.{extension}")).exists());
+        }
+        std::fs::remove_dir_all(output_dir).expect("cleanup reporter test directory");
+    }
+
+    #[test]
+    fn csv_report_has_one_escaped_row_per_summary_with_comparison() {
+        let mut fast = summary("=queue,fast", 1_000_000.0, QualityClass::Authoritative);
+        fast.parameters
+            .insert("size".to_string(), "1,024".to_string());
+        let mut slow = summary("queue::slow", 10.0, QualityClass::Acceptable);
+        slow.primary_metric = PrimaryMetric::NsPerOp;
+        let mut run = run_with_summaries(vec![fast, slow]);
+        let mut comparison = crate::artifact::ComparisonResult::new(
+            "queue::slow",
+            PrimaryMetric::NsPerOp,
+            QualityClass::Acceptable,
+            ComparisonClass::Regression,
+            0.05,
+        );
+        comparison.change_percent = Some(-12.5);
+        run.comparisons.push(comparison);
+
+        let csv = crate::csv::format_csv_report(&run);
+        let lines = csv.split("\r\n").collect::<Vec<_>>();
+        assert_eq!(lines.len(), 4, "{csv}");
+        assert_eq!(lines[0], crate::csv::CSV_HEADER.join(","));
+        assert!(
+            lines[1]
+                .starts_with("suite,\"'=queue,fast\",\"'=queue,fast\",\"size=1,024\",throughput,"),
+            "{}",
+            lines[1]
+        );
+        assert!(lines[1].contains(",op/s,"), "{}", lines[1]);
+        assert!(lines[1].ends_with(",authoritative,gate,,"), "{}", lines[1]);
+        assert!(lines[2].contains(",ns_per_op,"), "{}", lines[2]);
+        assert!(lines[2].contains(",ns/op,"), "{}", lines[2]);
+        assert!(
+            lines[2].ends_with(",acceptable,gate,regression,-12.5"),
+            "{}",
+            lines[2]
+        );
+        assert_eq!(lines[3], "");
+    }
+
+    #[test]
+    fn recovery_accepts_legacy_generations_without_csv() {
+        let suite_dir = Path::new("suite");
+        let manifest = |names: &[&str]| ArtifactTransactionManifest {
+            targets: names.iter().map(ToString::to_string).collect(),
+        };
+        for names in [
+            &[
+                "1.txt",
+                "1.md",
+                "latest.txt",
+                "latest.md",
+                "1.json",
+                "latest.json",
+            ][..],
+            &["1.txt", "1.md", "1.json"][..],
+            &[
+                "1.txt",
+                "1.md",
+                "latest.txt",
+                "latest.md",
+                "1.csv",
+                "latest.csv",
+                "1.json",
+                "latest.json",
+            ][..],
+            &["1.txt", "1.md", "1.csv", "1.json"][..],
+        ] {
+            assert!(
+                recovered_artifact_targets(suite_dir, &manifest(names)).is_ok(),
+                "{names:?}"
+            );
+        }
+        for names in [
+            &["1.txt", "1.md", "latest.txt", "1.json"][..],
+            &["1.txt", "1.md", "1.csv", "latest.csv", "1.json"][..],
+            &["1.txt", "1.json", "2.md"][..],
+            &["1.txt", "1.txt", "1.md", "1.json"][..],
+        ] {
+            assert!(
+                recovered_artifact_targets(suite_dir, &manifest(names)).is_err(),
+                "{names:?}"
+            );
+        }
     }
 
     #[test]
@@ -4007,6 +4179,7 @@ mod tests {
             .expect("previous latest text");
         std::fs::write(suite_dir.join("latest.md"), b"previous markdown")
             .expect("previous latest markdown");
+        std::fs::write(suite_dir.join("latest.csv"), b"previous csv").expect("previous latest csv");
         let reporter = JsonReporter::new(&output_dir);
         let run = run_with_summaries(vec![summary(
             "queue::fast",
@@ -4037,7 +4210,11 @@ mod tests {
             std::fs::read(suite_dir.join("latest.md")).expect("restored latest markdown"),
             b"previous markdown"
         );
-        for extension in ["json", "txt", "md"] {
+        assert_eq!(
+            std::fs::read(suite_dir.join("latest.csv")).expect("restored latest csv"),
+            b"previous csv"
+        );
+        for extension in ["json", "txt", "md", "csv"] {
             assert!(!suite_dir
                 .join(format!("{}.{extension}", run.started_at))
                 .exists());
@@ -4083,7 +4260,8 @@ mod tests {
             b"previous markdown"
         );
         assert!(suite_dir.join("latest.json").is_dir());
-        for extension in ["json", "txt", "md"] {
+        assert!(!suite_dir.join("latest.csv").exists());
+        for extension in ["json", "txt", "md", "csv"] {
             assert!(!suite_dir
                 .join(format!("{}.{extension}", run.started_at))
                 .exists());
