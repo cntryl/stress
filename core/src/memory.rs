@@ -67,7 +67,7 @@ mod tests {
         assert!(after >= before);
         assert!(
             after >= (BUFFER_BYTES / 2) as u64,
-            "peak RSS {after} is below a touched {BUFFER_BYTES}-byte buffer"
+            "peak RSS {after} is below half of a touched {BUFFER_BYTES}-byte buffer"
         );
     }
 

@@ -22,12 +22,15 @@ triggers:
   least-squares fit of `ln(value)` on `ln(parameter)` has r² below 0.9. A
   power law then leaves more than 10% of the log variance unexplained; clean
   polynomial sweeps fit above 0.95 even with a few percent of noise, so a lower
-  fit points at a knee or cliff rather than at noise.
+  fit points at a knee or cliff rather than at noise. Over a smaller span a
+  few small steps dominate the fit's shape, so the span guard keeps nearly
+  flat sweeps silent.
 - `low_thread_efficiency`: for a `threads` sweep of throughput rows, the
   parallel efficiency `T(n) / ((n / n0) * T(n0))` against the smallest thread
   count `n0` is below 0.5 at some evaluated point, even when computed from the
   upper bound of `T(n)`'s interval and the lower bound of `T(n0)`'s. Each added
-  thread then buys less than half its ideal speedup. This also fires on a flat
+  thread then buys less than half its ideal speedup. A base whose interval
+  reaches zero or below is too noisy to judge and never fires. This also fires on a flat
   throughput sweep, where threads add nothing.
 
 It is attached to every evaluated row of the group; a row swept over several
@@ -64,9 +67,10 @@ at contention, a cache cliff, or an unstable measurement.
 ## How to fix
 
 For `poor_fit`, find the sweep point where the value jumps and check the
-working set against cache sizes. For thread sweeps, low efficiency at small thread counts points at contention; keep thread counts at
-or below the available parallelism. Investigate `non_monotonic` groups before
-trusting the sweep.
+working set against cache sizes. For thread sweeps, low efficiency at small
+thread counts points at contention; keep thread counts at or below the
+available parallelism. Investigate `non_monotonic` groups before trusting the
+sweep.
 
 ## Allowing it
 

@@ -577,7 +577,7 @@ Sweeps grouped as in the report's sweep tables are also checked for scaling.
 Healthy sweeps, such as a clean O(n) size sweep, stay silent. A group of at
 least 3 points gets the Info diagnostic `scaling_anomaly` on each row only
 when it reverses direction beyond its confidence intervals (`non_monotonic`),
-changes measurably but its log-log fit has r² below 0.9 (`poor_fit`), or, for
+changes by at least 1.5x but its log-log fit has r² below 0.9 (`poor_fit`), or, for
 a `threads` throughput sweep, its parallel efficiency is below 0.5 at an
 evaluated point (`low_thread_efficiency`). The diagnostic carries the log-log
 exponent, its fit quality, and the `triggers` that fired. `threads` sweeps skip
