@@ -3522,6 +3522,7 @@ mod tests {
             summaries,
             comparisons: Vec::new(),
             diagnostics_summary: Vec::new(),
+            confirmation_runs: Vec::new(),
             started_at: "123".to_string(),
             total_elapsed_ns: 1_000,
             metadata: BTreeMap::new(),

@@ -45,6 +45,10 @@
       "type": "array",
       "items": { "$ref": "#/$defs/diagnosticSummary" }
     },
+    "confirmation_runs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/confirmationRun" }
+    },
     "started_at": { "type": "string", "minLength": 1 },
     "total_elapsed_ns": { "$ref": "#/$defs/nonNegativeInteger" },
     "metadata": { "$ref": "#/$defs/stringMap" }
@@ -368,6 +372,19 @@
         "parameters": { "$ref": "#/$defs/stringMap" },
         "metadata": { "$ref": "#/$defs/stringMap" },
         "source": { "$ref": "#/$defs/sourceLocation" }
+      }
+    },
+    "confirmationRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attempt"],
+      "properties": {
+        "attempt": { "$ref": "#/$defs/positiveInteger" },
+        "benchmark_ids": { "type": "array", "items": { "type": "string" } },
+        "regressions_before": { "type": "array", "items": { "type": "string" } },
+        "regressions_after": { "type": "array", "items": { "type": "string" } },
+        "samples_added": { "$ref": "#/$defs/nonNegativeInteger" },
+        "error": { "type": "string" }
       }
     },
     "sourceLocation": {

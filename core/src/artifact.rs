@@ -1756,6 +1756,50 @@ impl ComparisonResult {
     }
 }
 
+/// One confirm-on-regression attempt: the benchmarks re-run after rows were
+/// classified as regressions, and the classification after pooling the new
+/// samples with every earlier attempt.
+///
+/// Fields may be added in minor releases, so struct-literal construction is
+/// not supported outside this crate; use the constructor and assign fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ConfirmationRun {
+    /// One-based attempt number.
+    pub attempt: usize,
+    /// Benchmark (function-level) ids re-run in this attempt.
+    #[serde(default)]
+    pub benchmark_ids: Vec<String>,
+    /// Row ids classified as regressions before this attempt.
+    #[serde(default)]
+    pub regressions_before: Vec<String>,
+    /// Row ids still classified as regressions after pooling this attempt.
+    #[serde(default)]
+    pub regressions_after: Vec<String>,
+    /// Raw samples (all phases) this attempt appended to the artifact.
+    #[serde(default)]
+    pub samples_added: usize,
+    /// Why the attempt could not complete, when it failed. A failed attempt
+    /// never clears a regression.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl ConfirmationRun {
+    /// Create an empty record for a one-based attempt number.
+    #[must_use]
+    pub const fn new(attempt: usize) -> Self {
+        Self {
+            attempt,
+            benchmark_ids: Vec::new(),
+            regressions_before: Vec::new(),
+            regressions_after: Vec::new(),
+            samples_added: 0,
+            error: None,
+        }
+    }
+}
+
 /// Complete current run artifact.
 ///
 /// Fields may be added in minor releases. Build a run with [`StressRun::new`]
@@ -1792,6 +1836,10 @@ pub struct StressRun {
     /// Query-friendly ledger of all benchmark diagnostics.
     #[serde(default)]
     pub diagnostics_summary: Vec<DiagnosticSummary>,
+    /// Every confirm-on-regression attempt, in order. Samples collected by
+    /// these attempts are appended to `samples`, and `summaries` pool them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub confirmation_runs: Vec<ConfirmationRun>,
     /// Timestamp/run id.
     pub started_at: String,
     /// Total elapsed wall-clock time in nanoseconds.
@@ -1821,6 +1869,7 @@ impl StressRun {
             summaries: Vec::new(),
             comparisons: Vec::new(),
             diagnostics_summary: Vec::new(),
+            confirmation_runs: Vec::new(),
             started_at: String::new(),
             total_elapsed_ns: 0,
             metadata: BTreeMap::new(),
@@ -2202,6 +2251,15 @@ impl<'a> BaselineTopology<'a> {
         }
         Ok(())
     }
+}
+
+/// Summaries recomputed with current math from every raw sample in `run`.
+///
+/// A pooled baseline is a run whose `samples` hold the raw samples of several
+/// compatible baseline runs; for a single run this equals
+/// [`StressRun::canonical_baseline_summaries`].
+pub(crate) fn pooled_baseline_summaries(run: &StressRun) -> Vec<BenchmarkSummary> {
+    recompute_baseline_summaries(run).0
 }
 
 fn recompute_baseline_summaries(run: &StressRun) -> (Vec<BenchmarkSummary>, Vec<BenchmarkSummary>) {
@@ -5107,6 +5165,7 @@ mod tests {
                 },
             ],
             diagnostics_summary: Vec::new(),
+            confirmation_runs: Vec::new(),
             started_at: "123".to_string(),
             total_elapsed_ns: 0,
             metadata: BTreeMap::new(),
@@ -5532,6 +5591,7 @@ mod tests {
             summaries: Vec::new(),
             comparisons: Vec::new(),
             diagnostics_summary: Vec::new(),
+            confirmation_runs: Vec::new(),
             started_at: "123".to_string(),
             total_elapsed_ns: 0,
             metadata: BTreeMap::new(),
@@ -5671,6 +5731,7 @@ mod tests {
             summaries: vec![summary],
             comparisons: Vec::new(),
             diagnostics_summary: Vec::new(),
+            confirmation_runs: Vec::new(),
             started_at: "123".to_string(),
             total_elapsed_ns: 0,
             metadata: BTreeMap::from([(
@@ -5681,6 +5742,60 @@ mod tests {
 
         run.canonical_baseline_summaries()
             .expect("advisory text and post-v0.4 additions must not invalidate baselines");
+    }
+
+    #[test]
+    fn confirmation_runs_are_additive_in_json_and_schema() {
+        let mut run = StressRun::new(
+            "suite",
+            RunProfile::Default,
+            EnvironmentInfo::unknown(ProfileConfig::new()),
+        );
+        let json = serde_json::to_value(&run).expect("serialize");
+        assert!(json.get("confirmation_runs").is_none());
+
+        let mut attempt = ConfirmationRun::new(1);
+        attempt.benchmark_ids = vec!["suite/bench".to_string()];
+        attempt.regressions_before = vec!["suite/bench/work".to_string()];
+        attempt.samples_added = 10;
+        run.confirmation_runs.push(attempt.clone());
+        let json = serde_json::to_value(&run).expect("serialize");
+        assert_eq!(json["confirmation_runs"][0]["attempt"], 1);
+        assert_eq!(json["confirmation_runs"][0]["samples_added"], 10);
+        assert!(json["confirmation_runs"][0].get("error").is_none());
+        let parsed: StressRun = serde_json::from_value(json).expect("round trip");
+        assert_eq!(parsed.confirmation_runs, vec![attempt]);
+
+        let schema =
+            serde_json::from_str::<serde_json::Value>(ARTIFACT_JSON_SCHEMA).expect("schema");
+        assert!(schema["properties"]["confirmation_runs"].is_object());
+        assert!(schema["$defs"]["confirmationRun"].is_object());
+        assert!(!schema["required"]
+            .as_array()
+            .expect("required")
+            .iter()
+            .any(|field| field == "confirmation_runs"));
+    }
+
+    #[test]
+    fn pooled_baseline_summaries_of_one_run_match_canonical_math() {
+        let spec = spec("bench");
+        let samples = (0..6)
+            .map(|index| completed_sample("bench", index, 100 + index as u128 * 3, 1))
+            .collect::<Vec<_>>();
+        let summary = summarize_benchmark(&spec, &samples);
+        let mut run = StressRun::new("suite", RunProfile::Default, test_env());
+        run.tool_version = run.environment.tool_version.clone();
+        run.benchmark_specs = vec![spec];
+        run.samples = samples;
+        run.summaries = vec![summary];
+        run.metadata.insert(
+            SUMMARY_SEMANTICS_METADATA_KEY.to_string(),
+            SUMMARY_SEMANTICS_CURRENT.to_string(),
+        );
+
+        let canonical = run.canonical_baseline_summaries().expect("canonical");
+        assert_eq!(pooled_baseline_summaries(&run), canonical);
     }
 
     #[test]
@@ -5805,6 +5920,7 @@ mod tests {
             summaries: Vec::new(),
             comparisons: Vec::new(),
             diagnostics_summary: Vec::new(),
+            confirmation_runs: Vec::new(),
             started_at: "123".to_string(),
             total_elapsed_ns: 0,
             metadata: BTreeMap::new(),
@@ -5834,6 +5950,7 @@ mod tests {
             summaries: Vec::new(),
             comparisons: Vec::new(),
             diagnostics_summary: Vec::new(),
+            confirmation_runs: Vec::new(),
             started_at: "123".to_string(),
             total_elapsed_ns: 0,
             metadata: BTreeMap::new(),
@@ -5901,6 +6018,7 @@ mod tests {
             summaries: vec![legacy_summary],
             comparisons: Vec::new(),
             diagnostics_summary: Vec::new(),
+            confirmation_runs: Vec::new(),
             started_at: "123".to_string(),
             total_elapsed_ns: 0,
             metadata: BTreeMap::new(),
@@ -5959,6 +6077,7 @@ mod tests {
             summaries: vec![legacy_summary],
             comparisons: Vec::new(),
             diagnostics_summary: Vec::new(),
+            confirmation_runs: Vec::new(),
             started_at: "123".to_string(),
             total_elapsed_ns: 0,
             metadata: BTreeMap::from([(
@@ -6001,6 +6120,7 @@ mod tests {
             summaries: vec![summary],
             comparisons: Vec::new(),
             diagnostics_summary: Vec::new(),
+            confirmation_runs: Vec::new(),
             started_at: "123".to_string(),
             total_elapsed_ns: 0,
             metadata: BTreeMap::new(),
@@ -6032,6 +6152,7 @@ mod tests {
             summaries: vec![summary],
             comparisons: Vec::new(),
             diagnostics_summary: Vec::new(),
+            confirmation_runs: Vec::new(),
             started_at: "123".to_string(),
             total_elapsed_ns: 0,
             metadata: BTreeMap::new(),
@@ -6082,6 +6203,7 @@ mod tests {
             summaries: vec![summary],
             comparisons: Vec::new(),
             diagnostics_summary: Vec::new(),
+            confirmation_runs: Vec::new(),
             started_at: "123".to_string(),
             total_elapsed_ns: 0,
             metadata: BTreeMap::new(),
@@ -6113,6 +6235,7 @@ mod tests {
             summaries: vec![summary],
             comparisons: Vec::new(),
             diagnostics_summary: Vec::new(),
+            confirmation_runs: Vec::new(),
             started_at: "123".to_string(),
             total_elapsed_ns: 0,
             metadata: BTreeMap::new(),
@@ -6159,6 +6282,7 @@ mod tests {
                 trust_class: TrustClass::Diagnostic,
                 parameters: BTreeMap::new(),
             }],
+            confirmation_runs: Vec::new(),
             started_at: "123".to_string(),
             total_elapsed_ns: 0,
             metadata: BTreeMap::new(),
@@ -6194,6 +6318,7 @@ mod tests {
             summaries: Vec::new(),
             comparisons: Vec::new(),
             diagnostics_summary: Vec::new(),
+            confirmation_runs: Vec::new(),
             started_at: "123".to_string(),
             total_elapsed_ns: 0,
             metadata: BTreeMap::new(),
