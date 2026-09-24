@@ -35,6 +35,8 @@ impl LatencyHistogram {
         self.max = self.max.max(value);
     }
 
+    /// Adds every value of `other`; merging is exact.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn merge(&mut self, other: &Self) {
         for (count, added) in self.counts.iter_mut().zip(&other.counts) {
             *count += added;

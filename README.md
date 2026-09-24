@@ -504,11 +504,13 @@ samples into a fixed-bucket log-linear histogram (about two significant
 digits, relative error at most 1/128). The summary's `latency_distribution`
 records `count`, `p90`, `p99`, `max`, and `p999` once there are at least 1000
 latencies. Each `record_observation` series gets the same fields as
-`distribution`, computed exactly from its per-sample values. Micro rows never
+`distribution`, computed exactly over its per-sample values (so `count` is the
+number of measured samples). Micro rows never
 get distributions: their samples are calibrated batches, not single
 operations, and batch timings are never used as latencies. The console prints
 a `tail` line per series and the Markdown report adds a "Tail Distributions"
-table. Both fields are optional, and older artifacts and baselines without
+table. Both fields are informational (never gated or baseline-checked) and
+optional, and older artifacts and baselines without
 them still load and compare.
 
 #### Peak RSS

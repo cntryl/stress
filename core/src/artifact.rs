@@ -360,8 +360,8 @@ pub struct ObservationSummary {
     pub distribution: Option<DistributionSummary>,
 }
 
-/// Tail percentiles of values recorded with `record_latency` or
-/// `record_observation`.
+/// Tail percentiles of latencies recorded with `record_latency`, or of the
+/// per-sample values of one `record_observation` series.
 ///
 /// Recorded latencies are merged across measured samples into a fixed-bucket
 /// log-linear histogram (relative error at most 1/128); observations use exact
@@ -2861,11 +2861,9 @@ fn latency_distribution(spec: &BenchmarkSpec, samples: &[&Sample]) -> Option<Dis
     }
     let mut histogram = crate::histogram::LatencyHistogram::new();
     for sample in samples {
-        let mut per_sample = crate::histogram::LatencyHistogram::new();
         for latency in &sample.latency_ns {
-            per_sample.record(u64::try_from(*latency).unwrap_or(u64::MAX));
+            histogram.record(u64::try_from(*latency).unwrap_or(u64::MAX));
         }
-        histogram.merge(&per_sample);
     }
     let count = histogram.count();
     Some(DistributionSummary {
