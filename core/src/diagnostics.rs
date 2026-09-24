@@ -168,8 +168,8 @@ pub const DIAGNOSTIC_CATALOG: &[DiagnosticInfo] = &[
     DiagnosticInfo {
         code: "scaling_anomaly",
         default_severity: DiagnosticSeverity::Info,
-        summary: "A parameter sweep's primary value changes measurably with the swept parameter.",
-        causes: "Algorithmic cost growth, contention or saturation as threads grow, or a cache or capacity cliff between sweep points.",
+        summary: "A parameter sweep reverses direction, fits no single power law, or loses parallel efficiency.",
+        causes: "Contention or saturation as threads grow, a cache or capacity cliff between sweep points, or an unstable measurement.",
         fix: "Check the exponent and thread efficiency against the expected complexity; investigate reversals before trusting the sweep.",
         docs_anchor: "diagnostics/scaling_anomaly.md",
     },

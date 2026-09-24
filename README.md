@@ -574,11 +574,14 @@ measurement, and baselines saved without these codes stay valid. See
 [`measurement_drift`](docs/diagnostics/measurement_drift.md).
 
 Sweeps grouped as in the report's sweep tables are also checked for scaling.
-When a group of at least 3 points changes beyond its confidence intervals,
-the Info diagnostic `scaling_anomaly` is attached to each row with the
-log-log exponent, its fit quality, and whether the group is non-monotonic.
-`threads` sweeps skip counts above the available parallelism and report
-parallel efficiency for throughput rows. See
+Healthy sweeps, such as a clean O(n) size sweep, stay silent. A group of at
+least 3 points gets the Info diagnostic `scaling_anomaly` on each row only
+when it reverses direction beyond its confidence intervals (`non_monotonic`),
+changes by at least 1.5x but its log-log fit has r² below 0.9 (`poor_fit`), or, for
+a `threads` throughput sweep, its parallel efficiency is below 0.5 at an
+evaluated point (`low_thread_efficiency`). The diagnostic carries the log-log
+exponent, its fit quality, and the `triggers` that fired. `threads` sweeps skip
+counts above the available parallelism. See
 [`scaling_anomaly`](docs/diagnostics/scaling_anomaly.md).
 
 ### Environment observations

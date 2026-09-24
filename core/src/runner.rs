@@ -2813,10 +2813,11 @@ mod tests {
             .operations_per_sample(1);
         let mut runner = StressRunner::with_config("suite", config);
         runner.reporters(Vec::new());
-        for size in [1_u64, 2, 4, 8] {
+        // A reversal at size=8: 1ms, 2ms, 4ms, then 1ms again.
+        for (size, millis) in [(1_u64, 1_u64), (2, 2), (4, 4), (8, 1)] {
             runner.run(&format!("scan/size={size}"), move |ctx| {
                 ctx.parameter("size", size);
-                ctx.record_external("work", Duration::from_millis(size), 1);
+                ctx.record_external("work", Duration::from_millis(millis), 1);
             });
         }
         let run = runner.finish();

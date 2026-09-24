@@ -145,17 +145,21 @@ pub(crate) fn name_without_swept_value(name: &str, key: &str, raw_value: &str) -
     name.to_string()
 }
 
-/// Attaches the Info `scaling_anomaly` diagnostic to rows of sweeps whose
-/// primary value measurably changes with the swept parameter.
+/// Attaches the Info `scaling_anomaly` diagnostic to rows of sweeps that
+/// scale anomalously.
 ///
 /// The pass reuses the sweep-table grouping and evaluates groups with at
-/// least [`MIN_SCALING_POINTS`] positive points. A group is reported when
-/// two of its points differ beyond both their 95% confidence intervals and
-/// [`MIN_RELATIVE_STEP`]; it is `non_monotonic` when such differences go
-/// both up and down. For a `threads` sweep, counts above
-/// `available_parallelism` are skipped (and listed), and throughput rows
-/// carry the parallel efficiency `T(n) / (n / n0 * T(n0))`. The diagnostic is
-/// Info and never changes measurements.
+/// least [`MIN_SCALING_POINTS`] positive points. Two points differ when they
+/// are apart by more than both their 95% confidence intervals and
+/// [`MIN_RELATIVE_STEP`]. A group is reported when such differences go both up
+/// and down (`non_monotonic`), when it changes measurably but its log-log fit
+/// has r² below [`MIN_FIT_R_SQUARED`] over a span of at least
+/// [`MIN_POOR_FIT_SPAN`] (`poor_fit`), or, for a `threads`
+/// throughput sweep, when the optimistic parallel efficiency
+/// `T(n) / (n / n0 * T(n0))` falls below [`MIN_THREAD_EFFICIENCY`] at an
+/// evaluated point (`low_thread_efficiency`). Healthy monotonic sweeps stay
+/// silent. Thread counts above `available_parallelism` are skipped (and
+/// listed). The diagnostic is Info and never changes measurements.
 pub(crate) fn attach_scaling_diagnostics(
     summaries: &mut [BenchmarkSummary],
     available_parallelism: Option<usize>,
@@ -184,6 +188,18 @@ const SCALING_ANOMALY: &str = "scaling_anomaly";
 const MIN_SCALING_POINTS: usize = 3;
 /// Smallest relative difference between two points that counts as a change.
 const MIN_RELATIVE_STEP: f64 = 0.05;
+/// Below this log-log r², a single power law leaves more than 10% of the
+/// variance in `ln(value)` unexplained. Clean polynomial sweeps (O(n),
+/// O(n log n), O(n²)) fit at r² > 0.95 even with a few percent of noise, so a
+/// lower fit indicates a regime change such as a cache cliff or knee.
+const MIN_FIT_R_SQUARED: f64 = 0.9;
+/// `poor_fit` needs the largest value to be at least this multiple of the
+/// smallest. Over a smaller span a few small steps dominate the fit's shape,
+/// so a low r² says nothing about a regime change.
+const MIN_POOR_FIT_SPAN: f64 = 1.5;
+/// Below this parallel efficiency, adding threads buys less than half of the
+/// ideal speedup: more than half of every added thread is lost to contention.
+const MIN_THREAD_EFFICIENCY: f64 = 0.5;
 /// Diagnostics on member rows that explain scheduler-driven scaling.
 const RELATED_CODES: [&str; 2] = ["flat_or_capped_throughput", "fixed_ops_throughput"];
 
@@ -230,15 +246,43 @@ fn scaling_diagnostic(
             }
         }
     }
-    if !rises && !falls {
-        return None;
-    }
     let pattern = match (rises, falls) {
         (true, true) => "non_monotonic",
         (true, false) => "monotonic_increasing",
-        _ => "monotonic_decreasing",
+        (false, true) => "monotonic_decreasing",
+        (false, false) => "flat",
     };
     let (exponent, r_squared) = log_log_fit(&evaluated);
+    let throughput_threads =
+        threads && summaries[evaluated[0].index].primary_metric == PrimaryMetric::Throughput;
+    // Efficiency is judged on its most favourable reading: the upper interval
+    // bound at `n` against the lower bound at `n0`, so noise cannot fire it.
+    // A non-positive base lower bound means the base is too noisy to judge.
+    let low_efficiency = throughput_threads
+        && intervals[0].0 > 0.0
+        && evaluated
+            .iter()
+            .zip(&intervals)
+            .skip(1)
+            .any(|(point, interval)| {
+                let optimistic = (interval.1 / intervals[0].0) / (point.x / evaluated[0].x);
+                optimistic < MIN_THREAD_EFFICIENCY
+            });
+    let mut triggers = Vec::new();
+    if pattern == "non_monotonic" {
+        triggers.push("non_monotonic");
+    } else if pattern != "flat"
+        && r_squared < MIN_FIT_R_SQUARED
+        && value_span(&evaluated) >= MIN_POOR_FIT_SPAN
+    {
+        triggers.push("poor_fit");
+    }
+    if low_efficiency {
+        triggers.push("low_thread_efficiency");
+    }
+    if triggers.is_empty() {
+        return None;
+    }
 
     let format_x = |point: &SweepPoint| format!("{}", point.x);
     let mut evidence = BTreeMap::from([
@@ -257,6 +301,7 @@ fn scaling_diagnostic(
         ("exponent".to_string(), format!("{exponent:.3}")),
         ("r_squared".to_string(), format!("{r_squared:.3}")),
         ("pattern".to_string(), pattern.to_string()),
+        ("triggers".to_string(), triggers.join(", ")),
     ]);
     if let Some(limit) = limit {
         evidence.insert("available_parallelism".to_string(), limit.to_string());
@@ -267,8 +312,7 @@ fn scaling_diagnostic(
             );
         }
     }
-    let first = &summaries[evaluated[0].index];
-    if threads && first.primary_metric == PrimaryMetric::Throughput {
+    if throughput_threads {
         let (base_x, base_y) = (evaluated[0].x, evaluated[0].y);
         let efficiency = evaluated
             .iter()
@@ -308,17 +352,24 @@ fn scaling_diagnostic(
         );
     }
 
-    let reason = if pattern == "non_monotonic" {
-        format!(
-            "The primary value reverses direction across `{}` beyond confidence-interval noise.",
-            group.parameter
-        )
-    } else {
-        format!(
-            "The primary value scales with `{}` as roughly {}^{exponent:.2}.",
-            group.parameter, group.parameter
-        )
-    };
+    let reason = triggers
+        .iter()
+        .map(|trigger| match *trigger {
+            "non_monotonic" => format!(
+                "The primary value reverses direction across `{}` beyond confidence-interval noise.",
+                group.parameter
+            ),
+            "poor_fit" => format!(
+                "The primary value changes with `{}` but no single power law fits it (r² {r_squared:.2}); look for a regime change such as a cache cliff.",
+                group.parameter
+            ),
+            _ => format!(
+                "Parallel efficiency across `{}` falls below {MIN_THREAD_EFFICIENCY} even at the top of its confidence interval.",
+                group.parameter
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut diagnostic =
         BenchmarkDiagnostic::new(SCALING_ANOMALY, DiagnosticSeverity::Info, reason);
     diagnostic.evidence = evidence;
@@ -330,6 +381,13 @@ fn scaling_diagnostic(
         diagnostic,
         evaluated.iter().map(|point| point.index).collect(),
     ))
+}
+
+/// Ratio of the largest to the smallest evaluated value.
+fn value_span(points: &[SweepPoint]) -> f64 {
+    let max = points.iter().map(|point| point.y).fold(f64::MIN, f64::max);
+    let min = points.iter().map(|point| point.y).fold(f64::MAX, f64::min);
+    max / min
 }
 
 /// The 95% interval that belongs to the row's primary value.
@@ -456,24 +514,121 @@ mod tests {
 
     #[test]
     #[allow(clippy::cast_precision_loss)]
-    fn linear_and_quadratic_sweeps_report_their_exponents() {
+    fn healthy_polynomial_sweeps_stay_silent() {
         let sizes = [10_u64, 100, 1_000, 10_000];
         let linear = sizes.map(|n| (n, 3.0 * n as f64));
         let quadratic = sizes.map(|n| (n, 0.5 * (n as f64).powi(2)));
-        let mut rows = sweep("size", PrimaryMetric::NsPerOp, 0.01, &linear);
+        let n_log_n = sizes.map(|n| (n, n as f64 * (n as f64).ln()));
+        for points in [&linear, &quadratic, &n_log_n] {
+            let mut rows = sweep("size", PrimaryMetric::NsPerOp, 0.01, points);
+            attach_scaling_diagnostics(&mut rows, None);
+            assert!(rows.iter().all(|summary| scaling(summary).is_none()));
+        }
+    }
+
+    #[test]
+    fn poorly_fitting_monotonic_sweeps_report_the_fit() {
+        // A cache cliff: flat, then a 10x jump, then flat again.
+        let mut rows = sweep(
+            "size",
+            PrimaryMetric::NsPerOp,
+            0.01,
+            &[(1, 10.0), (2, 10.5), (4, 11.0), (8, 100.0), (16, 105.0)],
+        );
         attach_scaling_diagnostics(&mut rows, None);
         for summary in &rows {
             let diagnostic = scaling(summary).expect("every row of the sweep");
             assert_eq!(diagnostic.severity, DiagnosticSeverity::Info);
-            assert_eq!(diagnostic.evidence["parameter"], "size");
             assert_eq!(diagnostic.evidence["pattern"], "monotonic_increasing");
-            assert!((exponent(summary) - 1.0).abs() < 0.02);
+            assert_eq!(diagnostic.evidence["triggers"], "poor_fit");
             let r_squared: f64 = diagnostic.evidence["r_squared"].parse().unwrap();
-            assert!(r_squared > 0.99);
+            assert!(r_squared < 0.9);
+            assert!(exponent(summary) > 0.0);
         }
-        let mut rows = sweep("size", PrimaryMetric::NsPerOp, 0.01, &quadratic);
+    }
+
+    #[test]
+    fn flat_thread_throughput_reports_low_efficiency() {
+        let mut rows = sweep(
+            "threads",
+            PrimaryMetric::Throughput,
+            0.01,
+            &[(1, 1_000.0), (2, 1_010.0), (4, 990.0)],
+        );
+        attach_scaling_diagnostics(&mut rows, Some(8));
+        let diagnostic = scaling(&rows[2]).expect("efficiency collapse");
+        assert_eq!(diagnostic.evidence["triggers"], "low_thread_efficiency");
+        assert_eq!(diagnostic.evidence["pattern"], "flat");
+    }
+
+    #[test]
+    fn a_noisy_base_with_a_negative_lower_bound_cannot_fire_low_efficiency() {
+        let mut rows = sweep(
+            "threads",
+            PrimaryMetric::Throughput,
+            0.01,
+            &[(1, 1_000.0), (2, 2_000.0), (4, 4_000.0)],
+        );
+        rows[0] = row(
+            "sort",
+            "threads",
+            1,
+            PrimaryMetric::Throughput,
+            1_000.0,
+            3.0,
+        );
+        let lower = rows[0].stats.as_ref().unwrap().confidence_interval_95.lower;
+        assert!(
+            lower < 0.0,
+            "fixture needs a negative lower bound, got {lower}"
+        );
+        attach_scaling_diagnostics(&mut rows, Some(8));
+        assert!(rows.iter().all(|summary| scaling(summary).is_none()));
+    }
+
+    #[test]
+    fn small_steps_in_a_nearly_flat_sweep_are_not_a_poor_fit() {
+        // A real but small 10% step fits a power law badly in shape only.
+        let mut rows = sweep(
+            "size",
+            PrimaryMetric::NsPerOp,
+            0.0,
+            &[(1, 10.0), (2, 10.0), (4, 11.0)],
+        );
         attach_scaling_diagnostics(&mut rows, None);
-        assert!((exponent(&rows[0]) - 2.0).abs() < 0.02);
+        assert!(rows.iter().all(|summary| scaling(summary).is_none()));
+    }
+
+    #[test]
+    fn the_reason_names_every_trigger_that_fired() {
+        // Flat for two points, then a collapse: both a poor fit and low
+        // parallel efficiency.
+        let mut rows = sweep(
+            "threads",
+            PrimaryMetric::Throughput,
+            0.01,
+            &[(1, 1_000.0), (2, 1_000.0), (4, 3_000.0), (8, 3_000.0)],
+        );
+        attach_scaling_diagnostics(&mut rows, Some(8));
+        let diagnostic = scaling(&rows[0]).expect("anomalous thread sweep");
+        assert_eq!(
+            diagnostic.evidence["triggers"],
+            "poor_fit, low_thread_efficiency"
+        );
+        assert!(diagnostic.reason.contains("power law"));
+        assert!(diagnostic.reason.contains("efficiency"));
+    }
+
+    #[test]
+    fn near_linear_thread_scaling_stays_silent() {
+        let mut rows = sweep(
+            "threads",
+            PrimaryMetric::Throughput,
+            0.01,
+            &[(1, 1_000.0), (2, 1_900.0), (4, 3_500.0), (8, 6_000.0)],
+        );
+        attach_scaling_diagnostics(&mut rows, Some(8));
+        assert!(rows.iter().all(|summary| scaling(summary).is_none()));
     }
 
     #[test]
@@ -499,6 +654,8 @@ mod tests {
         attach_scaling_diagnostics(&mut rows, None);
         let diagnostic = scaling(&rows[3]).expect("non-monotonic group");
         assert_eq!(diagnostic.evidence["pattern"], "non_monotonic");
+        assert!(diagnostic.evidence["triggers"].contains("non_monotonic"));
+        assert!(diagnostic.evidence.contains_key("exponent"));
         assert!(diagnostic.reason.contains("reverses"));
     }
 
@@ -543,7 +700,7 @@ mod tests {
                 (1, 1_000.0),
                 (2, 1_900.0),
                 (4, 3_200.0),
-                (8, 4_000.0),
+                (8, 3_600.0),
                 (16, 4_100.0),
             ],
         );
@@ -556,8 +713,9 @@ mod tests {
         let diagnostic = scaling(&rows[0]).expect("thread sweep");
         assert_eq!(
             diagnostic.evidence["thread_efficiency"],
-            "1=1.00, 2=0.95, 4=0.80, 8=0.50"
+            "1=1.00, 2=0.95, 4=0.80, 8=0.45"
         );
+        assert_eq!(diagnostic.evidence["triggers"], "low_thread_efficiency");
         assert_eq!(diagnostic.evidence["available_parallelism"], "8");
         assert_eq!(diagnostic.evidence["skipped_above_parallelism"], "16");
         assert_eq!(diagnostic.evidence["points"], "4");
@@ -574,7 +732,7 @@ mod tests {
             "threads",
             PrimaryMetric::NsPerOp,
             0.01,
-            &[(1, 100.0), (2, 200.0), (4, 400.0)],
+            &[(1, 100.0), (2, 200.0), (4, 120.0)],
         );
         attach_scaling_diagnostics(&mut rows, Some(8));
         let diagnostic = scaling(&rows[0]).expect("thread sweep");
@@ -587,7 +745,7 @@ mod tests {
             "size",
             PrimaryMetric::NsPerOp,
             0.01,
-            &[(1, 1.0), (2, 2.0), (4, 4.0)],
+            &[(1, 1.0), (2, 2.0), (4, 1.2)],
         );
         attach_scaling_diagnostics(&mut rows, None);
         attach_scaling_diagnostics(&mut rows, None);
