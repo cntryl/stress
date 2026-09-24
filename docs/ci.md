@@ -57,14 +57,14 @@ permissions:
 
 concurrency:
   group: stress-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
   STRESS_VERSION: "0.5.0"
-  # Paths passed to `cargo stress` are resolved from the repository root.
-  STRESS_BASELINE_DIR: target/stress/baselines
-  STRESS_OUTPUT_DIR: target/stress
+  # Passed as flags, which `cargo stress` resolves from the repository root.
+  BENCH_BASELINE_DIR: target/stress/baselines
+  BENCH_OUTPUT_DIR: target/stress
 
 jobs:
   baseline:
@@ -92,7 +92,7 @@ jobs:
       - name: Run and save baseline
         run: >-
           cargo stress --profile release
-          --baseline-dir "$STRESS_BASELINE_DIR" --output-dir "$STRESS_OUTPUT_DIR"
+          --baseline-dir "$BENCH_BASELINE_DIR" --output-dir "$BENCH_OUTPUT_DIR"
           --save-baseline --baseline-runs 5
 
       # Cache entries are immutable, so each run saves under a new key and
@@ -139,7 +139,7 @@ jobs:
             echo "::notice::No baseline cache for the base branch yet; running without a comparison."
           fi
           cargo stress --profile release \
-            --baseline-dir "$STRESS_BASELINE_DIR" --output-dir "$STRESS_OUTPUT_DIR" \
+            --baseline-dir "$BENCH_BASELINE_DIR" --output-dir "$BENCH_OUTPUT_DIR" \
             --deny-code likely_optimized_away "${compare[@]}"
 
       - name: Compare with baseline
@@ -149,13 +149,13 @@ jobs:
           {
             echo "## cntryl-stress comparison"
             found=0
-            for candidate in "$STRESS_OUTPUT_DIR"/*/*/latest.json; do
+            for candidate in "$BENCH_OUTPUT_DIR"/*/*/latest.json; do
               [ -f "$candidate" ] || continue
               suite_dir=$(dirname "$candidate")
               suite=$(basename "$suite_dir")
               package=$(basename "$(dirname "$suite_dir")")
               [ "$package" = baselines ] && continue
-              baseline="$STRESS_BASELINE_DIR/$package/latest/$suite.json"
+              baseline="$BENCH_BASELINE_DIR/$package/latest/$suite.json"
               echo
               echo "### $package / $suite"
               if [ -f "$baseline" ]; then
@@ -247,6 +247,12 @@ against the directory it runs in, and adds the package name as a namespace:
   from.
 - Before a push to the base branch has saved a cache, the PR job runs without
   `--baseline` and the comment says there is no baseline yet.
+- `--save-baseline` refuses to save a run that failed its gate or has no
+  gate row of at least acceptable quality, which fails the push job. The
+  cache is then not saved, so the previous baselines stay in place. Noisy
+  runners make this more likely; see the noise section above.
+- The `comment` job posts a new comment on every PR push. If the `pr` job
+  fails before uploading the table, the `comment` job fails too.
 - `--baseline latest` fails the run when a selected suite has no saved
   baseline. Land a new bench target on `main` first, or expect that PR's gate
   to fail until it does.

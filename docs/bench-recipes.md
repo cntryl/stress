@@ -403,7 +403,7 @@ across the sweep. Every row from one function must use the same `samples`,
 
 ## Anti-DCE with `black_box`
 
-`likely_optimized_away` (Tier 1 below 5 ns/op) and `tiny_micro_timing` (below
+`likely_optimized_away` (Tier 1 below 5 ns/op) and `tiny_micro_timing` (5 to
 15 ns/op) usually mean the compiler saw through the benchmark. Route inputs
 through `cntryl_stress::black_box` (a re-export of `std::hint::black_box`),
 vary them across calls, and return an observable output:

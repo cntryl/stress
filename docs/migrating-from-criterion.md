@@ -23,7 +23,7 @@ gate can compare. Most Criterion benchmarks translate mechanically.
 | `criterion::black_box` | `cntryl_stress::black_box` (re-export of `std::hint::black_box`) |
 | `--save-baseline x` / `--baseline x` | `--save-baseline` / `--baseline latest` (or a file path) |
 | `cargo bench -- <filter>` | `cargo bench -- --workload '<glob>'` or `cargo stress --workload '<glob>'` |
-| HTML reports | `target/stress/<suite>/latest.{json,txt,md}`, and `cargo stress compare` |
+| HTML reports | `target/stress/<package>/<suite>/latest.{json,txt,md}` (`target/stress/<suite>/` for plain `cargo bench`), and `cargo stress compare` |
 
 Choose the tier from what the benchmark measures: Tier 1 for hot-path
 microbenchmarks (calibrated micro timing, ns/op), Tier 2 for a single
