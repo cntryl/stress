@@ -354,7 +354,40 @@ pub struct ObservationSummary {
     pub direction: ObservationDirection,
     /// Median, confidence interval, RSD, and other descriptive statistics.
     pub stats: SummaryStats,
+    /// Tail percentiles over the per-sample values. Absent on Micro rows and
+    /// in artifacts written before 0.6.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distribution: Option<DistributionSummary>,
 }
+
+/// Tail percentiles of values recorded with `record_latency` or
+/// `record_observation`.
+///
+/// Recorded latencies are merged across measured samples into a fixed-bucket
+/// log-linear histogram (relative error at most 1/128); observations use exact
+/// nearest-rank percentiles. `p999` is present only from 1000 values. Never
+/// computed for Micro rows, whose samples are calibrated batches.
+///
+/// Fields may be added in minor releases; this type is read from artifacts,
+/// not constructed by callers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DistributionSummary {
+    /// Number of values.
+    pub count: u64,
+    /// 90th percentile.
+    pub p90: f64,
+    /// 99th percentile.
+    pub p99: f64,
+    /// 99.9th percentile, present only when `count >= 1000`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p999: Option<f64>,
+    /// Largest value.
+    pub max: f64,
+}
+
+/// Fewest values for which `p999` is reported.
+pub(crate) const P999_MIN_COUNT: u64 = 1_000;
 
 impl ScalarObservation {
     /// Create a scalar observation.
@@ -388,6 +421,7 @@ impl ObservationSummary {
             unit,
             direction,
             stats,
+            distribution: None,
         }
     }
 }
@@ -1663,6 +1697,11 @@ pub struct BenchmarkSummary {
     /// Informational only; ignored by baseline validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peak_rss_bytes: Option<u64>,
+    /// Tail percentiles of latencies recorded with `record_latency`, merged
+    /// across measured samples. Absent when no latencies were recorded, on
+    /// Micro rows, and in artifacts written before 0.6.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_distribution: Option<DistributionSummary>,
 }
 
 /// Source location of a benchmark row or registered benchmark function.
@@ -1739,6 +1778,7 @@ impl BenchmarkSummary {
             metadata: BTreeMap::new(),
             source: None,
             peak_rss_bytes: None,
+            latency_distribution: None,
         }
     }
 
@@ -2446,6 +2486,11 @@ fn normalized_summary_for_validation(
     normalized.source = None;
     // Peak RSS is a process-wide observation, not derived from raw samples.
     normalized.peak_rss_bytes = None;
+    // Tail distributions were added in 0.6; older baselines lack them.
+    normalized.latency_distribution = None;
+    for observation in &mut normalized.observations {
+        observation.distribution = None;
+    }
     // Comparison-time codes depend on the other artifact, and codes or
     // evidence added after v0.4 are absent from older baselines. Suggestions
     // are advisory text that may be reworded between releases.
@@ -2658,7 +2703,8 @@ fn summarize_benchmark_with_latency_estimator(
         SummaryStats::from_values(&per_op_values(&measured, |sample| sample.allocs_per_op));
     let bytes_per_op =
         SummaryStats::from_values(&per_op_values(&measured, |sample| sample.bytes_per_op));
-    let observations = summarize_observations(&measured);
+    let observations = summarize_observations(spec, &measured);
+    let latency_distribution = latency_distribution(spec, &measured);
     let values = primary_values(primary_metric, &measured, latency_estimator);
     let stats = primary_stats(primary_metric, latency_estimator, &values);
     let wall_clock = SummaryStats::from_values(&wall_clock_values(&measured));
@@ -2746,10 +2792,12 @@ fn summarize_benchmark_with_latency_estimator(
         metadata,
         source: None,
         peak_rss_bytes: None,
+        latency_distribution,
     }
 }
 
-fn summarize_observations(samples: &[&Sample]) -> Vec<ObservationSummary> {
+fn summarize_observations(spec: &BenchmarkSpec, samples: &[&Sample]) -> Vec<ObservationSummary> {
+    let batched = spec.mode.kind() == BenchmarkModeKind::Micro;
     let Some(first) = samples.first() else {
         return Vec::new();
     };
@@ -2773,9 +2821,62 @@ fn summarize_observations(samples: &[&Sample]) -> Vec<ObservationSummary> {
                 direction: definition.direction,
                 stats: SummaryStats::from_values(&values)
                     .expect("finite observation values produce statistics"),
+                distribution: (!batched)
+                    .then(|| observation_distribution(&values))
+                    .flatten(),
             })
         })
         .collect()
+}
+
+/// Exact nearest-rank tail percentiles of per-sample observation values.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn observation_distribution(values: &[f64]) -> Option<DistributionSummary> {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let count = sorted.len() as u64;
+    let nearest = |quantile: f64| {
+        let rank = ((quantile * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len());
+        sorted[rank - 1]
+    };
+    let max = *sorted.last()?;
+    Some(DistributionSummary {
+        count,
+        p90: nearest(0.90),
+        p99: nearest(0.99),
+        p999: (count >= P999_MIN_COUNT).then(|| nearest(0.999)),
+        max,
+    })
+}
+
+/// Histogram tail percentiles of latencies recorded with `record_latency`.
+#[allow(clippy::cast_precision_loss)]
+fn latency_distribution(spec: &BenchmarkSpec, samples: &[&Sample]) -> Option<DistributionSummary> {
+    if spec.mode.kind() == BenchmarkModeKind::Micro {
+        return None;
+    }
+    let mut histogram = crate::histogram::LatencyHistogram::new();
+    for sample in samples {
+        let mut per_sample = crate::histogram::LatencyHistogram::new();
+        for latency in &sample.latency_ns {
+            per_sample.record(u64::try_from(*latency).unwrap_or(u64::MAX));
+        }
+        histogram.merge(&per_sample);
+    }
+    let count = histogram.count();
+    Some(DistributionSummary {
+        count,
+        p90: histogram.quantile(0.90)?,
+        p99: histogram.quantile(0.99)?,
+        p999: (count >= P999_MIN_COUNT)
+            .then(|| histogram.quantile(0.999))
+            .flatten(),
+        max: histogram.max() as f64,
+    })
 }
 
 fn summary_metadata(
@@ -6861,5 +6962,113 @@ mod tests {
         assert_eq!(change_percent(Some(0.0), Some(0.0)), None);
         assert_eq!(change_percent(None, Some(5.0)), None);
         assert!((change_percent(Some(100.0), Some(110.0)).expect("change") - 10.0).abs() < 1e-9);
+    }
+
+    fn latency_samples(spec_id: &str, per_sample: &[Vec<u128>]) -> Vec<Sample> {
+        per_sample
+            .iter()
+            .enumerate()
+            .map(|(index, latencies)| {
+                let mut sample = completed_sample(spec_id, index, 1_000_000, 1_000);
+                sample.latency_ns.clone_from(latencies);
+                sample
+            })
+            .collect()
+    }
+
+    #[test]
+    fn recorded_latencies_report_tail_percentiles_without_p999_below_1000() {
+        let samples = latency_samples(
+            "bench",
+            &[
+                (1..=100).collect(),
+                (101..=200).collect(),
+                (201..=300).collect(),
+            ],
+        );
+        let summary = summarize_benchmark(&spec("bench"), &samples);
+        let distribution = summary.latency_distribution.expect("latency distribution");
+        assert_eq!(distribution.count, 300);
+        assert!((distribution.p90 - 270.0).abs() / 270.0 <= 1.0 / 64.0);
+        assert!((distribution.p99 - 297.0).abs() / 297.0 <= 1.0 / 64.0);
+        assert!(distribution.p999.is_none(), "p99.9 needs 1000 observations");
+        assert!((distribution.max - 300.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn p999_is_reported_from_1000_recorded_latencies() {
+        let samples = latency_samples("bench", &[(1..=500).collect(), (501..=1_000).collect()]);
+        let summary = summarize_benchmark(&spec("bench"), &samples);
+        let distribution = summary.latency_distribution.expect("latency distribution");
+        assert_eq!(distribution.count, 1_000);
+        let p999 = distribution.p999.expect("p99.9 at N = 1000");
+        assert!((p999 - 999.0).abs() / 999.0 <= 1.0 / 64.0);
+    }
+
+    #[test]
+    fn batch_samples_never_get_latency_distributions() {
+        // Fixed-operations rows without recorded latencies: the batch timing
+        // itself is never treated as a latency distribution.
+        let samples = latency_samples("bench", &[vec![], vec![], vec![]]);
+        assert!(summarize_benchmark(&spec("bench"), &samples)
+            .latency_distribution
+            .is_none());
+        // Micro rows are calibrated batches: even latencies attached to them
+        // do not describe single operations.
+        let samples = latency_samples("micro", &[(1..=100).collect(), (1..=100).collect()]);
+        let summary = summarize_benchmark(&micro_spec("micro"), &samples);
+        assert!(summary.latency_distribution.is_none());
+    }
+
+    #[test]
+    fn recorded_observations_report_tail_percentiles() {
+        let mut samples = latency_samples("bench", &vec![vec![]; 20]);
+        for (index, sample) in samples.iter_mut().enumerate() {
+            sample.observations.push(ScalarObservation::new(
+                "queue_depth",
+                f64::from(u32::try_from(index).unwrap() + 1),
+                ObservationUnit::Count,
+                ObservationDirection::LowerIsBetter,
+            ));
+        }
+        let summary = summarize_benchmark(&spec("bench"), &samples);
+        let distribution = summary.observations[0]
+            .distribution
+            .clone()
+            .expect("observation distribution");
+        assert_eq!(distribution.count, 20);
+        assert!((distribution.p90 - 18.0).abs() < 1e-9);
+        assert!((distribution.p99 - 20.0).abs() < 1e-9);
+        assert!(distribution.p999.is_none());
+        assert!((distribution.max - 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn summaries_without_distribution_fields_still_load() {
+        let samples = latency_samples("bench", &[(1..=10).collect(), (1..=10).collect()]);
+        let summary = summarize_benchmark(&spec("bench"), &samples);
+        let mut json = serde_json::to_value(&summary).unwrap();
+        json.as_object_mut().unwrap().remove("latency_distribution");
+        let loaded: BenchmarkSummary = serde_json::from_value(json).unwrap();
+        assert!(loaded.latency_distribution.is_none());
+    }
+
+    #[test]
+    fn baselines_without_distribution_fields_stay_valid() {
+        let spec = spec("bench");
+        let samples = latency_samples("bench", &vec![(1..=10).collect::<Vec<u128>>(); 5]);
+        let mut summary = summarize_benchmark(&spec, &samples);
+        assert!(summary.latency_distribution.is_some());
+        summary.latency_distribution = None;
+        let mut run = StressRun::new("suite", RunProfile::Default, test_env());
+        run.benchmark_specs = vec![spec];
+        run.samples = samples;
+        run.summaries = vec![summary];
+        run.metadata.insert(
+            SUMMARY_SEMANTICS_METADATA_KEY.to_string(),
+            SUMMARY_SEMANTICS_CURRENT.to_string(),
+        );
+        run.canonical_baseline_summaries()
+            .expect("older baselines lack latency distributions");
     }
 }
