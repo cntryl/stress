@@ -1511,7 +1511,94 @@ pub(crate) fn format_markdown_report(run: &StressRun) -> String {
             }
         }
     }
+    write_markdown_tails(&mut output, run);
     output
+}
+
+/// One tail distribution row: benchmark name, series label, the
+/// distribution, and whether its values are nanoseconds.
+type TailRow<'a> = (
+    &'a str,
+    &'a str,
+    &'a crate::artifact::DistributionSummary,
+    bool,
+);
+
+/// Tail distributions of recorded latencies and observations, in row order.
+fn tail_rows(run: &StressRun) -> Vec<TailRow<'_>> {
+    let mut rows = Vec::new();
+    for summary in &run.summaries {
+        if let Some(distribution) = &summary.latency_distribution {
+            rows.push((summary.name.as_str(), "latency", distribution, true));
+        }
+        for observation in &summary.observations {
+            if let Some(distribution) = &observation.distribution {
+                rows.push((
+                    summary.name.as_str(),
+                    observation.name.as_str(),
+                    distribution,
+                    false,
+                ));
+            }
+        }
+    }
+    rows
+}
+
+fn format_tail_value(value: f64, nanoseconds: bool) -> String {
+    if nanoseconds {
+        format_duration_ns(f64_to_u128(value))
+    } else {
+        format!("{value:.3}")
+    }
+}
+
+fn tail_console_lines(run: &StressRun) -> Vec<String> {
+    tail_rows(run)
+        .into_iter()
+        .map(|(name, series, distribution, nanoseconds)| {
+            let value = |value| format_tail_value(value, nanoseconds);
+            let p999 = distribution
+                .p999
+                .map_or_else(String::new, |p999| format!(" p99.9={}", value(p999)));
+            format!(
+                "tail {name} {series} (n={}): p90={} p99={}{p999} max={}",
+                distribution.count,
+                value(distribution.p90),
+                value(distribution.p99),
+                value(distribution.max),
+            )
+        })
+        .collect()
+}
+
+fn write_markdown_tails(output: &mut String, run: &StressRun) {
+    let rows = tail_rows(run);
+    if rows.is_empty() {
+        return;
+    }
+    let _ = writeln!(output);
+    let _ = writeln!(output, "## Tail Distributions");
+    let _ = writeln!(output);
+    let _ = writeln!(
+        output,
+        "| Benchmark | Series | N | p90 | p99 | p99.9 | Max |"
+    );
+    let _ = writeln!(output, "|---|---|---:|---:|---:|---:|---:|");
+    for (name, series, distribution, nanoseconds) in rows {
+        let value = |value| format_tail_value(value, nanoseconds);
+        let _ = writeln!(
+            output,
+            "| {} | {} | {} | {} | {} | {} | {} |",
+            escape_markdown_cell(name),
+            escape_markdown_cell(series),
+            distribution.count,
+            value(distribution.p90),
+            value(distribution.p99),
+            distribution.p999.map_or_else(|| "-".to_string(), value),
+            value(distribution.max),
+        );
+    }
 }
 
 /// Format one stress run for the human console.
@@ -1683,6 +1770,9 @@ fn write_suite_block(output: &mut String, run: &StressRun) {
         &comparisons,
         run.environment.profile_config.console_names,
     );
+    for line in tail_console_lines(run) {
+        let _ = writeln!(output, "{line}");
+    }
 }
 
 fn rows_for_human_console(run: &StressRun) -> Vec<&BenchmarkSummary> {
@@ -3564,6 +3654,7 @@ mod tests {
             metadata: BTreeMap::new(),
             source: None,
             peak_rss_bytes: None,
+            latency_distribution: None,
         }
     }
 
@@ -4419,6 +4510,61 @@ mod tests {
         assert!(
             markdown.contains("at `benches/queue.rs:42`"),
             "missing location in:\n{markdown}"
+        );
+    }
+
+    #[test]
+    fn tail_distributions_render_in_console_and_markdown() {
+        let mut run = run_with_summaries(vec![
+            summary("svc/request", 1_000.0, QualityClass::Acceptable),
+            summary("svc/queue", 1_000.0, QualityClass::Acceptable),
+        ]);
+        assert!(!format_console_output(&run).contains("tail "));
+        assert!(!format_markdown_report(&run).contains("## Tail Distributions"));
+
+        run.summaries[0].latency_distribution = Some(crate::artifact::DistributionSummary {
+            count: 2_000,
+            p90: 1_500.0,
+            p99: 2_500.0,
+            p999: Some(4_000.0),
+            max: 9_000.0,
+        });
+        let mut observation = crate::artifact::ObservationSummary::new(
+            "depth",
+            crate::artifact::ObservationUnit::Count,
+            crate::artifact::ObservationDirection::LowerIsBetter,
+            SummaryStats::from_values(&[1.0, 2.0]).unwrap(),
+        );
+        observation.distribution = Some(crate::artifact::DistributionSummary {
+            count: 20,
+            p90: 18.0,
+            p99: 20.0,
+            p999: None,
+            max: 20.0,
+        });
+        run.summaries[1].observations.push(observation);
+
+        let console = format_console_output(&run);
+        assert!(
+            console.contains(
+                "tail svc/request latency (n=2000): p90=1.50µs p99=2.50µs p99.9=4.00µs max=9.00µs"
+            ),
+            "{console}"
+        );
+        assert!(
+            console.contains("tail svc/queue depth (n=20): p90=18.000 p99=20.000 max=20.000"),
+            "{console}"
+        );
+        let markdown = format_markdown_report(&run);
+        assert!(markdown.contains("## Tail Distributions"), "{markdown}");
+        assert!(
+            markdown
+                .contains("| svc/request | latency | 2000 | 1.50µs | 2.50µs | 4.00µs | 9.00µs |"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("| svc/queue | depth | 20 | 18.000 | 20.000 | - | 20.000 |"),
+            "{markdown}"
         );
     }
 

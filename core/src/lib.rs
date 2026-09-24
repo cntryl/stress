@@ -59,6 +59,7 @@ pub mod diagnostics;
 mod environment;
 mod error;
 mod harness;
+mod histogram;
 mod memory;
 pub mod reporting;
 pub mod runner;

@@ -102,7 +102,20 @@
         "name": { "type": "string", "minLength": 1 },
         "unit": { "$ref": "#/$defs/observationUnit" },
         "direction": { "$ref": "#/$defs/observationDirection" },
-        "stats": { "$ref": "#/$defs/summaryStats" }
+        "stats": { "$ref": "#/$defs/summaryStats" },
+        "distribution": { "$ref": "#/$defs/distributionSummary" }
+      }
+    },
+    "distributionSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "p90", "p99", "max"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 0 },
+        "p90": { "type": "number" },
+        "p99": { "type": "number" },
+        "p999": { "type": "number" },
+        "max": { "type": "number" }
       }
     },
     "diagnosticSeverity": {
@@ -386,7 +399,8 @@
         "parameters": { "$ref": "#/$defs/stringMap" },
         "metadata": { "$ref": "#/$defs/stringMap" },
         "source": { "$ref": "#/$defs/sourceLocation" },
-        "peak_rss_bytes": { "type": "integer", "minimum": 0 }
+        "peak_rss_bytes": { "type": "integer", "minimum": 0 },
+        "latency_distribution": { "$ref": "#/$defs/distributionSummary" }
       }
     },
     "confirmationRun": {
