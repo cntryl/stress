@@ -2776,8 +2776,8 @@ mod tests {
     #[allow(clippy::unnecessary_wraps)]
     fn progressing_benchmark(ctx: &mut StressContext) -> StressResult {
         let progress = ctx.progress_handle();
-        for _ in 0..8 {
-            std::thread::sleep(Duration::from_millis(8));
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(10));
             progress.advance();
         }
         ctx.measure("progress", || std::hint::black_box(1_u64));
@@ -2901,8 +2901,8 @@ mod tests {
             &deadline_spec("progressing"),
             None,
             progressing_benchmark,
-            Some(Duration::from_secs(1)),
-            Some(Duration::from_millis(20)),
+            Some(Duration::from_secs(2)),
+            Some(Duration::from_millis(200)),
         )
         .expect("regular heartbeat advances keep the benchmark alive");
     }
