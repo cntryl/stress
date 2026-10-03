@@ -4686,7 +4686,7 @@ const fn quality_rank(quality: QualityClass) -> u8 {
     clippy::cast_sign_loss
 )]
 pub(crate) fn percentile_sorted(sorted: &[f64], quantile: f64) -> f64 {
-    debug_assert!(!sorted.is_empty());
+    debug_assert_ne!(sorted, [] as [f64; 0]);
     if sorted.len() == 1 {
         return sorted[0];
     }
@@ -4714,7 +4714,7 @@ pub(crate) fn percentile_sorted(sorted: &[f64], quantile: f64) -> f64 {
     clippy::cast_sign_loss
 )]
 pub(crate) fn quantile_confidence_interval_95(sorted: &[f64], quantile: f64) -> ConfidenceInterval {
-    debug_assert!(!sorted.is_empty());
+    debug_assert_ne!(sorted, [] as [f64; 0]);
     let n = sorted.len() as f64;
     let center = n * quantile;
     let half = 1.96 * (n * quantile * (1.0 - quantile)).sqrt();
@@ -6467,7 +6467,7 @@ mod tests {
         let parsed =
             StressRun::from_json_str(&serde_json::to_string(&json).expect("json")).expect("parse");
 
-        assert!(parsed.diagnostics_summary.is_empty());
+        assert_eq!(parsed.diagnostics_summary, [] as [DiagnosticSummary; 0]);
         assert_eq!(parsed.environment.profile_config.deny_diagnostics, None);
         assert_eq!(
             parsed.environment.profile_config.console_names,

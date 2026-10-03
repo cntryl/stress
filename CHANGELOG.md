@@ -3,6 +3,15 @@
 All notable changes to `cntryl-stress` and `cntryl-stress-macros` are recorded here.
 Both crates share a version number and are released together.
 
+## [0.5.1] - 2026-10-03
+
+### Added
+
+- Cloneable progress heartbeats for workloads driven by worker threads, with
+  `--no-progress-timeout-secs` and `STRESS_NO_PROGRESS_TIMEOUT_SECS` watchdogs.
+  A stale heartbeat records structured failure metadata and abandons the
+  isolated worker while retaining results from earlier completed benchmarks.
+
 ## [0.5.0] - 2026-09-24
 
 0.5.0 is a breaking release. Artifacts written by 0.4 still load and compare.

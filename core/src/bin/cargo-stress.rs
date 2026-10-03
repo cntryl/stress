@@ -5215,7 +5215,10 @@ mod init_tests {
             .find(|path| path.is_file())
             .expect("latest.json written");
             let run = StressRun::load(&latest).expect("load latest.json");
-            assert!(!run.summaries.is_empty());
+            assert_ne!(
+                run.summaries,
+                [] as [cntryl_stress::artifact::BenchmarkSummary; 0]
+            );
             last = run
                 .summaries
                 .iter()

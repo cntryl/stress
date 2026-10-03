@@ -66,6 +66,8 @@ pub struct StressRunnerConfig {
     pub git_sha: Option<String>,
     /// Per-benchmark deadline enforced by the generated `stress_main!` harness.
     pub timeout: Option<Duration>,
+    /// Maximum interval between workload heartbeat advances.
+    pub no_progress_timeout: Option<Duration>,
     /// Fixed-duration sample budget.
     pub sample_duration: Duration,
     /// Fixed-operations sample size.
@@ -209,6 +211,7 @@ impl StressRunnerConfig {
             tier: None,
             git_sha: None,
             timeout: None,
+            no_progress_timeout: None,
             sample_duration: profile_config.sample_duration,
             operations_per_sample: profile_config.operations_per_sample,
             micro_sample_duration: profile_config.micro_sample_duration,
@@ -303,6 +306,12 @@ impl StressRunnerConfig {
         }
         if self.timeout.is_some_and(|timeout| timeout.is_zero()) {
             errors.push("timeout must be greater than 0 when configured".to_string());
+        }
+        if self
+            .no_progress_timeout
+            .is_some_and(|timeout| timeout.is_zero())
+        {
+            errors.push("no_progress_timeout must be greater than 0 when configured".to_string());
         }
         if self.tier.is_some_and(|tier| tier == 0 || tier > MAX_TIER) {
             errors.push(format!("tier must be between 1 and {MAX_TIER}"));
@@ -465,6 +474,13 @@ impl StressRunnerConfig {
     #[must_use]
     pub fn timeout(mut self, duration: Duration) -> Self {
         self.timeout = Some(duration);
+        self
+    }
+
+    /// Set the maximum interval between workload heartbeat advances.
+    #[must_use]
+    pub fn no_progress_timeout(mut self, duration: Duration) -> Self {
+        self.no_progress_timeout = Some(duration);
         self
     }
 
@@ -751,6 +767,14 @@ where
     parse_env(
         &get_var,
         resolution,
+        "STRESS_NO_PROGRESS_TIMEOUT_SECS",
+        "no_progress_timeout_secs",
+        |value| value.parse::<u64>().ok().filter(|value| *value != 0),
+        |config, value| config.no_progress_timeout = Some(Duration::from_secs(value)),
+    );
+    parse_env(
+        &get_var,
+        resolution,
         "STRESS_SAMPLE_DURATION_MS",
         "sample_duration",
         |value| value.parse::<u64>().ok().filter(|value| *value != 0),
@@ -976,6 +1000,7 @@ fn apply_default_sources(metadata: &mut HashMap<String, String>) {
         "console_names_src",
         "progress_src",
         "timeout_secs_src",
+        "no_progress_timeout_secs_src",
         "sample_duration_src",
         "operations_per_sample_src",
         "micro_sample_duration_src",
@@ -1112,6 +1137,7 @@ mod tests {
             ("STRESS_WARMUP_SAMPLES", "2".to_string()),
             ("STRESS_JSON", "true".to_string()),
             ("STRESS_TIER", "4".to_string()),
+            ("STRESS_NO_PROGRESS_TIMEOUT_SECS", "60".to_string()),
         ]);
 
         let resolution = StressRunnerConfig::resolve_from_env_with(|key| env.get(key).cloned());
@@ -1121,7 +1147,11 @@ mod tests {
         assert_eq!(resolution.config.warmup_samples, 2);
         assert!(resolution.config.json_stdout);
         assert_eq!(resolution.config.tier, Some(4));
-        assert!(resolution.warnings.is_empty());
+        assert_eq!(
+            resolution.config.no_progress_timeout,
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(resolution.warnings, [] as [String; 0]);
     }
 
     #[test]
@@ -1130,6 +1160,7 @@ mod tests {
             ("STRESS_SAMPLES", "abc".to_string()),
             ("STRESS_JSON", "maybe".to_string()),
             ("STRESS_TIMEOUT_SECS", "soon".to_string()),
+            ("STRESS_NO_PROGRESS_TIMEOUT_SECS", "later".to_string()),
         ]);
 
         let resolution = StressRunnerConfig::resolve_from_env_with(|key| env.get(key).cloned());
@@ -1137,7 +1168,8 @@ mod tests {
         assert_eq!(resolution.config.samples, 5);
         assert!(!resolution.config.json_stdout);
         assert_eq!(resolution.config.timeout, None);
-        assert_eq!(resolution.warnings.len(), 3);
+        assert_eq!(resolution.config.no_progress_timeout, None);
+        assert_eq!(resolution.warnings.len(), 4);
     }
 
     #[test]
@@ -1192,6 +1224,7 @@ mod tests {
         cfg.sample_duration = Duration::ZERO;
         cfg.micro_sample_duration = Duration::ZERO;
         cfg.timeout = Some(Duration::ZERO);
+        cfg.no_progress_timeout = Some(Duration::ZERO);
 
         assert_eq!(
             cfg.validation_errors(),
@@ -1199,6 +1232,7 @@ mod tests {
                 "sample_duration must be greater than 0".to_string(),
                 "micro_sample_duration must be greater than 0".to_string(),
                 "timeout must be greater than 0 when configured".to_string(),
+                "no_progress_timeout must be greater than 0 when configured".to_string(),
             ]
         );
     }
@@ -1207,6 +1241,7 @@ mod tests {
     fn zero_execution_env_values_warn_and_keep_profile_defaults() {
         let env = HashMap::from([
             ("STRESS_TIMEOUT_SECS", "0".to_string()),
+            ("STRESS_NO_PROGRESS_TIMEOUT_SECS", "0".to_string()),
             ("STRESS_SAMPLE_DURATION_MS", "0".to_string()),
             ("STRESS_OPERATIONS_PER_SAMPLE", "0".to_string()),
             ("STRESS_MICRO_SAMPLE_DURATION_MS", "0".to_string()),
@@ -1215,6 +1250,7 @@ mod tests {
         let resolution = StressRunnerConfig::resolve_from_env_with(|key| env.get(key).cloned());
 
         assert_eq!(resolution.config.timeout, None);
+        assert_eq!(resolution.config.no_progress_timeout, None);
         assert_eq!(
             resolution.config.sample_duration,
             Duration::from_millis(500)
@@ -1224,7 +1260,7 @@ mod tests {
             resolution.config.micro_sample_duration,
             Duration::from_millis(25)
         );
-        assert_eq!(resolution.warnings.len(), 4);
+        assert_eq!(resolution.warnings.len(), 5);
     }
 
     #[test]
@@ -1322,7 +1358,7 @@ mod tests {
         let profile = cfg.profile_config();
         assert_eq!(profile.deny_codes, vec!["too_fast".to_string()]);
         assert_eq!(profile.allow_codes, vec!["high_variance".to_string()]);
-        assert!(cfg.validation_errors().is_empty());
+        assert_eq!(cfg.validation_errors(), [] as [String; 0]);
 
         let cfg = StressRunnerConfig::new().deny_code("to_fast");
         let errors = cfg.validation_errors();
@@ -1392,7 +1428,7 @@ mod tests {
             resolution.config.deny_diagnostics,
             Some(DiagnosticSeverity::Warning)
         );
-        assert!(resolution.warnings.is_empty());
+        assert_eq!(resolution.warnings, [] as [String; 0]);
         assert_eq!(resolution.notices.len(), 1);
 
         let resolution = resolve(&[
@@ -1423,14 +1459,14 @@ mod tests {
             resolution.config.deny_diagnostics,
             Some(DiagnosticSeverity::Warning)
         );
-        assert!(resolution.notices.is_empty());
+        assert_eq!(resolution.notices, [] as [String; 0]);
     }
 
     #[test]
     fn empty_git_sha_env_is_treated_as_unset_with_notice() {
         for value in ["", "   "] {
             let resolution = resolve(&[("STRESS_GIT_SHA", value)]);
-            assert!(resolution.warnings.is_empty());
+            assert_eq!(resolution.warnings, [] as [String; 0]);
             assert_eq!(resolution.notices.len(), 1);
             assert_ne!(
                 resolution.metadata.get("git_sha_src"),
@@ -1475,7 +1511,7 @@ mod tests {
             ("STRESS_FAIL_ON_QUALITY", "1"),
             ("STRESS_MIN_QUALITY", "authoritative"),
         ]);
-        assert!(resolution.warnings.is_empty());
+        assert_eq!(resolution.warnings, [] as [String; 0]);
         assert!(resolution.config.fail_on_regression);
         assert!(resolution.config.fail_on_quality);
         assert_eq!(resolution.config.min_quality, QualityClass::Authoritative);

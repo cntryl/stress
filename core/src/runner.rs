@@ -985,6 +985,7 @@ where
     let error = f(&mut ctx).into_stress_result().err();
     let wall_clock = wall_clock_start.elapsed();
     if let Some(error) = error {
+        let context_metadata = ctx.metadata_snapshot();
         let mut records = ctx.take_measurements();
         if let Some(failed_record) = records
             .iter_mut()
@@ -994,9 +995,16 @@ where
             failed_record
                 .metadata
                 .insert("benchmark_error".to_string(), error.message().to_string());
+            failed_record.metadata.extend(error.metadata().clone());
+            failed_record.metadata.extend(
+                context_metadata
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
         } else {
             let mut error_ctx = StressContext::new(spec.tier, spec.mode.clone());
-            error_ctx.record_benchmark_error(error.message());
+            error_ctx.record_benchmark_error(&error);
+            error_ctx.extend_metadata(context_metadata);
             let mut error_records = error_ctx.take_measurements();
             for error_record in &mut error_records {
                 error_record.name = unique_record_name(&records, &error_record.name);
@@ -1940,7 +1948,10 @@ mod tests {
             .iter()
             .all(|result| result.metric != "max_peak_rss_mb"));
         assert!(run.budgets_passed());
-        assert!(run.diagnostic_gate_failures().is_empty());
+        assert_eq!(
+            run.diagnostic_gate_failures(),
+            [] as [&crate::artifact::DiagnosticSummary; 0]
+        );
     }
 
     #[test]
@@ -2215,7 +2226,7 @@ mod tests {
         });
 
         let run = runner.finish();
-        assert!(run.summaries.is_empty());
+        assert_eq!(run.summaries, [] as [BenchmarkSummary; 0]);
         assert_eq!(evaluate_run_gate(&run), RunGate::QualityFailed);
     }
 
@@ -2707,7 +2718,10 @@ mod tests {
             .any(|diagnostic| diagnostic.code == "too_few_samples"));
         run.environment.profile_config.deny_codes = vec!["regression".to_string()];
         assert_eq!(evaluate_run_gate(&run), RunGate::Passed);
-        assert!(run.diagnostic_gate_failures().is_empty());
+        assert_eq!(
+            run.diagnostic_gate_failures(),
+            [] as [&crate::artifact::DiagnosticSummary; 0]
+        );
 
         run.environment.profile_config.deny_codes = vec!["too_few_samples".to_string()];
         assert_eq!(evaluate_run_gate(&run), RunGate::DiagnosticsFailed);
@@ -3267,7 +3281,7 @@ mod tests {
             attempt.regressions_before,
             vec!["suite/bench/work".to_string()]
         );
-        assert!(attempt.regressions_after.is_empty());
+        assert_eq!(attempt.regressions_after, [] as [String; 0]);
         assert_eq!(attempt.samples_added, 10);
         assert_eq!(run.samples.len(), 20);
         assert_eq!(run.summaries[0].measured_samples, 20);
@@ -3374,7 +3388,7 @@ mod tests {
             reruns, 0,
             "pooling must not clear an absolute budget failure"
         );
-        assert!(run.confirmation_runs.is_empty());
+        assert_eq!(run.confirmation_runs, [] as [ConfirmationRun; 0]);
         assert!(run
             .metadata
             .get("confirmation_skipped")
@@ -3397,7 +3411,7 @@ mod tests {
         });
         let run = runner.finish_with_baseline_pool(&pool);
         assert_eq!(reruns, 0);
-        assert!(run.confirmation_runs.is_empty());
+        assert_eq!(run.confirmation_runs, [] as [ConfirmationRun; 0]);
         assert!(serde_json::to_value(&run)
             .expect("json")
             .get("confirmation_runs")

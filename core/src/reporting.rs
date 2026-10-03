@@ -4813,7 +4813,7 @@ mod tests {
         );
         comparison.change_percent = Some(-20.0);
         run.comparisons.push(comparison);
-        assert!(run.regressions().is_empty());
+        assert_eq!(run.regressions(), [] as [&ComparisonResult; 0]);
         let (reporter, buffer) = github_reporter_for_test(None);
 
         reporter.suite_end(&run).expect("github reporter");
@@ -4879,7 +4879,7 @@ mod tests {
             1_000.0,
             QualityClass::Acceptable,
         )]);
-        assert!(noise_gating_lines(&plain).is_empty());
+        assert_eq!(noise_gating_lines(&plain), [] as [String; 0]);
 
         let mut skipped = plain;
         skipped.metadata.insert(

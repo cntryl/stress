@@ -1,11 +1,13 @@
 //! Structured benchmark-function errors.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// Error returned by a stress benchmark function.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StressError {
     message: String,
+    metadata: BTreeMap<String, String>,
 }
 
 impl StressError {
@@ -14,13 +16,25 @@ impl StressError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            metadata: BTreeMap::new(),
         }
+    }
+
+    /// Attach structured fields to the failing benchmark row.
+    #[must_use]
+    pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.metadata.insert(key.into(), value.into());
+        self
     }
 
     /// Return the error message.
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    pub(crate) fn metadata(&self) -> &BTreeMap<String, String> {
+        &self.metadata
     }
 }
 

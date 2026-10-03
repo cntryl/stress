@@ -235,7 +235,7 @@ fn artifact_types_build_via_constructors_only() {
     assert_eq!(sample.phase, SamplePhase::Warmup);
     assert_eq!(sample.intent, MeasurementIntent::General);
     assert_eq!(sample.elapsed_ns, 0);
-    assert!(sample.latency_ns.is_empty());
+    assert_eq!(sample.latency_ns, [] as [u128; 0]);
     assert!(sample.parameters.is_empty());
     assert_eq!(sample.environment, environment);
 
@@ -254,7 +254,10 @@ fn artifact_types_build_via_constructors_only() {
     assert_eq!(summary.tier, 3);
     assert_eq!(summary.primary_metric, PrimaryMetric::NsPerOp);
     assert!(summary.stats.is_none());
-    assert!(summary.diagnostics.is_empty());
+    assert_eq!(
+        summary.diagnostics,
+        [] as [cntryl_stress::artifact::BenchmarkDiagnostic; 0]
+    );
     summary.diagnostics.push(diagnostic.clone());
 
     let ledger = DiagnosticSummary::from_diagnostic("s", &summary, &diagnostic);
@@ -316,7 +319,7 @@ fn nested_artifact_types_build_via_constructors_only() {
 
     let correctness = CorrectnessSummary::new(false);
     assert!(!correctness.passed);
-    assert!(correctness.errors.is_empty());
+    assert_eq!(correctness.errors, [] as [String; 0]);
 
     let observation = ScalarObservation::new(
         "rows",
