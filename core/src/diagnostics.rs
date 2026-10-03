@@ -316,7 +316,7 @@ mod tests {
 
     #[test]
     fn catalog_codes_are_unique_sorted_and_documented() {
-        assert!(!DIAGNOSTIC_CATALOG.is_empty());
+        assert_ne!(DIAGNOSTIC_CATALOG, []);
         for pair in DIAGNOSTIC_CATALOG.windows(2) {
             assert!(pair[0].code < pair[1].code, "{} out of order", pair[1].code);
         }
@@ -354,7 +354,10 @@ mod tests {
             nearest_diagnostic_codes("high_varience").first(),
             Some(&"high_variance")
         );
-        assert!(nearest_diagnostic_codes("zzzzzzzzzzzzzzzzzzzzzz").is_empty());
+        assert_eq!(
+            nearest_diagnostic_codes("zzzzzzzzzzzzzzzzzzzzzz"),
+            [] as [&str; 0]
+        );
         let error = validate_diagnostic_code("to_fast").expect_err("unknown code");
         assert!(
             error.contains("unknown diagnostic code 'to_fast'"),

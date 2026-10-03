@@ -615,6 +615,7 @@ Command-line arguments override `STRESS_*` environment variables, which override
 | `STRESS_FILTER` | Benchmark name/module glob; an empty or whitespace value is treated as unset (with a notice); an unmatched selection is fatal |
 | `STRESS_TIER` | Exact tier filter, 1 through 6 |
 | `STRESS_TIMEOUT_SECS` | Positive per-benchmark deadline in seconds |
+| `STRESS_NO_PROGRESS_TIMEOUT_SECS` | Positive limit in seconds between workload heartbeat advances |
 | `STRESS_OUTPUT_DIR` | Artifact output directory |
 | `STRESS_JSON` | Emit machine-readable JSON to stdout instead of the console table |
 | `STRESS_INCLUDE_IGNORED` | Include ignored benchmarks |

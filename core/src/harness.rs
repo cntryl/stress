@@ -7,7 +7,7 @@ use crate::artifact::{
 use crate::config::{parse_bool_env, StressRunnerConfig};
 use crate::reporting::{atomic_write, GitHubActionsReporter, Reporter};
 use crate::runner::{evaluate_run_gate, RunGate, StressRunner};
-use crate::{StressContext, StressError, StressResult};
+use crate::{ProgressHandle, StressContext, StressError, StressResult};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::NonZeroU64;
@@ -58,6 +58,7 @@ struct StressBinaryArgs {
     warmup_samples: Option<usize>,
     cooldown_samples: Option<usize>,
     timeout: Option<Duration>,
+    no_progress_timeout: Option<Duration>,
     operations_per_sample: Option<NonZeroU64>,
     sample_duration_ms: Option<NonZeroU64>,
     micro_sample_duration_ms: Option<NonZeroU64>,
@@ -219,6 +220,12 @@ impl StressBinaryArgs {
                     let seconds = parse_positive_flag_value("--timeout-secs", value)?;
                     result.timeout = Some(Duration::from_secs(seconds.get()));
                 }
+                "--no-progress-timeout-secs" => {
+                    let value =
+                        required_flag_value(args, &mut index, "--no-progress-timeout-secs")?;
+                    let seconds = parse_positive_flag_value("--no-progress-timeout-secs", value)?;
+                    result.no_progress_timeout = Some(Duration::from_secs(seconds.get()));
+                }
                 "--json" => {
                     result.json_stdout = Some(true);
                 }
@@ -340,6 +347,7 @@ fn singleton_argument(argument: &str) -> Option<&'static str> {
         "--sample-duration-ms" => Some("--sample-duration-ms"),
         "--micro-sample-duration-ms" => Some("--micro-sample-duration-ms"),
         "--timeout-secs" => Some("--timeout-secs"),
+        "--no-progress-timeout-secs" => Some("--no-progress-timeout-secs"),
         "--json" => Some("--json"),
         "--include-ignored" => Some("--include-ignored"),
         "--list" => Some("--list"),
@@ -413,6 +421,7 @@ fn print_help() {
         "    --micro-sample-duration-ms <N> Target milliseconds for calibrated micro samples"
     );
     eprintln!("    --timeout-secs <N>             Per-benchmark deadline in seconds");
+    eprintln!("    --no-progress-timeout-secs <N>  Fail when a benchmark heartbeat is stale");
     eprintln!("    --json                         Print machine-readable JSON to stdout");
     eprintln!("    --include-ignored              Include ignored benchmarks");
     eprintln!("    --list                         List benchmarks");
@@ -505,6 +514,8 @@ pub struct StressRunnerOptions {
     pub cooldown_samples: Option<usize>,
     /// Per-benchmark deadline.
     pub timeout: Option<Duration>,
+    /// Maximum interval between workload heartbeat advances.
+    pub no_progress_timeout: Option<Duration>,
     /// Optional machine-readable JSON stdout override.
     pub json_stdout: Option<bool>,
     /// Artifact output directory.
@@ -595,6 +606,13 @@ impl StressRunnerOptions {
     #[must_use]
     pub const fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// Fail when a benchmark heartbeat is not advanced within `timeout`.
+    #[must_use]
+    pub const fn no_progress_timeout(mut self, timeout: Duration) -> Self {
+        self.no_progress_timeout = Some(timeout);
         self
     }
 
@@ -744,6 +762,7 @@ fn binary_args_from_options(options: StressRunnerOptions) -> StressBinaryArgs {
         warmup_samples: options.warmup_samples,
         cooldown_samples: options.cooldown_samples,
         timeout: options.timeout,
+        no_progress_timeout: options.no_progress_timeout,
         json_stdout: options.json_stdout,
         output_dir: options.output_dir,
         include_ignored: options.include_ignored,
@@ -907,6 +926,13 @@ where
             "cli --timeout-secs".to_string(),
         );
     }
+    if let Some(timeout) = args.no_progress_timeout {
+        config.no_progress_timeout = Some(timeout);
+        metadata.insert(
+            "no_progress_timeout_secs_src".to_string(),
+            "cli --no-progress-timeout-secs".to_string(),
+        );
+    }
     if let Some(json_stdout) = args.json_stdout {
         config.json_stdout = json_stdout;
         metadata.insert("json_stdout_src".to_string(), "cli --json".to_string());
@@ -1062,6 +1088,12 @@ enum SpecRunError {
         benchmark_id: String,
         timeout: Duration,
     },
+    NoProgress {
+        benchmark_id: String,
+        timeout: Duration,
+        idle_for: Duration,
+        completed_units: u64,
+    },
     Spawn {
         benchmark_id: String,
         reason: String,
@@ -1074,7 +1106,7 @@ enum SpecRunError {
 
 impl SpecRunError {
     const fn exit_code(&self) -> i32 {
-        if matches!(self, Self::Timeout { .. }) {
+        if matches!(self, Self::Timeout { .. } | Self::NoProgress { .. }) {
             124
         } else {
             1
@@ -1091,6 +1123,17 @@ impl fmt::Display for SpecRunError {
             } => write!(
                 f,
                 "benchmark {benchmark_id:?} exceeded its {:.3}s deadline",
+                timeout.as_secs_f64()
+            ),
+            Self::NoProgress {
+                benchmark_id,
+                timeout,
+                idle_for,
+                completed_units,
+            } => write!(
+                f,
+                "benchmark {benchmark_id:?} made no progress for {:.3}s (limit {:.3}s; completed units: {completed_units})",
+                idle_for.as_secs_f64(),
                 timeout.as_secs_f64()
             ),
             Self::Spawn {
@@ -1125,6 +1168,7 @@ impl fmt::Display for SpecRunError {
 /// and the error is returned so the caller can stop scheduling further work. A
 /// timed-out worker cannot be cancelled; it is abandoned and the caller is
 /// expected to exit after publishing results.
+#[cfg(test)]
 fn run_spec_with_timeout(
     runner: &mut StressRunner,
     spec: &BenchmarkSpec,
@@ -1132,21 +1176,33 @@ fn run_spec_with_timeout(
     func: fn(&mut StressContext) -> StressResult,
     timeout: Duration,
 ) -> Result<(), SpecRunError> {
-    with_timeout_invoker(spec, func, timeout, |invoke| {
+    run_spec_with_watchdogs(runner, spec, source, func, Some(timeout), None)
+}
+
+fn run_spec_with_watchdogs(
+    runner: &mut StressRunner,
+    spec: &BenchmarkSpec,
+    source: Option<&crate::artifact::SourceLocation>,
+    func: fn(&mut StressContext) -> StressResult,
+    timeout: Option<Duration>,
+    no_progress_timeout: Option<Duration>,
+) -> Result<(), SpecRunError> {
+    with_timeout_invoker(spec, func, timeout, no_progress_timeout, |invoke| {
         runner.run_spec_at(spec, source, invoke);
     })
     .1
 }
 
 /// Drive `func` through `drive` with every invocation on one isolated worker
-/// thread under a shared deadline (see [`run_spec_with_timeout`]).
+/// thread under a shared deadline (see [`run_spec_with_watchdogs`]).
 fn with_timeout_invoker<R>(
     spec: &BenchmarkSpec,
     func: fn(&mut StressContext) -> StressResult,
-    timeout: Duration,
+    timeout: Option<Duration>,
+    no_progress_timeout: Option<Duration>,
     drive: impl FnOnce(&dyn Fn(&mut StressContext) -> StressResult) -> R,
 ) -> (R, Result<(), SpecRunError>) {
-    let deadline = std::time::Instant::now() + timeout;
+    let benchmark_started_at = std::time::Instant::now();
     let failure: std::cell::RefCell<Option<SpecRunError>> = std::cell::RefCell::new(None);
     let worker: std::cell::RefCell<Option<IsolatedWorker>> = std::cell::RefCell::new(None);
     let invoke = |ctx: &mut StressContext| -> StressResult {
@@ -1159,14 +1215,42 @@ fn with_timeout_invoker<R>(
                 Some(worker) => Ok(worker),
                 None => IsolatedWorker::spawn(spec, func).map(|spawned| worker.insert(spawned)),
             }
-            .and_then(|worker| worker.invoke(ctx, spec, deadline, timeout))
+            .and_then(|worker| {
+                worker.invoke(
+                    ctx,
+                    spec,
+                    benchmark_started_at,
+                    timeout,
+                    no_progress_timeout,
+                )
+            })
         };
         match outcome {
             Ok(result) => result,
             Err(error) => {
                 let message = error.to_string();
+                let stress_error = match &error {
+                    SpecRunError::NoProgress {
+                        timeout,
+                        idle_for,
+                        completed_units,
+                        ..
+                    } => StressError::new(message)
+                        .with_metadata("failure_kind", "no_progress_timeout")
+                        .with_metadata(
+                            "no_progress_timeout_secs",
+                            timeout.as_secs_f64().to_string(),
+                        )
+                        .with_metadata("progress_idle_ms", idle_for.as_millis().to_string())
+                        .with_metadata("progress_completed_units", completed_units.to_string()),
+                    _ => StressError::new(message),
+                };
+                let error_message = stress_error.message().to_string();
+                for (key, value) in stress_error.metadata() {
+                    ctx.metadata(key.clone(), value.clone());
+                }
                 *failure.borrow_mut() = Some(error);
-                Err(StressError::new(message))
+                Err(StressError::new(error_message))
             }
         }
     };
@@ -1185,6 +1269,7 @@ struct IsolatedWorker {
     jobs: std::sync::mpsc::Sender<StressContext>,
     replies: std::sync::mpsc::Receiver<InvocationReply>,
     handle: Option<std::thread::JoinHandle<()>>,
+    progress: ProgressHandle,
 }
 
 impl IsolatedWorker {
@@ -1212,6 +1297,7 @@ impl IsolatedWorker {
             jobs,
             replies,
             handle: Some(handle),
+            progress: ProgressHandle::new(),
         })
     }
 
@@ -1219,24 +1305,66 @@ impl IsolatedWorker {
         &mut self,
         ctx: &mut StressContext,
         spec: &BenchmarkSpec,
-        deadline: std::time::Instant,
-        total_timeout: Duration,
+        benchmark_started_at: std::time::Instant,
+        total_timeout: Option<Duration>,
+        no_progress_timeout: Option<Duration>,
     ) -> Result<StressResult, SpecRunError> {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        let owned = std::mem::replace(ctx, StressContext::new(spec.tier, spec.mode.clone()));
+        let mut owned = std::mem::replace(ctx, StressContext::new(spec.tier, spec.mode.clone()));
+        owned.install_progress_handle(self.progress.clone());
         if self.jobs.send(owned).is_err() {
             return Err(self.panicked(spec));
         }
-        match self.replies.recv_timeout(remaining) {
-            Ok((returned, result)) => {
+        loop {
+            let remaining_deadline =
+                total_timeout.map(|timeout| timeout.saturating_sub(benchmark_started_at.elapsed()));
+            let remaining_progress =
+                no_progress_timeout.map(|timeout| timeout.saturating_sub(self.progress.idle_for()));
+            let remaining = match (remaining_deadline, remaining_progress) {
+                (Some(deadline), Some(progress)) => Some(deadline.min(progress)),
+                (Some(deadline), None) => Some(deadline),
+                (None, Some(progress)) => Some(progress),
+                (None, None) => None,
+            };
+
+            let reply = if let Some(remaining) = remaining {
+                match self.replies.recv_timeout(remaining) {
+                    Ok(reply) => Some(reply),
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(self.panicked(spec));
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                }
+            } else {
+                match self.replies.recv() {
+                    Ok(reply) => Some(reply),
+                    Err(_) => return Err(self.panicked(spec)),
+                }
+            };
+
+            if let Some((returned, result)) = reply {
                 *ctx = returned;
-                Ok(result)
+                return Ok(result);
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(SpecRunError::Timeout {
-                benchmark_id: spec.id.clone(),
-                timeout: total_timeout,
-            }),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(self.panicked(spec)),
+
+            // If both limits expire together, the configured hard deadline is
+            // the primary outcome; otherwise report the stale workload pulse.
+            if total_timeout.is_some_and(|timeout| benchmark_started_at.elapsed() >= timeout) {
+                return Err(SpecRunError::Timeout {
+                    benchmark_id: spec.id.clone(),
+                    timeout: total_timeout.expect("checked timeout is present"),
+                });
+            }
+            if let Some(timeout) = no_progress_timeout {
+                let idle_for = self.progress.idle_for();
+                if idle_for >= timeout {
+                    return Err(SpecRunError::NoProgress {
+                        benchmark_id: spec.id.clone(),
+                        timeout,
+                        idle_for,
+                        completed_units: self.progress.completed_units(),
+                    });
+                }
+            }
         }
     }
 
@@ -1375,10 +1503,15 @@ fn run_with_resolved_config(resolved: ResolvedStressConfig) {
         };
         let source = Some(crate::artifact::SourceLocation::new(entry.file, entry.line));
         ran.insert(spec.id.clone(), (spec.clone(), entry.func));
-        if let Some(timeout) = config_for_specs.timeout {
-            if let Err(error) =
-                run_spec_with_timeout(&mut runner, &spec, source.as_ref(), entry.func, timeout)
-            {
+        if config_for_specs.timeout.is_some() || config_for_specs.no_progress_timeout.is_some() {
+            if let Err(error) = run_spec_with_watchdogs(
+                &mut runner,
+                &spec,
+                source.as_ref(),
+                entry.func,
+                config_for_specs.timeout,
+                config_for_specs.no_progress_timeout,
+            ) {
                 // Stop scheduling work (a timed-out thread may still be
                 // running), but publish what already completed plus the
                 // failing row before exiting non-zero.
@@ -1404,6 +1537,7 @@ fn run_with_resolved_config(resolved: ResolvedStressConfig) {
                         resolved.confirm_regressions,
                         &ran,
                         config_for_specs.timeout,
+                        config_for_specs.no_progress_timeout,
                     );
                 }
                 Ok(runner.finish_with_baseline_pool(&pool))
@@ -1450,18 +1584,20 @@ fn confirm_regressions_in_harness(
     attempts: usize,
     ran: &BTreeMap<String, RegisteredBenchmark>,
     timeout: Option<Duration>,
+    no_progress_timeout: Option<Duration>,
 ) -> Option<SpecRunError> {
     let mut aborted = None;
     runner.confirm_regressions(pool, attempts, |runner, base_id| {
         let (spec, func) = ran
             .get(base_id)
             .ok_or_else(|| format!("benchmark {base_id:?} was not run"))?;
-        let Some(timeout) = timeout else {
+        if timeout.is_none() && no_progress_timeout.is_none() {
             return runner.confirm_spec(base_id, *func).map(|_| ());
-        };
-        let (result, failure) = with_timeout_invoker(spec, *func, timeout, |invoke| {
-            runner.confirm_spec(base_id, invoke)
-        });
+        }
+        let (result, failure) =
+            with_timeout_invoker(spec, *func, timeout, no_progress_timeout, |invoke| {
+                runner.confirm_spec(base_id, invoke)
+            });
         if let Err(error) = failure {
             eprintln!("Stress confirmation run failed: {error}");
             aborted = Some(error);
@@ -1805,6 +1941,17 @@ fn print_resolved_config(suite: &str, resolved: &ResolvedStressConfig) {
     );
     println!("JSON stdout: {}", resolved.config.json_stdout);
     println!("Include ignored: {}", resolved.include_ignored);
+    println!(
+        "No-progress timeout: {} ({})",
+        resolved.config.no_progress_timeout.map_or_else(
+            || "<disabled>".to_string(),
+            |duration| format!("{}s", duration.as_secs())
+        ),
+        resolved
+            .metadata
+            .get("no_progress_timeout_secs_src")
+            .map_or("unknown", String::as_str)
+    );
     println!(
         "Baseline: {} ({})",
         resolved
@@ -2407,6 +2554,8 @@ mod tests {
             "--names".to_string(),
             "full".to_string(),
             "--no-progress".to_string(),
+            "--no-progress-timeout-secs".to_string(),
+            "45".to_string(),
             "--baseline".to_string(),
             "latest".to_string(),
             "--baseline-dir".to_string(),
@@ -2420,6 +2569,7 @@ mod tests {
         assert_eq!(parsed.deny_diagnostics, Some(DiagnosticSeverity::Error));
         assert_eq!(parsed.names, Some(ConsoleNameMode::Full));
         assert_eq!(parsed.no_progress, Some(true));
+        assert_eq!(parsed.no_progress_timeout, Some(Duration::from_secs(45)));
         assert_eq!(parsed.baseline, Some(PathBuf::from("latest")));
         assert_eq!(
             parsed.baseline_dir,
@@ -2495,6 +2645,8 @@ mod tests {
             ("--cooldown-samples", "some"),
             ("--timeout-secs", "0"),
             ("--timeout-secs", "later"),
+            ("--no-progress-timeout-secs", "0"),
+            ("--no-progress-timeout-secs", "soon"),
             ("--operations-per-sample", "0"),
             ("--operations-per-sample", "many"),
             ("--sample-duration-ms", "0"),
@@ -2575,6 +2727,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cli_no_progress_timeout_overrides_environment_value() {
+        let args = StressBinaryArgs {
+            no_progress_timeout: Some(Duration::from_secs(3)),
+            ..StressBinaryArgs::default()
+        };
+        let resolved = resolve_from_binary_args_with(&args, |key| {
+            (key == "STRESS_NO_PROGRESS_TIMEOUT_SECS").then(|| "20".to_string())
+        });
+
+        assert_eq!(
+            resolved.config.no_progress_timeout,
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(
+            resolved.metadata.get("no_progress_timeout_secs_src"),
+            Some(&"cli --no-progress-timeout-secs".to_string())
+        );
+    }
+
     fn deadline_config() -> StressRunnerConfig {
         StressRunnerConfig::new()
             .samples(1)
@@ -2608,6 +2780,17 @@ mod tests {
     #[allow(clippy::unnecessary_wraps)]
     fn slow_benchmark(ctx: &mut StressContext) -> StressResult {
         ctx.measure("slow", || std::thread::sleep(Duration::from_millis(200)));
+        Ok(())
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    fn progressing_benchmark(ctx: &mut StressContext) -> StressResult {
+        let progress = ctx.progress_handle();
+        for _ in 0..8 {
+            std::thread::sleep(Duration::from_millis(8));
+            progress.advance();
+        }
+        ctx.measure("progress", || std::hint::black_box(1_u64));
         Ok(())
     }
 
@@ -2720,6 +2903,61 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_keeps_a_slow_benchmark_alive() {
+        let mut runner = StressRunner::with_config("timeout-suite", deadline_config());
+
+        run_spec_with_watchdogs(
+            &mut runner,
+            &deadline_spec("progressing"),
+            None,
+            progressing_benchmark,
+            Some(Duration::from_secs(1)),
+            Some(Duration::from_millis(20)),
+        )
+        .expect("regular heartbeat advances keep the benchmark alive");
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    fn stalled_benchmark(ctx: &mut StressContext) -> StressResult {
+        let _progress = ctx.progress_handle();
+        ctx.measure("stalled", || std::thread::sleep(Duration::from_millis(250)));
+        Ok(())
+    }
+
+    #[test]
+    fn stale_heartbeat_returns_a_typed_no_progress_failure() {
+        let mut runner = StressRunner::with_config("timeout-suite", deadline_config());
+
+        let error = run_spec_with_watchdogs(
+            &mut runner,
+            &deadline_spec("stalled"),
+            None,
+            stalled_benchmark,
+            None,
+            Some(Duration::from_millis(20)),
+        )
+        .expect_err("no progress timeout is enforced without a hard deadline");
+
+        assert!(matches!(error, SpecRunError::NoProgress { .. }));
+        assert_eq!(error.exit_code(), 124);
+        let run = runner.finish();
+        assert_eq!(run.summaries.len(), 1);
+        assert_eq!(
+            run.summaries[0].metadata.get("failure_kind"),
+            Some(&"no_progress_timeout".to_string())
+        );
+        assert_eq!(
+            run.summaries[0].metadata.get("progress_completed_units"),
+            Some(&"0".to_string())
+        );
+        assert!(run.summaries[0]
+            .metadata
+            .get("benchmark_error")
+            .is_some_and(|message| message.contains("made no progress")));
+        assert_ne!(evaluate_run_gate(&run), RunGate::Passed);
+    }
+
+    #[test]
     fn timed_out_benchmark_keeps_completed_rows_and_fails_the_gate() {
         let mut runner = StressRunner::with_config("timeout-suite", deadline_config());
         run_spec_with_timeout(
@@ -2747,6 +2985,39 @@ mod tests {
             .metadata
             .get("benchmark_error")
             .is_some_and(|message| message.contains("deadline")));
+        assert_ne!(evaluate_run_gate(&run), RunGate::Passed);
+    }
+
+    #[test]
+    fn no_progress_failure_retains_previously_completed_benchmark_rows() {
+        let mut runner = StressRunner::with_config("timeout-suite", deadline_config());
+        run_spec_with_timeout(
+            &mut runner,
+            &deadline_spec("fast-before-stall"),
+            None,
+            fast_benchmark,
+            Duration::from_secs(1),
+        )
+        .expect("first benchmark completes");
+
+        let error = run_spec_with_watchdogs(
+            &mut runner,
+            &deadline_spec("stall-after-fast"),
+            None,
+            stalled_benchmark,
+            Some(Duration::from_secs(1)),
+            Some(Duration::from_millis(20)),
+        )
+        .expect_err("stale progress fails the second benchmark");
+
+        assert!(matches!(error, SpecRunError::NoProgress { .. }));
+        let run = runner.finish();
+        assert_eq!(run.summaries.len(), 2, "{:?}", run.summaries);
+        assert!(run.summaries[0].name.contains("fast"));
+        assert_eq!(
+            run.summaries[1].metadata.get("failure_kind"),
+            Some(&"no_progress_timeout".to_string())
+        );
         assert_ne!(evaluate_run_gate(&run), RunGate::Passed);
     }
 

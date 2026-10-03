@@ -363,7 +363,10 @@ mod tests {
     #[test]
     fn empty_root_yields_no_observations() {
         let root = FakeRoot::new("empty");
-        assert!(linux_observations(&root.0, Some(4)).is_empty());
+        assert_eq!(
+            linux_observations(&root.0, Some(4)),
+            [] as [EnvironmentObservation; 0]
+        );
     }
 
     #[test]
@@ -385,7 +388,7 @@ mod tests {
         let governor = find(&observations, "cpu_governor");
         assert_eq!(governor.value, "performance,powersave");
         assert!(governor.adverse);
-        assert!(!governor.detail.is_empty());
+        assert_ne!(governor.detail, "");
 
         let root = FakeRoot::new("governor-ok");
         root.write(
@@ -427,7 +430,10 @@ mod tests {
 
         let root = FakeRoot::new("load-garbage");
         root.write("proc/loadavg", "nope\n");
-        assert!(linux_observations(&root.0, Some(4)).is_empty());
+        assert_eq!(
+            linux_observations(&root.0, Some(4)),
+            [] as [EnvironmentObservation; 0]
+        );
     }
 
     #[test]
@@ -441,7 +447,10 @@ mod tests {
 
         let root = FakeRoot::new("cg2-max");
         root.write("sys/fs/cgroup/cpu.max", "max 100000\n");
-        assert!(linux_observations(&root.0, Some(4)).is_empty());
+        assert_eq!(
+            linux_observations(&root.0, Some(4)),
+            [] as [EnvironmentObservation; 0]
+        );
 
         let root = FakeRoot::new("cg1");
         root.write("sys/fs/cgroup/cpu/cpu.cfs_quota_us", "400000\n")
@@ -454,7 +463,10 @@ mod tests {
         let root = FakeRoot::new("cg1-unlimited");
         root.write("sys/fs/cgroup/cpu/cpu.cfs_quota_us", "-1\n")
             .write("sys/fs/cgroup/cpu/cpu.cfs_period_us", "100000\n");
-        assert!(linux_observations(&root.0, Some(4)).is_empty());
+        assert_eq!(
+            linux_observations(&root.0, Some(4)),
+            [] as [EnvironmentObservation; 0]
+        );
     }
 
     #[test]

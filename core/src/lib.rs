@@ -83,7 +83,7 @@ pub use artifact::{
     ObservationDirection, ObservationUnit, RunProfile, TrustClass as BenchmarkRole,
 };
 pub use config::StressRunnerConfig;
-pub use context::{LogicalUnit, OperationOutcome, StressContext};
+pub use context::{LogicalUnit, OperationOutcome, ProgressHandle, StressContext};
 pub use error::{StressError, StressResult};
 pub use runner::StressRunner;
 pub use std::hint::black_box;
@@ -231,8 +231,8 @@ macro_rules! stress_allocator {
 pub mod prelude {
     pub use crate::{
         black_box, stress, stress_allocator, stress_main, BenchmarkRole, ObservationDirection,
-        ObservationUnit, RunProfile, StressContext, StressError, StressResult, StressRunner,
-        StressRunnerConfig, StressRunnerOptions,
+        ObservationUnit, ProgressHandle, RunProfile, StressContext, StressError, StressResult,
+        StressRunner, StressRunnerConfig, StressRunnerOptions,
     };
     pub use crate::{LogicalUnit, OperationOutcome};
 }

@@ -864,7 +864,7 @@ mod tests {
         assert!(suite.join(format!("{T1}.json.bak")).exists());
 
         assert_eq!(plan_prune(&suite, 0).unwrap().delete.len(), 8);
-        assert!(apply_prune(&suite, 5).unwrap().delete.is_empty());
+        assert_eq!(apply_prune(&suite, 5).unwrap().delete, [] as [PathBuf; 0]);
     }
 
     #[test]

@@ -8,6 +8,8 @@ use crate::artifact::{
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Context passed to benchmark functions.
@@ -24,6 +26,81 @@ pub struct StressContext {
     pending_counters: CorrectnessCounters,
     pending_has_counters: bool,
     pending_source: Option<SourceLocation>,
+    progress: ProgressHandle,
+}
+
+/// Cloneable heartbeat for workloads that perform work on their own threads.
+///
+/// Call [`advance`](Self::advance) after a workload unit has reached a final
+/// outcome. When the runner has a no-progress timeout configured, it fails and
+/// abandons the isolated benchmark worker if this handle is not advanced
+/// before the timeout expires.
+#[derive(Debug, Clone)]
+pub struct ProgressHandle(Arc<ProgressState>);
+
+#[derive(Debug)]
+struct ProgressState {
+    started_at: Instant,
+    last_progress_ns: AtomicU64,
+    completed_units: AtomicU64,
+}
+
+impl ProgressState {
+    fn mark_progress(&self, elapsed_ns: u64) {
+        self.last_progress_ns
+            .fetch_max(elapsed_ns, Ordering::Release);
+    }
+}
+
+impl ProgressHandle {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(ProgressState {
+            started_at: Instant::now(),
+            last_progress_ns: AtomicU64::new(0),
+            completed_units: AtomicU64::new(0),
+        }))
+    }
+
+    /// Mark one attempted workload unit as complete, whether it succeeded or
+    /// returned a classified saturation response.
+    pub fn advance(&self) {
+        self.advance_by(1);
+    }
+
+    /// Mark `units` workload units as complete.
+    ///
+    /// A zero increment is ignored and does not reset the heartbeat.
+    pub fn advance_by(&self, units: u64) {
+        if units == 0 {
+            return;
+        }
+        let mut completed = self.0.completed_units.load(Ordering::Acquire);
+        loop {
+            match self.0.completed_units.compare_exchange_weak(
+                completed,
+                completed.saturating_add(units),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => completed = observed,
+            }
+        }
+        let elapsed_ns = u64::try_from(self.0.started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.0.mark_progress(elapsed_ns);
+    }
+
+    /// Return the number of workload units reported complete so far.
+    #[must_use]
+    pub fn completed_units(&self) -> u64 {
+        self.0.completed_units.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn idle_for(&self) -> Duration {
+        let now_ns = u64::try_from(self.0.started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let last_ns = self.0.last_progress_ns.load(Ordering::Acquire);
+        Duration::from_nanos(now_ns.saturating_sub(last_ns))
+    }
 }
 
 /// Stable name for the logical operation represented by a measurement.
@@ -279,6 +356,30 @@ impl StressContext {
             pending_counters: CorrectnessCounters::default(),
             pending_has_counters: false,
             pending_source: None,
+            progress: ProgressHandle::new(),
+        }
+    }
+
+    /// Return a cloneable heartbeat handle for workload threads.
+    #[must_use]
+    pub fn progress_handle(&self) -> ProgressHandle {
+        self.progress.clone()
+    }
+
+    pub(crate) fn install_progress_handle(&mut self, progress: ProgressHandle) {
+        self.progress = progress;
+    }
+
+    pub(crate) fn metadata_snapshot(&self) -> BTreeMap<String, String> {
+        self.metadata.clone()
+    }
+
+    pub(crate) fn extend_metadata(&mut self, metadata: BTreeMap<String, String>) {
+        for (key, value) in metadata {
+            self.metadata.insert(key.clone(), value.clone());
+            if let Some(record) = self.measurements.last_mut() {
+                record.metadata.insert(key, value);
+            }
         }
     }
 
@@ -824,7 +925,7 @@ impl StressContext {
     }
 
     /// Record a benchmark-function error as a structured, untrustworthy row.
-    pub(crate) fn record_benchmark_error(&mut self, message: &str) {
+    pub(crate) fn record_benchmark_error(&mut self, error: &crate::StressError) {
         let state = MeasurementState {
             duration: Duration::ZERO,
             counters: CorrectnessCounters {
@@ -846,7 +947,12 @@ impl StressContext {
             .last_mut()
             .expect("record_benchmark_error records one measurement")
             .metadata
-            .insert("benchmark_error".to_string(), message.to_string());
+            .insert("benchmark_error".to_string(), error.message().to_string());
+        self.measurements
+            .last_mut()
+            .expect("record_benchmark_error records one measurement")
+            .metadata
+            .extend(error.metadata().clone());
     }
 
     pub(crate) fn take_measurements(self) -> Vec<MeasurementRecord> {
@@ -2918,6 +3024,42 @@ impl CorrectnessRecorder<'_> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::thread;
+
+    #[test]
+    fn progress_handle_keeps_the_latest_timestamp_when_advances_race() {
+        let state = ProgressState {
+            started_at: Instant::now(),
+            last_progress_ns: AtomicU64::new(0),
+            completed_units: AtomicU64::new(0),
+        };
+
+        state.mark_progress(20);
+        state.mark_progress(10);
+
+        assert_eq!(state.last_progress_ns.load(Ordering::Acquire), 20);
+    }
+
+    #[test]
+    fn progress_handle_counts_concurrent_advances() {
+        let progress = ProgressHandle::new();
+        let workers = (0..8)
+            .map(|_| {
+                let progress = progress.clone();
+                thread::spawn(move || {
+                    for _ in 0..1_000 {
+                        progress.advance();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for worker in workers {
+            worker.join().expect("progress worker exits");
+        }
+
+        assert_eq!(progress.completed_units(), 8_000);
+    }
 
     fn fixed_ops_ctx(operations_per_sample: u64) -> StressContext {
         StressContext::new(
