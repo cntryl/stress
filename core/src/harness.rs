@@ -514,8 +514,6 @@ pub struct StressRunnerOptions {
     pub cooldown_samples: Option<usize>,
     /// Per-benchmark deadline.
     pub timeout: Option<Duration>,
-    /// Maximum interval between workload heartbeat advances.
-    pub no_progress_timeout: Option<Duration>,
     /// Optional machine-readable JSON stdout override.
     pub json_stdout: Option<bool>,
     /// Artifact output directory.
@@ -606,13 +604,6 @@ impl StressRunnerOptions {
     #[must_use]
     pub const fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
-        self
-    }
-
-    /// Fail when a benchmark heartbeat is not advanced within `timeout`.
-    #[must_use]
-    pub const fn no_progress_timeout(mut self, timeout: Duration) -> Self {
-        self.no_progress_timeout = Some(timeout);
         self
     }
 
@@ -762,7 +753,6 @@ fn binary_args_from_options(options: StressRunnerOptions) -> StressBinaryArgs {
         warmup_samples: options.warmup_samples,
         cooldown_samples: options.cooldown_samples,
         timeout: options.timeout,
-        no_progress_timeout: options.no_progress_timeout,
         json_stdout: options.json_stdout,
         output_dir: options.output_dir,
         include_ignored: options.include_ignored,
