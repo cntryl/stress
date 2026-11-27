@@ -110,7 +110,7 @@ cargo test --locked --manifest-path "$macro_package/Cargo.toml" --doc
 
 ## Project Structure
 
-- **core/** - Main library (`cntryl-stress`)
+- **crates/stress/** - Main library (`cntryl-stress`)
   - `src/harness.rs` - Test discovery and execution
   - `src/runner.rs` - StressRunner API
   - `src/reporting.rs` - Output reporters and human formatting
@@ -119,10 +119,10 @@ cargo test --locked --manifest-path "$macro_package/Cargo.toml" --doc
   - `src/config.rs` - Configuration and CLI parsing
   - `src/bin/cargo-stress.rs` - Optional `cargo stress` wrapper behind the `cli` feature
 
-- **macros/** - Proc macros (`cntryl-stress-macros`)
+- **crates/stress-macros/** - Proc macros (`cntryl-stress-macros`)
   - `src/lib.rs` - `#[stress]` and `stress_main!()` macros
 
-- **demo/** - Demo benchmarks (not published)
+- **crates/stress-demo/** - Demo benchmarks (not published)
   - `benches/` - Example benchmark files
 
 ## Making Changes

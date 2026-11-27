@@ -953,7 +953,7 @@ Programmatic suite names are portable path components: ASCII letters, digits,
 `same-name` and `same_name` when they would canonicalize to the same suite.
 
 The JSON artifact contains tool version, run profile, environment, benchmark specs, raw samples, summaries, diagnostics, quality, and comparisons. Unknown environment fields are explicit `"unknown"` or `null`.
-The checked-in [cntryl-stress.v2 JSON Schema](https://github.com/cntryl/stress/blob/main/core/schema/cntryl-stress.v2.schema.json)
+The checked-in [cntryl-stress.v2 JSON Schema](https://github.com/cntryl/stress/blob/main/crates/stress/schema/cntryl-stress.v2.schema.json)
 is also available to Rust tooling as
 `cntryl_stress::artifact::ARTIFACT_JSON_SCHEMA`.
 

@@ -52,7 +52,7 @@ jobs:
           artifact_path="$(find . -path '*/target/stress/stress-demo1/latest.json' -print -quit)"
           test -n "$artifact_path"
           npx --yes ajv-cli@5 validate --spec=draft2020 --strict=false \
-            -s core/schema/cntryl-stress.v2.schema.json \
+            -s crates/stress/schema/cntryl-stress.v2.schema.json \
             -d "$artifact_path"
 
       - name: Verify published package shape
