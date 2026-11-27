@@ -31,12 +31,12 @@ jobs:
       - name: Read release versions from Cargo manifests
         id: version
         run: |
-          core_version="$(sed -n '/^\[package\]/,/^\[/ { s/^version = "\([^"]*\)"/\1/p; }' core/Cargo.toml | head -n 1)"
-          macros_version="$(sed -n '/^\[package\]/,/^\[/ { s/^version = "\([^"]*\)"/\1/p; }' macros/Cargo.toml | head -n 1)"
+          core_version="$(sed -n '/^\[package\]/,/^\[/ { s/^version = "\([^"]*\)"/\1/p; }' crates/stress/Cargo.toml | head -n 1)"
+          macros_version="$(sed -n '/^\[package\]/,/^\[/ { s/^version = "\([^"]*\)"/\1/p; }' crates/stress-macros/Cargo.toml | head -n 1)"
           test -n "${core_version}"
           test -n "${macros_version}"
           test "${core_version}" = "${macros_version}"
-          grep -Fq "cntryl-stress-macros = { version = \"=${macros_version}\"" core/Cargo.toml
+          grep -Fq "cntryl-stress-macros = { version = \"=${macros_version}\"" crates/stress/Cargo.toml
           echo "version=${core_version}" >> "${GITHUB_OUTPUT}"
 
       - name: Restrict release source ref
@@ -78,12 +78,12 @@ jobs:
       - name: Read release versions from Cargo manifests
         id: version
         run: |
-          core_version="$(sed -n '/^\[package\]/,/^\[/ { s/^version = "\([^"]*\)"/\1/p; }' core/Cargo.toml | head -n 1)"
-          macros_version="$(sed -n '/^\[package\]/,/^\[/ { s/^version = "\([^"]*\)"/\1/p; }' macros/Cargo.toml | head -n 1)"
+          core_version="$(sed -n '/^\[package\]/,/^\[/ { s/^version = "\([^"]*\)"/\1/p; }' crates/stress/Cargo.toml | head -n 1)"
+          macros_version="$(sed -n '/^\[package\]/,/^\[/ { s/^version = "\([^"]*\)"/\1/p; }' crates/stress-macros/Cargo.toml | head -n 1)"
           test -n "${core_version}"
           test -n "${macros_version}"
           test "${core_version}" = "${macros_version}"
-          grep -Fq "cntryl-stress-macros = { version = \"=${macros_version}\"" core/Cargo.toml
+          grep -Fq "cntryl-stress-macros = { version = \"=${macros_version}\"" crates/stress/Cargo.toml
           echo "version=${core_version}" >> "${GITHUB_OUTPUT}"
 
       - name: Restrict release source ref

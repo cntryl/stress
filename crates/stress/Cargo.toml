@@ -1,14 +1,13 @@
 [package]
 name = "cntryl-stress"
-version = "0.5.1"
-edition = "2021"
-rust-version = "1.85"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 description = "Raw-sample-first stress benchmarking framework for Tier 1 through Tier 6 performance work"
-license = "Apache-2.0"
-repository = "https://github.com/cntryl/stress"
-homepage = "https://github.com/cntryl/stress"
+license.workspace = true
+repository.workspace = true
 documentation = "https://docs.rs/cntryl-stress"
-readme = "../README.md"
+readme = "README.md"
 keywords = ["benchmark", "stress", "testing", "performance"]
 categories = ["development-tools::profiling", "development-tools::testing"]
 
@@ -29,7 +28,7 @@ toml = { version = "1", optional = true }
 linkme = "0.3"
 # tokio 1.x declares rust-version 1.71, compatible with this crate's 1.85 MSRV.
 tokio = { version = "1.38", default-features = false, features = ["rt", "rt-multi-thread", "time", "sync"], optional = true }
-cntryl-stress-macros = { version = "=0.5.1", path = "../macros" }
+cntryl-stress-macros = { version = "=0.5.1", path = "../stress-macros" }
 
 [target.'cfg(unix)'.dependencies]
 # Already in the tree through fs2; used directly for getrusage peak RSS.

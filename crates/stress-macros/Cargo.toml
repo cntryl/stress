@@ -1,14 +1,13 @@
 [package]
 name = "cntryl-stress-macros"
-version = "0.5.1"
-edition = "2021"
-rust-version = "1.85"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 description = "Proc macros for the cntryl-stress benchmark framework"
-license = "Apache-2.0"
-repository = "https://github.com/cntryl/stress"
-homepage = "https://github.com/cntryl/stress"
+license.workspace = true
+repository.workspace = true
 documentation = "https://docs.rs/cntryl-stress-macros"
-readme = "../README.md"
+readme = "README.md"
 keywords = ["benchmark", "stress", "testing", "performance"]
 categories = ["development-tools::profiling", "development-tools::testing"]
 exclude = ["tests/ui.rs", "tests/ui/**"]
@@ -23,5 +22,5 @@ quote = "1"
 syn = { version = "2", features = ["full"] }
 
 [dev-dependencies]
-stress_alias = { package = "cntryl-stress", path = "../core" }
+stress_alias = { package = "cntryl-stress", path = "../stress" }
 trybuild = "=1.0.119"

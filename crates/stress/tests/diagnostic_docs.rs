@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 fn docs_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../docs")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs")
 }
 
 #[test]
